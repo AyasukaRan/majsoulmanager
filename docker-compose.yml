@@ -74,9 +74,13 @@ services:
 
   clickhouse:
     image: clickhouse/clickhouse-server:25.3-alpine
+    environment:
+      CLICKHOUSE_USER: mjai
+      CLICKHOUSE_PASSWORD: mjai
     volumes:
       - clickhouse-data:/var/lib/clickhouse
       - ./migrations/clickhouse:/docker-entrypoint-initdb.d:ro
+      - ./deploy/clickhouse/listen-ipv4.xml:/etc/clickhouse-server/config.d/zz-listen-ipv4.xml:ro
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
       interval: 5s

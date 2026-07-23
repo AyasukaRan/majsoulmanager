@@ -1,0 +1,5 @@
+<!-- 强制 ClickHouse 监听 IPv4。官方镜像默认尝试 [::]，在容器网络禁用
+     IPv6 的宿主机（如部署服务器）上所有监听都会失败，进程存活但无端口。 -->
+<clickhouse>
+    <listen_host>0.0.0.0</listen_host>
+</clickhouse>
