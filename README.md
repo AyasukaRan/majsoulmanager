@@ -9,6 +9,9 @@
 - `GET /api/v1/records`：按来源、时间、玩家筛选，使用游标分页。
 - `POST /api/v1/downloads`：创建异步批量导出任务。
 - `GET /api/v1/downloads/{job_id}`：查询导出进度和下载地址。
+- 内置 majsoul2mjai Watch：在线配置房间、模式、账号密钥引用、代理和轮询频率，展示 UUID 获取与转换状态。
+- 登录与 PB 获取采用版本化进程模块，安装时校验 SHA-256 和协议健康状态，可在线切换、失败回滚。
+- 集成 mihomo：网页配置订阅、刷新 provider、测试节点延迟并切换 Watch 专用节点。
 - 原始数据与索引分离：RustFS 保存不可变 `.mjpack` 数据包，ClickHouse 保存筛选字段和包内偏移。
 - PostgreSQL 保存采集幂等状态和下载任务，Kafka/Redpanda 解耦索引与导出工作负载。
 
@@ -59,6 +62,7 @@ Compose 会构建并启动两个应用镜像：
 
 - `mjai-management-api:local`：Rust/Axum API，端口 `8000`。
 - `mjai-management-web:local`：React + shadcn/ui 管理台，端口 `3000`。
+- `metacubex/mihomo:v1.19.27`：Watch 专用代理内核，仅在 Compose 内网暴露控制与代理端口。
 
 其余本地端口：PostgreSQL `5432`、ClickHouse HTTP `8123`、RustFS S3 `9000`、RustFS 控制台 `9002`、Redpanda `9092`。
 
@@ -69,5 +73,12 @@ make image-build
 ```
 
 前端工程说明见 [web/README.md](web/README.md)。
+
+Watch 默认关闭。进入管理台填写 `file:/run/secrets/...` 或 `env:...`
+形式的账号密钥引用后启用；密钥文件内容为 `username,password`。订阅链接由
+后端以 `0600` 权限保存在数据卷中，状态 API 只返回订阅域名。协议模块的打包和
+进程接口见 [docs/watch-modules.md](docs/watch-modules.md)。
+本地 Compose 可在 `.env` 设置 `MAJSOUL_ACCOUNTS=username,password`，然后
+在网页选择 `env:MAJSOUL_ACCOUNTS`；生产环境建议改用只读文件 secret。
 
 生产路径不会把每个约 10KB 的 mjson 分别存成 RustFS 对象。打包器把每条记录压成独立 Zstandard frame，再合并为约 256MB 的 `.mjpack`；单条读取根据 ClickHouse 中的 offset/length 发起 Range GET，只下载对应的几 KB。

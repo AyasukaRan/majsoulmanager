@@ -20,9 +20,17 @@ Pack/Index worker
 
 查询 API ──► ClickHouse ──► RustFS Range GET ──► 单条 mjson
 导出 worker ─► 按 pack_key 合并 Range ─────────► RustFS 导出对象
+
+管理 API ──► Watch supervisor ──► 登录模块 / PB 模块
+                            └──► mihomo ──► 雀魂网关
 ```
 
 当前仓库的默认本地模式为了零依赖调试，在 API 进程内完成打包并用内存目录保存索引。`.mjpack` 格式和单条读取路径与生产一致。生产模式应把打包、ClickHouse 批量写入和导出拆成独立 worker。
+
+Watch 与查询 API 同镜像部署但属于独立受管任务。配置 revision、运行 phase 和
+UUID 队列彼此分离；热重载先校验模块，再替换任务 generation。登录/PB
+模块使用独立进程协议，避免 Rust 动态库卸载带来的 ABI 和内存安全风险。
+mihomo 控制端口只在容器网络开放，订阅原文不进入普通状态响应。
 
 ## `.mjpack` 格式
 
