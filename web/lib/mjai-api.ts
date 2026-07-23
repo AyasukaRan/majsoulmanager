@@ -85,6 +85,22 @@ export type WatchModuleRef = {
   version: string;
 };
 
+export type WatchLogLevel = "debug" | "info" | "warn" | "error";
+
+export type WatchLogEntry = {
+  seq: number;
+  timestamp: string;
+  level: WatchLogLevel;
+  source: string;
+  message: string;
+};
+
+export type WatchLogPage = {
+  boot_id: string;
+  items: WatchLogEntry[];
+  next_cursor: number | null;
+};
+
 export type WatchServiceConfig = {
   revision: number;
   enabled: boolean;

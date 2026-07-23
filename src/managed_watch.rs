@@ -33,11 +33,13 @@ use crate::{
     mjai,
     pack::PackStore,
     watch::{WatchEvent, WatchEventKind, WatchRegistry},
+    watch_log::{WatchLogBuffer, WatchLogLevel},
     watch_service::{PluginWorker, WatchProxyMode, WatchServiceConfig},
 };
 
 const FILTER_ID_OFFSET: i32 = 200;
 const SETTLE_SECS: u64 = 120;
+const RECONNECT_DELAY_SECS: u64 = 5;
 
 pub struct ManagedWatchDependencies {
     pub data_dir: PathBuf,
@@ -45,6 +47,7 @@ pub struct ManagedWatchDependencies {
     pub packs: Arc<PackStore>,
     pub registry: Arc<WatchRegistry>,
     pub mihomo: Arc<MihomoManager>,
+    pub logs: Arc<WatchLogBuffer>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -121,6 +124,20 @@ pub(crate) async fn run(
         WatchProxyMode::Mihomo => Some(dependencies.mihomo.proxy_url().to_owned()),
         WatchProxyMode::Custom => config.custom_proxy_url.clone(),
     };
+    // 外置模块的 stderr 与错误链会进入 Web 可见的日志缓冲,可能回显
+    // open_session 参数;先注册机密让 append 统一脱敏。
+    dependencies.logs.register_secret(password.clone());
+    if let Some(proxy_url) = proxy.as_deref() {
+        dependencies.logs.register_secret(proxy_url);
+        if let Ok(parsed) = reqwest::Url::parse(proxy_url) {
+            if let Some(proxy_password) = parsed.password() {
+                dependencies.logs.register_secret(proxy_password);
+            }
+            if !parsed.username().is_empty() {
+                dependencies.logs.register_secret(parsed.username());
+            }
+        }
+    }
     let state_path = dependencies.data_dir.join("watch/state.json");
     let (tracked_state, pending_state) = load_state(&state_path)?;
     let mut tracked = tracked_state
@@ -132,13 +149,24 @@ pub(crate) async fn run(
         .map(|game| (game.uuid.clone(), game))
         .collect::<HashMap<_, _>>();
 
+    let proxy_label = proxy
+        .as_deref()
+        .map(proxy_display)
+        .unwrap_or_else(|| "直连".into());
+
     loop {
+        dependencies.logs.append(
+            WatchLogLevel::Info,
+            "collector",
+            format!("开始连接雀魂服务器 (账号 {username}, 代理 {proxy_label})"),
+        );
         match connect(
             &config,
             &username,
             &password,
             proxy.as_deref(),
             login_worker.clone(),
+            &dependencies.logs,
         )
         .await
         {
@@ -163,15 +191,53 @@ pub(crate) async fn run(
                 .await
                 {
                     warn!(error = %format!("{error:#}"), "watch session disconnected");
+                    dependencies.logs.append(
+                        WatchLogLevel::Warn,
+                        "collector",
+                        format!("会话断开: {error:#}"),
+                    );
                 }
                 transport.close().await;
             }
             Err(error) => {
                 warn!(error = %format!("{error:#}"), "watch login failed");
+                dependencies.logs.append(
+                    WatchLogLevel::Error,
+                    "collector",
+                    format!("登录失败: {error:#}"),
+                );
             }
         }
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        dependencies.logs.append(
+            WatchLogLevel::Info,
+            "collector",
+            format!("等待 {RECONNECT_DELAY_SECS} 秒后重连"),
+        );
+        tokio::time::sleep(Duration::from_secs(RECONNECT_DELAY_SECS)).await;
     }
+}
+
+/// Renders a proxy URL as `scheme://host[:port]`, never exposing credentials.
+fn proxy_display(proxy: &str) -> String {
+    match reqwest::Url::parse(proxy) {
+        Ok(url) => {
+            let scheme = url.scheme();
+            match (url.host_str(), url.port()) {
+                (Some(host), Some(port)) => format!("{scheme}://{host}:{port}"),
+                (Some(host), None) => format!("{scheme}://{host}"),
+                (None, _) => scheme.to_owned(),
+            }
+        }
+        Err(_) => "无法解析".into(),
+    }
+}
+
+/// Extracts the host of a gateway endpoint URL for log output.
+fn endpoint_host(endpoint: &str) -> String {
+    reqwest::Url::parse(endpoint)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "未知主机".into())
 }
 
 async fn fetch_live_list(
@@ -289,6 +355,7 @@ async fn connect(
     password: &str,
     proxy: Option<&str>,
     worker: Option<Arc<PluginWorker>>,
+    logs: &WatchLogBuffer,
 ) -> Result<(LoginTransport, String)> {
     if let Some(worker) = worker {
         let result = worker
@@ -306,6 +373,11 @@ async fn connect(
             .map_err(|error| anyhow::Error::msg(error.to_string()))?;
         let session_id = required_string(&result, "session_id")?;
         let client_version = required_string(&result, "client_version")?;
+        logs.append(
+            WatchLogLevel::Info,
+            "collector",
+            format!("登录成功 (外置模块, 客户端版本 {client_version})"),
+        );
         return Ok((
             LoginTransport::External { worker, session_id },
             client_version,
@@ -317,13 +389,25 @@ async fn connect(
     }
     let http = builder.build()?;
     let (endpoint, resource_version, route_id) = discover_gateway(&http, &config.server).await?;
+    logs.append(
+        WatchLogLevel::Info,
+        "collector",
+        format!("网关发现完成 ({})", endpoint_host(&endpoint)),
+    );
     let client_version = match &config.client_version {
         Some(version) => version.clone(),
         None => discover_client_version(&http, &config.server, &resource_version).await?,
     };
+    logs.append(
+        WatchLogLevel::Info,
+        "collector",
+        format!("客户端版本 {client_version}"),
+    );
     let rpc = MajsoulRpc::connect_with_proxy(&endpoint, proxy).await?;
+    logs.append(WatchLogLevel::Info, "collector", "WebSocket 已连接");
     rpc.login_native_exact(username, password, &client_version, &route_id)
         .await?;
+    logs.append(WatchLogLevel::Info, "collector", "登录成功");
     Ok((LoginTransport::Builtin(rpc), client_version))
 }
 

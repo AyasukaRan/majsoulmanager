@@ -1,4 +1,4 @@
-import { getSessionToken } from "@/lib/session";
+import { getSessionUser } from "@/lib/session";
 
 const DEFAULT_API_BASE_URL = "http://localhost:8000";
 
@@ -9,7 +9,7 @@ type RouteContext = {
 };
 
 async function forward(request: Request, context: RouteContext) {
-  if (!(await getSessionToken())) {
+  if (!(await getSessionUser())) {
     return Response.json({ error: "unauthorized" }, { status: 401 });
   }
   const { path } = await context.params;

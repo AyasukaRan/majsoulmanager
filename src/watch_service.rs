@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
     sync::Mutex,
     task::JoinHandle,
@@ -24,6 +24,7 @@ use tokio::{
 
 use crate::managed_watch::ManagedWatchDependencies;
 use crate::watch::{WatchRegistry, WatchSummary};
+use crate::watch_log::{WatchLogBuffer, WatchLogEntry, WatchLogLevel};
 
 pub const MODULE_PROTOCOL_VERSION: u32 = 1;
 pub const BUILTIN_MODULE_VERSION: &str = "majsoul2mjai-da985809";
@@ -301,12 +302,13 @@ pub enum WatchServiceError {
 
 pub struct ModuleStore {
     root: PathBuf,
+    logs: Arc<WatchLogBuffer>,
 }
 
 impl ModuleStore {
-    fn new(root: PathBuf) -> Result<Self, WatchServiceError> {
+    fn new(root: PathBuf, logs: Arc<WatchLogBuffer>) -> Result<Self, WatchServiceError> {
         std::fs::create_dir_all(&root)?;
-        Ok(Self { root })
+        Ok(Self { root, logs })
     }
 
     pub fn list(
@@ -412,7 +414,13 @@ impl ModuleStore {
         )
         .await?;
 
-        let worker = PluginWorker::spawn(executable, &request.manifest.args).await?;
+        let worker = PluginWorker::spawn(
+            executable,
+            &request.manifest.args,
+            &request.manifest.name,
+            Arc::clone(&self.logs),
+        )
+        .await?;
         worker.health().await?;
         worker.shutdown().await;
 
@@ -442,7 +450,13 @@ impl ModuleStore {
         }
         let manifest = self.load_manifest(kind, module)?;
         let executable = self.module_dir(&manifest).join(&manifest.executable);
-        let worker = PluginWorker::spawn(executable, &manifest.args).await?;
+        let worker = PluginWorker::spawn(
+            executable,
+            &manifest.args,
+            &manifest.name,
+            Arc::clone(&self.logs),
+        )
+        .await?;
         worker.health().await?;
         worker.shutdown().await;
         Ok(())
@@ -458,7 +472,15 @@ impl ModuleStore {
         }
         let manifest = self.load_manifest(kind, module)?;
         let executable = self.module_dir(&manifest).join(&manifest.executable);
-        let worker = Arc::new(PluginWorker::spawn(executable, &manifest.args).await?);
+        let worker = Arc::new(
+            PluginWorker::spawn(
+                executable,
+                &manifest.args,
+                &manifest.name,
+                Arc::clone(&self.logs),
+            )
+            .await?,
+        );
         worker.health().await?;
         Ok(Some(worker))
     }
@@ -552,13 +574,18 @@ pub(crate) struct PluginWorker {
 }
 
 impl PluginWorker {
-    async fn spawn(path: PathBuf, args: &[String]) -> Result<Self, WatchServiceError> {
+    async fn spawn(
+        path: PathBuf,
+        args: &[String],
+        module_name: &str,
+        logs: Arc<WatchLogBuffer>,
+    ) -> Result<Self, WatchServiceError> {
         let mut child = Command::new(path)
             .args(args)
             .arg("--mjai-module-stdio")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .map_err(WatchServiceError::Io)?;
@@ -568,6 +595,42 @@ impl PluginWorker {
         let output = child.stdout.take().ok_or_else(|| {
             WatchServiceError::ModuleHealth("module stdout was not available".into())
         })?;
+        if let Some(stderr) = child.stderr.take() {
+            let source = format!("module:{module_name}");
+            tokio::spawn(async move {
+                // 按字节读并做有界缓冲:非 UTF-8 行不能让循环退出(否则管道
+                // 关闭,模块下次写 stderr 会被 SIGPIPE 杀死),超长行也不能
+                // 无上限地占用内存。EOF 或真实 IO 错误才结束。
+                const MAX_LINE_BYTES: u64 = 8 * 1024;
+                let mut reader = BufReader::new(stderr);
+                let mut buf = Vec::with_capacity(256);
+                let mut discarding_overlong_tail = false;
+                loop {
+                    buf.clear();
+                    let read = (&mut reader)
+                        .take(MAX_LINE_BYTES)
+                        .read_until(b'\n', &mut buf)
+                        .await;
+                    match read {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let complete_line = buf.last() == Some(&b'\n');
+                            if discarding_overlong_tail {
+                                discarding_overlong_tail = !complete_line;
+                                continue;
+                            }
+                            discarding_overlong_tail = !complete_line;
+                            let line = String::from_utf8_lossy(&buf);
+                            let line = line.trim_end_matches(['\n', '\r']);
+                            if !line.is_empty() {
+                                logs.append(WatchLogLevel::Info, &source, line);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
         Ok(Self {
             child: Mutex::new(child),
             input: Mutex::new(input),
@@ -644,6 +707,7 @@ pub struct WatchSupervisor {
     modules: ModuleStore,
     registry: Arc<WatchRegistry>,
     dependencies: Arc<ManagedWatchDependencies>,
+    logs: Arc<WatchLogBuffer>,
     generation: AtomicU64,
     task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -653,6 +717,7 @@ impl WatchSupervisor {
         data_dir: &Path,
         registry: Arc<WatchRegistry>,
         dependencies: Arc<ManagedWatchDependencies>,
+        logs: Arc<WatchLogBuffer>,
     ) -> Result<Self, WatchServiceError> {
         let watch_dir = data_dir.join("watch");
         std::fs::create_dir_all(&watch_dir)?;
@@ -671,12 +736,21 @@ impl WatchSupervisor {
             config_path,
             config: RwLock::new(config),
             runtime: RwLock::new(WatchRuntimeStatus::default()),
-            modules: ModuleStore::new(watch_dir.join("modules"))?,
+            modules: ModuleStore::new(watch_dir.join("modules"), Arc::clone(&logs))?,
             registry,
             dependencies,
+            logs,
             generation: AtomicU64::new(0),
             task: Mutex::new(None),
         })
+    }
+
+    pub fn logs_after(&self, after: u64, limit: usize) -> Vec<WatchLogEntry> {
+        self.logs.entries_after(after, limit)
+    }
+
+    pub fn log_buffer(&self) -> Arc<WatchLogBuffer> {
+        Arc::clone(&self.logs)
     }
 
     pub fn config(&self) -> WatchServiceConfig {
@@ -751,7 +825,16 @@ impl WatchSupervisor {
 
     async fn start(self: &Arc<Self>) -> Result<(), WatchServiceError> {
         let config = self.config();
-        self.probe_modules(&config).await?;
+        self.logs
+            .append(WatchLogLevel::Info, "service", "watch 服务启动中");
+        if let Err(error) = self.probe_modules(&config).await {
+            self.logs.append(
+                WatchLogLevel::Error,
+                "service",
+                format!("watch 服务启动失败：模块探测未通过 ({error})"),
+            );
+            return Err(error);
+        }
         self.stop_task().await;
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         {
@@ -774,6 +857,8 @@ impl WatchSupervisor {
             runtime.phase = ServicePhase::Reloading;
             runtime.updated_at = Utc::now();
         }
+        self.logs
+            .append(WatchLogLevel::Info, "service", "watch 服务重新加载中");
         self.start().await
     }
 
@@ -783,6 +868,8 @@ impl WatchSupervisor {
             runtime.phase = ServicePhase::Stopping;
             runtime.updated_at = Utc::now();
         }
+        self.logs
+            .append(WatchLogLevel::Info, "service", "watch 服务停止中");
         self.stop_task().await;
         let mut runtime = self.runtime.write();
         runtime.phase = ServicePhase::Stopped;
@@ -790,6 +877,9 @@ impl WatchSupervisor {
         runtime.active_revision = None;
         runtime.login_module = None;
         runtime.pb_fetch_module = None;
+        drop(runtime);
+        self.logs
+            .append(WatchLogLevel::Info, "service", "watch 服务已停止");
     }
 
     async fn stop_task(&self) {
@@ -810,6 +900,11 @@ impl WatchSupervisor {
             runtime.updated_at = Utc::now();
             runtime.last_error = None;
         }
+        self.logs.append(
+            WatchLogLevel::Info,
+            "service",
+            format!("watch 服务已启动 (generation {generation})"),
+        );
 
         let login_worker = self
             .modules
@@ -829,10 +924,24 @@ impl WatchSupervisor {
             let mut runtime = self.runtime.write();
             runtime.updated_at = Utc::now();
             match result {
-                Ok(()) => runtime.phase = ServicePhase::Stopped,
+                Ok(()) => {
+                    runtime.phase = ServicePhase::Stopped;
+                    drop(runtime);
+                    self.logs.append(
+                        WatchLogLevel::Info,
+                        "service",
+                        format!("watch 服务已退出 (generation {generation})"),
+                    );
+                }
                 Err(error) => {
                     runtime.phase = ServicePhase::Failed;
                     runtime.last_error = Some(format!("{error:#}"));
+                    drop(runtime);
+                    self.logs.append(
+                        WatchLogLevel::Error,
+                        "service",
+                        format!("watch 服务失败: {error:#}"),
+                    );
                 }
             }
         }
@@ -897,7 +1006,7 @@ mod tests {
     #[tokio::test]
     async fn installs_only_a_health_checked_module_artifact() {
         let root = std::env::temp_dir().join(format!("mjai-module-test-{}", uuid::Uuid::new_v4()));
-        let store = ModuleStore::new(root.clone()).unwrap();
+        let store = ModuleStore::new(root.clone(), Arc::new(WatchLogBuffer::default())).unwrap();
         let artifact =
             b"#!/bin/sh\nIFS= read -r request\nprintf '%s\\n' '{\"id\":1,\"ok\":true,\"result\":{\"version\":\"test\"}}'\n";
         let manifest = ModuleManifest {
