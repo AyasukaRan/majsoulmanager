@@ -89,6 +89,12 @@ MJAI_EMAIL_FROM=mjai@example.com
 make image-build
 ```
 
+GitHub Actions 会在 PR 中验证镜像构建，并在 push 时发布到 GHCR：
+
+- 非 `main` 分支：`ghcr.io/ayasukaran/majsoulmanager-api:dev` 与 `ghcr.io/ayasukaran/majsoulmanager-web:dev`
+- `main`：`ghcr.io/ayasukaran/majsoulmanager-api:latest` 与 `ghcr.io/ayasukaran/majsoulmanager-web:latest`
+- `v*` 标签：发布去掉 `v` 前缀后的版本标签
+
 前端工程说明见 [web/README.md](web/README.md)。
 
 Watch 默认关闭。进入管理台填写 `file:/run/secrets/...` 或 `env:...`
