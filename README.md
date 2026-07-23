@@ -1,5 +1,7 @@
 # mjai management
 
+[![CI](https://github.com/AyasukaRan/majsoulmanager/actions/workflows/ci.yml/badge.svg)](https://github.com/AyasukaRan/majsoulmanager/actions/workflows/ci.yml)
+
 面向数亿级 mjai 对局日志的采集、索引、筛选和批量下载服务。
 
 ## 当前能力
