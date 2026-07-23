@@ -1,3 +1,5 @@
+import { getSessionToken } from "@/lib/session";
+
 const DEFAULT_API_BASE_URL = "http://localhost:8000";
 
 export const dynamic = "force-dynamic";
@@ -7,6 +9,9 @@ type RouteContext = {
 };
 
 async function forward(request: Request, context: RouteContext) {
+  if (!(await getSessionToken())) {
+    return Response.json({ error: "unauthorized" }, { status: 401 });
+  }
   const { path } = await context.params;
   const incoming = new URL(request.url);
   const baseUrl = process.env.MJAI_API_BASE_URL ?? DEFAULT_API_BASE_URL;
