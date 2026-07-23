@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 import { useEffect, useState } from "react";
 import { Layers3, LoaderCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -9,7 +9,6 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 
 export function AuthForm({ mode }: { mode: "login" | "register" | "verify" }) {
-  const router = useRouter();
   const search = useSearchParams();
   const [registrationEnabled, setRegistrationEnabled] = useState(false);
   const [form, setForm] = useState({ name: "", email: "", password: "" });
@@ -56,8 +55,7 @@ export function AuthForm({ mode }: { mode: "login" | "register" | "verify" }) {
       });
       if (response.ok) {
         if (mode === "login") {
-          router.push("/");
-          router.refresh();
+          window.location.assign("/");
           return;
         }
         setMessage("注册成功。请检查邮箱并在 24 小时内完成验证。");
