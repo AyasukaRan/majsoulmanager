@@ -42,6 +42,7 @@ test("protects the dashboard and server-renders the login page", async () => {
   assert.match(html, /登录管理台/);
   assert.match(html, /使用管理员或已验证账号继续/);
   assert.match(html, /创建账号|注册/);
+  assert.match(html, /type="submit"/);
   assert.match(html, /https:\/\/mjai\.local\/og\.png/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/);
 });

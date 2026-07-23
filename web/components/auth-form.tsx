@@ -48,23 +48,28 @@ export function AuthForm({ mode }: { mode: "login" | "register" | "verify" }) {
     event.preventDefault();
     setBusy(true);
     setMessage("");
-    const response = await fetch(`/api/auth/${mode}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(form),
-    });
-    if (response.ok) {
-      if (mode === "login") {
-        router.push("/");
-        router.refresh();
-        return;
+    try {
+      const response = await fetch(`/api/auth/${mode}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(form),
+      });
+      if (response.ok) {
+        if (mode === "login") {
+          router.push("/");
+          router.refresh();
+          return;
+        }
+        setMessage("注册成功。请检查邮箱并在 24 小时内完成验证。");
+      } else {
+        const value = await response.json() as { error?: string };
+        setMessage(value.error ?? "请求失败");
       }
-      setMessage("注册成功。请检查邮箱并在 24 小时内完成验证。");
-    } else {
-      const value = await response.json() as { error?: string };
-      setMessage(value.error ?? "请求失败");
+    } catch {
+      setMessage("无法连接到服务，请稍后重试。");
+    } finally {
+      setBusy(false);
     }
-    setBusy(false);
   }
 
   const title = mode === "login" ? "登录管理台" : mode === "register" ? "创建账号" : "验证邮箱";
@@ -86,7 +91,7 @@ export function AuthForm({ mode }: { mode: "login" | "register" | "verify" }) {
                 <label className="block space-y-1.5 text-xs font-medium">邮箱<Input required type="email" autoComplete="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} /></label>
                 <label className="block space-y-1.5 text-xs font-medium">密码<Input required type="password" minLength={10} autoComplete={mode === "login" ? "current-password" : "new-password"} value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} /></label>
                 {message && <p className="rounded-md bg-muted p-3 text-xs">{message}</p>}
-                <Button className="w-full" disabled={busy || (mode === "register" && !registrationEnabled)}>{busy && <LoaderCircle className="size-4 animate-spin" />}{mode === "login" ? "登录" : registrationEnabled ? "注册并发送验证邮件" : "管理员已关闭注册"}</Button>
+                <Button type="submit" className="w-full" disabled={busy || (mode === "register" && !registrationEnabled)}>{busy && <LoaderCircle className="size-4 animate-spin" />}{mode === "login" ? "登录" : registrationEnabled ? "注册并发送验证邮件" : "管理员已关闭注册"}</Button>
                 <p className="text-center text-xs text-muted-foreground">{mode === "login" ? <>没有账号？ <Link className="text-primary hover:underline" href="/register">注册</Link></> : <>已有账号？ <Link className="text-primary hover:underline" href="/login">登录</Link></>}</p>
               </form>
             )}
