@@ -75,8 +75,9 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d   # 或 mak
 - `majsoulmanager-web`：React + shadcn/ui 管理台，端口 `3000`（本地构建时标签为 `majsoulmanager-web:local`）。
 - `metacubex/mihomo:v1.19.27`：Watch 专用代理内核，仅在 Compose 内网暴露控制与代理端口。
 
-宿主机只暴露 `web:3000` 与 `api:8000`；PostgreSQL、ClickHouse、RustFS、Redpanda
-只在 Compose 内网互通。本地开发叠加 `docker-compose.dev.yml` 时，这些基础设施端口
+宿主机只暴露 `web` 与 `api`，端口可用 `MJAI_WEB_PORT`（默认 `3000`）和
+`MJAI_API_PORT`（默认 `8000`）覆盖，与其他服务共用宿主机时在 `.env` 里改掉即可；
+PostgreSQL、ClickHouse、RustFS、Redpanda 只在 Compose 内网互通。本地开发叠加 `docker-compose.dev.yml` 时，这些基础设施端口
 会额外映射到 `127.0.0.1`（PostgreSQL `5432`、ClickHouse HTTP `8123`/native `9001`、
 RustFS S3 `9000`/控制台 `9002`、Redpanda `9092`/Admin `9644`）。
 
