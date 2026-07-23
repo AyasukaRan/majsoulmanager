@@ -1,20 +1,32 @@
 pub mod api;
 pub mod catalog;
 pub mod config;
+pub mod majsoul;
+pub mod managed_watch;
+pub mod mihomo;
 pub mod mjai;
 pub mod pack;
+pub mod watch;
+pub mod watch_service;
 
 use std::{path::PathBuf, sync::Arc};
 
 use catalog::Catalog;
 use config::Config;
+use managed_watch::ManagedWatchDependencies;
+use mihomo::MihomoManager;
 use pack::PackStore;
+use watch::WatchRegistry;
+use watch_service::WatchSupervisor;
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     pub catalog: Arc<Catalog>,
+    pub mihomo: Arc<MihomoManager>,
     pub packs: Arc<PackStore>,
+    pub watch: Arc<WatchRegistry>,
+    pub watch_service: Arc<WatchSupervisor>,
     pub export_dir: PathBuf,
 }
 
@@ -24,9 +36,33 @@ impl AppState {
         let pack_dir = data_dir.join("packs");
         let export_dir = data_dir.join("exports");
         std::fs::create_dir_all(&export_dir)?;
+        let packs = Arc::new(PackStore::new(pack_dir, config.pack_target_bytes)?);
+        let catalog = Arc::new(Catalog::default());
+        let watch = Arc::new(WatchRegistry::default());
+        let mihomo = Arc::new(MihomoManager::new(
+            data_dir.join("mihomo"),
+            &config.mihomo_controller_url,
+            config.mihomo_secret.clone(),
+            config.mihomo_proxy_url.clone(),
+        )?);
+        let dependencies = Arc::new(ManagedWatchDependencies {
+            data_dir: data_dir.clone(),
+            catalog: Arc::clone(&catalog),
+            packs: Arc::clone(&packs),
+            registry: Arc::clone(&watch),
+            mihomo: Arc::clone(&mihomo),
+        });
+        let watch_service = Arc::new(WatchSupervisor::new(
+            &data_dir,
+            Arc::clone(&watch),
+            dependencies,
+        )?);
         Ok(Self {
-            packs: Arc::new(PackStore::new(pack_dir, config.pack_target_bytes)?),
-            catalog: Arc::new(Catalog::default()),
+            packs,
+            catalog,
+            mihomo,
+            watch,
+            watch_service,
             config: Arc::new(config),
             export_dir,
         })

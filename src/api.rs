@@ -13,7 +13,7 @@ use axum::{
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use chrono::{DateTime, Utc};
 use flate2::{Compression, write::GzEncoder};
@@ -33,7 +33,12 @@ use crate::{
         DownloadFormat, DownloadJob, DownloadRequest, IdempotencyClaim, IdempotencyError, JobState,
         Record, RecordFilter,
     },
+    mihomo::{MihomoAction, MihomoError, MihomoStatus, ProxySelection, SubscriptionUpdate},
     mjai,
+    watch_service::{
+        InstallModuleRequest, InstalledModule, WatchAction, WatchDashboard, WatchRuntimeStatus,
+        WatchServiceConfig, WatchServiceError, module_protocol_contract,
+    },
 };
 
 pub fn router(state: AppState) -> Router {
@@ -46,6 +51,25 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/downloads", post(create_download))
         .route("/api/v1/downloads/{id}", get(get_download))
         .route("/api/v1/downloads/{id}/file", get(download_file))
+        .route("/api/v1/watch/status", get(get_watch_status))
+        .route("/api/v1/watch/config", get(get_watch_config))
+        .route("/api/v1/watch/config", put(put_watch_config))
+        .route("/api/v1/watch/actions", post(post_watch_action))
+        .route(
+            "/api/v1/watch/modules",
+            get(get_watch_modules).post(install_watch_module),
+        )
+        .route("/api/v1/watch/modules/protocol", get(get_module_protocol))
+        .route("/api/v1/watch/proxy", get(get_watch_proxy))
+        .route(
+            "/api/v1/watch/proxy/subscription",
+            put(put_watch_proxy_subscription),
+        )
+        .route(
+            "/api/v1/watch/proxy/selection",
+            put(put_watch_proxy_selection),
+        )
+        .route("/api/v1/watch/proxy/actions", post(post_watch_proxy_action))
         .layer(DefaultBodyLimit::max(max_batch))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
     Router::new()
@@ -53,6 +77,111 @@ pub fn router(state: AppState) -> Router {
         .merge(protected)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+#[derive(Deserialize)]
+struct WatchQuery {
+    state: Option<String>,
+    #[serde(default = "default_watch_limit")]
+    limit: usize,
+}
+
+fn default_watch_limit() -> usize {
+    50
+}
+
+async fn get_watch_status(
+    State(state): State<AppState>,
+    Query(query): Query<WatchQuery>,
+) -> Result<Json<WatchDashboard>, ApiError> {
+    if !(1..=1000).contains(&query.limit) {
+        return Err(ApiError::BadRequest(
+            "limit must be between 1 and 1000".into(),
+        ));
+    }
+    Ok(Json(
+        state
+            .watch_service
+            .dashboard(query.state.as_deref(), query.limit),
+    ))
+}
+
+async fn get_watch_config(State(state): State<AppState>) -> Json<WatchServiceConfig> {
+    Json(state.watch_service.config())
+}
+
+async fn put_watch_config(
+    State(state): State<AppState>,
+    Json(config): Json<WatchServiceConfig>,
+) -> Result<Json<WatchServiceConfig>, ApiError> {
+    Ok(Json(state.watch_service.update_config(config).await?))
+}
+
+#[derive(Deserialize)]
+struct WatchActionRequest {
+    action: WatchAction,
+}
+
+async fn post_watch_action(
+    State(state): State<AppState>,
+    Json(request): Json<WatchActionRequest>,
+) -> Result<Json<WatchRuntimeStatus>, ApiError> {
+    Ok(Json(
+        state.watch_service.apply_action(request.action).await?,
+    ))
+}
+
+async fn get_watch_modules(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<InstalledModule>>, ApiError> {
+    Ok(Json(state.watch_service.modules()?))
+}
+
+async fn install_watch_module(
+    State(state): State<AppState>,
+    Json(request): Json<InstallModuleRequest>,
+) -> Result<(StatusCode, Json<InstalledModule>), ApiError> {
+    Ok((
+        StatusCode::CREATED,
+        Json(state.watch_service.install_module(request).await?),
+    ))
+}
+
+async fn get_module_protocol() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "protocol_version": crate::watch_service::MODULE_PROTOCOL_VERSION,
+        "contract": module_protocol_contract(),
+    }))
+}
+
+async fn get_watch_proxy(State(state): State<AppState>) -> Json<MihomoStatus> {
+    Json(state.mihomo.status().await)
+}
+
+async fn put_watch_proxy_subscription(
+    State(state): State<AppState>,
+    Json(update): Json<SubscriptionUpdate>,
+) -> Result<Json<MihomoStatus>, ApiError> {
+    Ok(Json(state.mihomo.update_subscription(update).await?))
+}
+
+async fn put_watch_proxy_selection(
+    State(state): State<AppState>,
+    Json(selection): Json<ProxySelection>,
+) -> Result<Json<MihomoStatus>, ApiError> {
+    Ok(Json(state.mihomo.select(selection).await?))
+}
+
+#[derive(Deserialize)]
+struct MihomoActionRequest {
+    action: MihomoAction,
+}
+
+async fn post_watch_proxy_action(
+    State(state): State<AppState>,
+    Json(request): Json<MihomoActionRequest>,
+) -> Result<Json<MihomoStatus>, ApiError> {
+    Ok(Json(state.mihomo.action(request.action).await?))
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -549,6 +678,34 @@ enum ApiError {
 impl From<IdempotencyError> for ApiError {
     fn from(error: IdempotencyError) -> Self {
         ApiError::Conflict(error.to_string())
+    }
+}
+
+impl From<WatchServiceError> for ApiError {
+    fn from(error: WatchServiceError) -> Self {
+        match error {
+            WatchServiceError::InvalidConfig(_)
+            | WatchServiceError::InvalidModule(_)
+            | WatchServiceError::ModuleNotInstalled(_, _) => {
+                ApiError::BadRequest(error.to_string())
+            }
+            WatchServiceError::ModuleHealth(_) => ApiError::Conflict(error.to_string()),
+            WatchServiceError::Io(_) | WatchServiceError::Json(_) => {
+                ApiError::Internal(error.to_string())
+            }
+        }
+    }
+}
+
+impl From<MihomoError> for ApiError {
+    fn from(error: MihomoError) -> Self {
+        match error {
+            MihomoError::InvalidConfig(_) => ApiError::BadRequest(error.to_string()),
+            MihomoError::Controller(_) => ApiError::Conflict(error.to_string()),
+            MihomoError::Io(_) | MihomoError::Json(_) | MihomoError::Http(_) => {
+                ApiError::Internal(error.to_string())
+            }
+        }
     }
 }
 

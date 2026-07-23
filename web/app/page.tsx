@@ -56,6 +56,8 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { WatchStatusPanel } from "@/components/watch-status-panel";
+import { WatchControlPanel } from "@/components/watch-control-panel";
 
 const records = [
   {
@@ -235,6 +237,10 @@ export default function Home() {
             icon={Boxes}
           />
         </section>
+
+        <WatchControlPanel />
+
+        <WatchStatusPanel />
 
         <section className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_340px]">
           <Card className="min-w-0 border-border/70 shadow-none">

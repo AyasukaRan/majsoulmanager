@@ -33,4 +33,21 @@ pub struct Config {
         default_value_t = 256 * 1024 * 1024
     )]
     pub pack_target_bytes: u64,
+
+    #[arg(
+        long,
+        env = "MJAI_MIHOMO_CONTROLLER_URL",
+        default_value = "http://mihomo:9090"
+    )]
+    pub mihomo_controller_url: String,
+
+    #[arg(long, env = "MJAI_MIHOMO_SECRET", default_value = "change-mihomo-me")]
+    pub mihomo_secret: String,
+
+    #[arg(
+        long,
+        env = "MJAI_MIHOMO_PROXY_URL",
+        default_value = "http://mihomo:7890"
+    )]
+    pub mihomo_proxy_url: String,
 }
