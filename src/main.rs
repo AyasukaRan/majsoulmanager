@@ -17,6 +17,7 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::parse();
     let listen = config.listen.clone();
     let state = AppState::local(config)?;
+    state.watch_service.start_if_enabled().await?;
     let listener = TcpListener::bind(&listen).await?;
     tracing::info!(%listen, "mjai management API listening");
     axum::serve(listener, api::router(state))

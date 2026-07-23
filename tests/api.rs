@@ -3,6 +3,7 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use flate2::read::GzDecoder;
+use mjai_management::watch::{WatchEvent, WatchEventKind};
 use mjai_management::{AppState, api, config::Config};
 use serde_json::Value;
 use std::io::Read;
@@ -19,6 +20,9 @@ fn test_state() -> (AppState, std::path::PathBuf) {
         max_batch_bytes: 1024 * 1024,
         max_batch_records: 100,
         pack_target_bytes: 1024 * 1024,
+        mihomo_controller_url: "http://127.0.0.1:1".into(),
+        mihomo_secret: "test-mihomo-secret".into(),
+        mihomo_proxy_url: "http://127.0.0.1:7890".into(),
     })
     .unwrap();
     (state, data_dir)
@@ -219,5 +223,113 @@ async fn creates_and_downloads_a_filtered_archive() {
     assert_eq!(extracted, raw);
     drop(entry);
     assert!(entries.next().is_none());
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+#[tokio::test]
+async fn reports_watch_uuid_and_conversion_transitions() {
+    let (state, data_dir) = test_state();
+    let app = api::router(state.clone());
+    for event in [
+        WatchEventKind::Live,
+        WatchEventKind::Pending,
+        WatchEventKind::Fetching,
+        WatchEventKind::Converting,
+        WatchEventKind::Completed,
+    ] {
+        state
+            .watch
+            .apply(WatchEvent {
+                uuid: "260723-abcdef01-2345-6789-abcd-ef0123456789".into(),
+                event,
+                mode_id: Some(16),
+                started_at: None,
+                message: None,
+                record_id: None,
+            })
+            .unwrap();
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/watch/status?limit=10")
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(json["total"], 1);
+    assert_eq!(json["completed"], 1);
+    assert_eq!(json["items"][0]["uuid_state"], "fetched");
+    assert_eq!(json["items"][0]["conversion_state"], "completed");
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+#[tokio::test]
+async fn updates_and_persists_online_watch_configuration() {
+    let (state, data_dir) = test_state();
+    let app = api::router(state.clone());
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/watch/config")
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{
+                        "revision":1,
+                        "enabled":false,
+                        "room":"throne",
+                        "players":4,
+                        "modes":["south"],
+                        "server":"cn",
+                        "account_secret_ref":"env:MAJSOUL_TEST_ACCOUNT",
+                        "proxy_mode":"mihomo",
+                        "custom_proxy_url":null,
+                        "client_version":null,
+                        "poll_interval_secs":15,
+                        "request_delay_ms":800,
+                        "login_module":{"name":"builtin","version":"majsoul2mjai-da985809"},
+                        "pb_fetch_module":{"name":"builtin","version":"majsoul2mjai-da985809"}
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(json["revision"], 2);
+    assert_eq!(json["room"], "throne");
+    assert_eq!(state.watch_service.config().request_delay_ms, 800);
+
+    let persisted: Value =
+        serde_json::from_slice(&std::fs::read(data_dir.join("watch/config.json")).unwrap())
+            .unwrap();
+    assert_eq!(persisted["revision"], 2);
+    assert_eq!(persisted["account_secret_ref"], "env:MAJSOUL_TEST_ACCOUNT");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/watch/modules")
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let modules: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(modules.as_array().unwrap().len(), 2);
     std::fs::remove_dir_all(data_dir).unwrap();
 }

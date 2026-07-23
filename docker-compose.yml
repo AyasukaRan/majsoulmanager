@@ -1,6 +1,13 @@
 name: mjai-management
 
 services:
+  mihomo-perms:
+    image: alpine:3.21
+    user: root
+    volumes:
+      - mihomo-data:/fix_path
+    command: chown -R 10001:10001 /fix_path
+
   api:
     image: mjai-management-api:local
     build:
@@ -13,9 +20,27 @@ services:
       MJAI_MAX_BATCH_BYTES: ${MJAI_MAX_BATCH_BYTES:-536870912}
       MJAI_MAX_BATCH_RECORDS: ${MJAI_MAX_BATCH_RECORDS:-50000}
       MJAI_PACK_TARGET_BYTES: ${MJAI_PACK_TARGET_BYTES:-268435456}
+      MJAI_MIHOMO_CONTROLLER_URL: http://mihomo:9090
+      MJAI_MIHOMO_SECRET: ${MJAI_MIHOMO_SECRET:-change-mihomo-me}
+      MJAI_MIHOMO_PROXY_URL: http://mihomo:7890
+      MAJSOUL_ACCOUNTS: ${MAJSOUL_ACCOUNTS:-}
     ports: ["8000:8000"]
     volumes:
       - api-data:/var/lib/mjai
+      - mihomo-data:/var/lib/mjai/mihomo
+    depends_on:
+      mihomo-perms:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  mihomo:
+    image: metacubex/mihomo:v1.19.27
+    command: ["-d", "/root/.config/mihomo", "-f", "/root/.config/mihomo/config.yaml"]
+    depends_on:
+      api:
+        condition: service_healthy
+    volumes:
+      - mihomo-data:/root/.config/mihomo
     restart: unless-stopped
 
   web:
@@ -25,6 +50,7 @@ services:
       dockerfile: Dockerfile
     environment:
       MJAI_API_BASE_URL: http://api:8000
+      MJAI_API_KEY: ${MJAI_API_KEY:-change-me}
     ports: ["3000:3000"]
     depends_on:
       api:
@@ -115,3 +141,4 @@ volumes:
   clickhouse-data:
   rustfs-data:
   redpanda-data:
+  mihomo-data:
