@@ -1,4 +1,4 @@
-.PHONY: install dev test lint infra-up infra-down
+.PHONY: install dev test lint image-build infra-up infra-down
 
 install:
 	cargo fetch
@@ -12,6 +12,9 @@ test:
 lint:
 	cargo fmt --check
 	cargo clippy --all-targets -- -D warnings
+
+image-build:
+	docker compose build api web
 
 infra-up:
 	docker compose up -d

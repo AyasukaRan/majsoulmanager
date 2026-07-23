@@ -1,6 +1,36 @@
 name: mjai-management
 
 services:
+  api:
+    image: mjai-management-api:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      MJAI_API_KEY: ${MJAI_API_KEY:-change-me}
+      MJAI_DATA_DIR: /var/lib/mjai
+      MJAI_MAX_RECORD_BYTES: ${MJAI_MAX_RECORD_BYTES:-16384}
+      MJAI_MAX_BATCH_BYTES: ${MJAI_MAX_BATCH_BYTES:-536870912}
+      MJAI_MAX_BATCH_RECORDS: ${MJAI_MAX_BATCH_RECORDS:-50000}
+      MJAI_PACK_TARGET_BYTES: ${MJAI_PACK_TARGET_BYTES:-268435456}
+    ports: ["8000:8000"]
+    volumes:
+      - api-data:/var/lib/mjai
+    restart: unless-stopped
+
+  web:
+    image: mjai-management-web:local
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    environment:
+      MJAI_API_BASE_URL: http://api:8000
+    ports: ["3000:3000"]
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
   postgres:
     image: postgres:17-alpine
     environment:
@@ -80,6 +110,7 @@ services:
       - redpanda-data:/var/lib/redpanda/data
 
 volumes:
+  api-data:
   postgres-data:
   clickhouse-data:
   rustfs-data:

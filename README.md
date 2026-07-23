@@ -55,6 +55,19 @@ curl -X POST http://localhost:8000/api/v1/records/batch \
 docker compose up -d
 ```
 
-本地端口：PostgreSQL `5432`、ClickHouse HTTP `8123`、RustFS S3 `9000`、RustFS 控制台 `9002`、Redpanda `9092`。
+Compose 会构建并启动两个应用镜像：
+
+- `mjai-management-api:local`：Rust/Axum API，端口 `8000`。
+- `mjai-management-web:local`：React + shadcn/ui 管理台，端口 `3000`。
+
+其余本地端口：PostgreSQL `5432`、ClickHouse HTTP `8123`、RustFS S3 `9000`、RustFS 控制台 `9002`、Redpanda `9092`。
+
+只构建前后端镜像：
+
+```bash
+make image-build
+```
+
+前端工程说明见 [web/README.md](web/README.md)。
 
 生产路径不会把每个约 10KB 的 mjson 分别存成 RustFS 对象。打包器把每条记录压成独立 Zstandard frame，再合并为约 256MB 的 `.mjpack`；单条读取根据 ClickHouse 中的 offset/length 发起 Range GET，只下载对应的几 KB。
