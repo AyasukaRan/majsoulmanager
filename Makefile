@@ -14,13 +14,13 @@ lint:
 	cargo clippy --all-targets -- -D warnings
 
 image-build:
-	docker compose -f docker-compose.yml -f docker-compose.build.yml build api web
+	docker compose -f docker-compose.yml -f docker-compose.dev.yml build api web
 
 infra-up:
 	docker compose up -d
 
 infra-up-local:
-	docker compose -f docker-compose.yml -f docker-compose.build.yml up -d
+	docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 
 infra-pull:
 	docker compose pull api web

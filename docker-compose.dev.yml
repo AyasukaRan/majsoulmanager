@@ -1,0 +1,30 @@
+# 叠加在 docker-compose.yml 之上，用于本地开发：
+#   - api/web 从当前源码构建（每次 up 自动重建）
+#   - 基础设施端口映射到 127.0.0.1，便于本地调试；部署环境一律走容器内网
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+services:
+  api:
+    image: majsoulmanager-api:local
+    pull_policy: build
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+  web:
+    image: majsoulmanager-web:local
+    pull_policy: build
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+
+  postgres:
+    ports: ["127.0.0.1:5432:5432"]
+
+  clickhouse:
+    ports: ["127.0.0.1:8123:8123", "127.0.0.1:9001:9000"]
+
+  rustfs:
+    ports: ["127.0.0.1:9000:9000", "127.0.0.1:9002:9001"]
+
+  redpanda:
+    ports: ["127.0.0.1:9092:9092", "127.0.0.1:9644:9644"]

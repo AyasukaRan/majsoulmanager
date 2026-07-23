@@ -59,14 +59,14 @@ curl -X POST http://localhost:8000/api/v1/records/batch \
 ## 本地基础设施
 
 Compose 有两套用法：默认直接拉取已发布镜像；本地开发时叠加
-`docker-compose.build.yml` 从当前源码构建。
+`docker-compose.dev.yml` 从当前源码构建。
 
 ```bash
-# 默认：拉取 GHCR 已发布镜像（MJAI_IMAGE_TAG 指定版本，默认 latest）
+# 默认（部署）：拉取 GHCR 已发布镜像（MJAI_IMAGE_TAG 指定版本，默认 latest）
 docker compose up -d          # 或 make infra-up；更新镜像用 make infra-pull
 
-# 本地构建：api/web 从当前源码构建，每次 up 自动重建
-docker compose -f docker-compose.yml -f docker-compose.build.yml up -d   # 或 make infra-up-local
+# 本地开发：api/web 从当前源码构建（每次 up 自动重建），并把基础设施端口映射到 127.0.0.1
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d   # 或 make infra-up-local
 ```
 
 两个应用镜像：
@@ -75,7 +75,10 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d   # 或 m
 - `majsoulmanager-web`：React + shadcn/ui 管理台，端口 `3000`（本地构建时标签为 `majsoulmanager-web:local`）。
 - `metacubex/mihomo:v1.19.27`：Watch 专用代理内核，仅在 Compose 内网暴露控制与代理端口。
 
-其余本地端口：PostgreSQL `5432`、ClickHouse HTTP `8123`、RustFS S3 `9000`、RustFS 控制台 `9002`、Redpanda `9092`。
+宿主机只暴露 `web:3000` 与 `api:8000`；PostgreSQL、ClickHouse、RustFS、Redpanda
+只在 Compose 内网互通。本地开发叠加 `docker-compose.dev.yml` 时，这些基础设施端口
+会额外映射到 `127.0.0.1`（PostgreSQL `5432`、ClickHouse HTTP `8123`/native `9001`、
+RustFS S3 `9000`/控制台 `9002`、Redpanda `9092`/Admin `9644`）。
 
 首次启动时会根据 `MJAI_ADMIN_EMAIL` 和 `MJAI_ADMIN_PASSWORD` 创建管理员。
 生产部署必须覆盖示例密码。公开注册默认关闭；配置邮件投递 API 后，管理员可在
