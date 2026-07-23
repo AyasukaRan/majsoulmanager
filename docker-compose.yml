@@ -27,7 +27,7 @@ services:
       MJAI_EMAIL_API_URL: ${MJAI_EMAIL_API_URL:-}
       MJAI_EMAIL_API_TOKEN: ${MJAI_EMAIL_API_TOKEN:-}
       MJAI_EMAIL_FROM: ${MJAI_EMAIL_FROM:-noreply@example.com}
-    ports: ["8000:8000"]
+    ports: ["${MJAI_API_PORT:-8000}:8000"]
     volumes:
       - api-data:/var/lib/mjai
       - mihomo-data:/var/lib/mjai/mihomo
@@ -51,7 +51,7 @@ services:
     environment:
       MJAI_API_BASE_URL: http://api:8000
       MJAI_API_KEY: ${MJAI_API_KEY:-change-me}
-    ports: ["3000:3000"]
+    ports: ["${MJAI_WEB_PORT:-3000}:3000"]
     depends_on:
       api:
         condition: service_healthy
