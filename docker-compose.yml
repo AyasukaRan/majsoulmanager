@@ -9,11 +9,7 @@ services:
     command: chown -R 10001:10001 /fix_path
 
   api:
-    image: mjai-management-api:local
-    pull_policy: build
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ghcr.io/ayasukaran/majsoulmanager-api:${MJAI_IMAGE_TAG:-latest}
     environment:
       MJAI_API_KEY: ${MJAI_API_KEY:-change-me}
       MJAI_DATA_DIR: /var/lib/mjai
@@ -51,11 +47,7 @@ services:
     restart: unless-stopped
 
   web:
-    image: mjai-management-web:local
-    pull_policy: build
-    build:
-      context: ./web
-      dockerfile: Dockerfile
+    image: ghcr.io/ayasukaran/majsoulmanager-web:${MJAI_IMAGE_TAG:-latest}
     environment:
       MJAI_API_BASE_URL: http://api:8000
       MJAI_API_KEY: ${MJAI_API_KEY:-change-me}

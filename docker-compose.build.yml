@@ -1,0 +1,16 @@
+# 叠加在 docker-compose.yml 之上，把 api/web 换成本地源码构建：
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d
+services:
+  api:
+    image: majsoulmanager-api:local
+    pull_policy: build
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+  web:
+    image: majsoulmanager-web:local
+    pull_policy: build
+    build:
+      context: ./web
+      dockerfile: Dockerfile
