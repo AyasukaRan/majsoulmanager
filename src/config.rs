@@ -50,4 +50,26 @@ pub struct Config {
         default_value = "http://mihomo:7890"
     )]
     pub mihomo_proxy_url: String,
+
+    #[arg(long, env = "MJAI_PUBLIC_URL", default_value = "http://localhost:3000")]
+    pub public_url: String,
+
+    #[arg(long, env = "MJAI_ADMIN_EMAIL", default_value = "admin@example.com")]
+    pub admin_email: String,
+
+    #[arg(
+        long,
+        env = "MJAI_ADMIN_PASSWORD",
+        default_value = "change-this-password"
+    )]
+    pub admin_password: String,
+
+    #[arg(long, env = "MJAI_EMAIL_API_URL")]
+    pub email_api_url: Option<String>,
+
+    #[arg(long, env = "MJAI_EMAIL_API_TOKEN")]
+    pub email_api_token: Option<String>,
+
+    #[arg(long, env = "MJAI_EMAIL_FROM", default_value = "noreply@example.com")]
+    pub email_from: String,
 }

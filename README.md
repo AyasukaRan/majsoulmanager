@@ -1,5 +1,7 @@
 # mjai management
 
+[![CI](https://github.com/AyasukaRan/majsoulmanager/actions/workflows/ci.yml/badge.svg)](https://github.com/AyasukaRan/majsoulmanager/actions/workflows/ci.yml)
+
 面向数亿级 mjai 对局日志的采集、索引、筛选和批量下载服务。
 
 ## 当前能力
@@ -14,6 +16,7 @@
 - 集成 mihomo：网页配置订阅、刷新 provider、测试节点延迟并切换 Watch 专用节点。
 - 原始数据与索引分离：RustFS 保存不可变 `.mjpack` 数据包，ClickHouse 保存筛选字段和包内偏移。
 - PostgreSQL 保存采集幂等状态和下载任务，Kafka/Redpanda 解耦索引与导出工作负载。
+- 管理台提供用户登录、管理员用户管理和公开注册开关；公开注册用户必须在 24 小时内完成邮箱验证。
 
 默认本地后端用于零依赖开发和接口测试；生产环境使用 `.env.example` 中的基础设施配置。规模设计、单条读取原理和上线清单见 [docs/architecture.md](docs/architecture.md)。
 
@@ -66,11 +69,31 @@ Compose 会构建并启动两个应用镜像：
 
 其余本地端口：PostgreSQL `5432`、ClickHouse HTTP `8123`、RustFS S3 `9000`、RustFS 控制台 `9002`、Redpanda `9092`。
 
+首次启动时会根据 `MJAI_ADMIN_EMAIL` 和 `MJAI_ADMIN_PASSWORD` 创建管理员。
+生产部署必须覆盖示例密码。公开注册默认关闭；配置邮件投递 API 后，管理员可在
+“用户管理”页面开启注册：
+
+```dotenv
+MJAI_PUBLIC_URL=https://mjai.example.com
+MJAI_EMAIL_API_URL=https://api.resend.com/emails
+MJAI_EMAIL_API_TOKEN=re_xxx
+MJAI_EMAIL_FROM=mjai@example.com
+```
+
+邮件接口采用 Resend 兼容的 JSON 请求格式。若未配置 `MJAI_EMAIL_API_URL`，
+管理台不会允许开启公开注册。
+
 只构建前后端镜像：
 
 ```bash
 make image-build
 ```
+
+GitHub Actions 会在 PR 中验证镜像构建，并在 push 时发布到 GHCR：
+
+- 非 `main` 分支：`ghcr.io/ayasukaran/majsoulmanager-api:dev` 与 `ghcr.io/ayasukaran/majsoulmanager-web:dev`
+- `main`：`ghcr.io/ayasukaran/majsoulmanager-api:latest` 与 `ghcr.io/ayasukaran/majsoulmanager-web:latest`
+- `v*` 标签：发布去掉 `v` 前缀后的版本标签
 
 前端工程说明见 [web/README.md](web/README.md)。
 

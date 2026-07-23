@@ -4,13 +4,13 @@ import test from "node:test";
 
 const projectRoot = new URL("../", import.meta.url);
 
-async function render() {
+async function render(path = "/") {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
   workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
   const { default: worker } = await import(workerUrl.href);
 
   return worker.fetch(
-    new Request("http://mjai.local/", {
+    new Request(`http://mjai.local${path}`, {
       headers: {
         accept: "text/html",
         host: "mjai.local",
@@ -29,17 +29,20 @@ async function render() {
   );
 }
 
-test("server-renders the mjai management dashboard", async () => {
+test("protects the dashboard and server-renders the login page", async () => {
   const response = await render();
-  assert.equal(response.status, 200);
-  assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
+  assert.equal(response.status, 307);
+  assert.equal(response.headers.get("location"), "http://mjai.local/login");
 
-  const html = await response.text();
+  const login = await render("/login");
+  assert.equal(login.status, 200);
+  assert.match(login.headers.get("content-type") ?? "", /^text\/html\b/i);
+  const html = await login.text();
   assert.match(html, /<title>mjai 管理台<\/title>/i);
-  assert.match(html, /对局数据概览/);
-  assert.match(html, /最近入库/);
-  assert.match(html, /RustFS/);
-  assert.match(html, /ClickHouse/);
+  assert.match(html, /登录管理台/);
+  assert.match(html, /使用管理员或已验证账号继续/);
+  assert.match(html, /创建账号|注册/);
+  assert.match(html, /type="submit"/);
   assert.match(html, /https:\/\/mjai\.local\/og\.png/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/);
 });

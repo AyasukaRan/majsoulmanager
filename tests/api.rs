@@ -1,16 +1,27 @@
 use axum::{
+    Json, Router,
     body::{Body, to_bytes},
+    extract::State,
     http::{Request, StatusCode, header},
+    routing::post,
 };
 use flate2::read::GzDecoder;
+use mjai_management::auth::{
+    AuthError, AuthSettings, LoginRequest, RegisterRequest, UserRole, VerifyEmailRequest,
+};
 use mjai_management::watch::{WatchEvent, WatchEventKind};
 use mjai_management::{AppState, api, config::Config};
 use serde_json::Value;
 use std::io::Read;
+use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 use uuid::Uuid;
 
 fn test_state() -> (AppState, std::path::PathBuf) {
+    test_state_with_email(None)
+}
+
+fn test_state_with_email(email_api_url: Option<String>) -> (AppState, std::path::PathBuf) {
     let data_dir = std::env::temp_dir().join(format!("mjai-api-test-{}", Uuid::new_v4()));
     let state = AppState::local(Config {
         listen: "127.0.0.1:0".into(),
@@ -23,9 +34,27 @@ fn test_state() -> (AppState, std::path::PathBuf) {
         mihomo_controller_url: "http://127.0.0.1:1".into(),
         mihomo_secret: "test-mihomo-secret".into(),
         mihomo_proxy_url: "http://127.0.0.1:7890".into(),
+        public_url: "http://localhost:3000".into(),
+        admin_email: "admin@example.com".into(),
+        admin_password: "test-password-123".into(),
+        email_api_url,
+        email_api_token: None,
+        email_from: "noreply@example.com".into(),
     })
     .unwrap();
     (state, data_dir)
+}
+
+type EmailSender = Arc<Mutex<Option<tokio::sync::oneshot::Sender<Value>>>>;
+
+async fn capture_email(
+    State(sender): State<EmailSender>,
+    Json(payload): Json<Value>,
+) -> StatusCode {
+    if let Some(sender) = sender.lock().unwrap().take() {
+        let _ = sender.send(payload);
+    }
+    StatusCode::OK
 }
 
 fn ingest_request(key: &str, body: &'static str) -> Request<Body> {
@@ -98,6 +127,148 @@ async fn rejects_unauthenticated_collection() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+#[tokio::test]
+async fn logs_in_the_bootstrap_admin_and_protects_user_management() {
+    let (state, data_dir) = test_state();
+    let app = api::router(state);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"email":"admin@example.com","password":"test-password-123"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let login: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let session = login["session_token"].as_str().unwrap();
+    assert_eq!(login["user"]["role"], "admin");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/auth/me")
+                .header("x-mjai-user-session", session)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/users")
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .header("x-mjai-user-session", session)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/register")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"name":"New user","email":"new@example.com","password":"new-password-123"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+#[tokio::test]
+async fn requires_email_verification_before_a_registered_user_can_log_in() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let email_url = format!("http://{}/emails", listener.local_addr().unwrap());
+    let (email_sender, email_receiver) = tokio::sync::oneshot::channel();
+    let capture = Arc::new(Mutex::new(Some(email_sender)));
+    let email_server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/emails", post(capture_email))
+                .with_state(capture),
+        )
+        .await
+    });
+
+    let (state, data_dir) = test_state_with_email(Some(email_url));
+    let admin = state
+        .auth
+        .login(LoginRequest {
+            email: "admin@example.com".into(),
+            password: "test-password-123".into(),
+        })
+        .unwrap();
+    state
+        .auth
+        .update_settings(
+            &admin.session_token,
+            AuthSettings {
+                registration_enabled: true,
+            },
+        )
+        .unwrap();
+    state
+        .auth
+        .register(RegisterRequest {
+            name: "Verified member".into(),
+            email: "member@example.com".into(),
+            password: "member-password-123".into(),
+        })
+        .await
+        .unwrap();
+
+    let error = state
+        .auth
+        .login(LoginRequest {
+            email: "member@example.com".into(),
+            password: "member-password-123".into(),
+        })
+        .unwrap_err();
+    assert!(matches!(error, AuthError::EmailNotVerified));
+
+    let email = email_receiver.await.unwrap();
+    let text = email["text"].as_str().unwrap();
+    let token = text.split("?token=").nth(1).unwrap().trim().to_owned();
+    state
+        .auth
+        .verify_email(VerifyEmailRequest { token })
+        .unwrap();
+    let member = state
+        .auth
+        .login(LoginRequest {
+            email: "member@example.com".into(),
+            password: "member-password-123".into(),
+        })
+        .unwrap();
+    assert_eq!(member.user.role, UserRole::Member);
+
+    email_server.abort();
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 

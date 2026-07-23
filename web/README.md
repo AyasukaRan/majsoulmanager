@@ -11,6 +11,11 @@ npm run dev
 
 默认访问 `http://localhost:3000`。Rust API 默认位于 `http://localhost:8000`，可通过 `.env` 中的 `MJAI_API_BASE_URL` 调整。
 
+管理台按概览、牌谱索引、Watch 服务、批量导出和用户管理拆分路由。浏览器登录后
+仅保存 HttpOnly 会话 Cookie；后端 API key 只由前端 BFF 读取，不会下发到浏览器。
+公开注册默认关闭，管理员配置邮件投递服务后可在用户管理页开启；新账号完成邮箱
+验证后才能登录。
+
 ## 镜像部署
 
 前端使用多阶段 `Dockerfile` 构建 Vinext 产物，并通过 Node 22 运行生产服务器：

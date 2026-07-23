@@ -1,4 +1,5 @@
 pub mod api;
+pub mod auth;
 pub mod catalog;
 pub mod config;
 pub mod majsoul;
@@ -11,6 +12,7 @@ pub mod watch_service;
 
 use std::{path::PathBuf, sync::Arc};
 
+use auth::AuthStore;
 use catalog::Catalog;
 use config::Config;
 use managed_watch::ManagedWatchDependencies;
@@ -22,6 +24,7 @@ use watch_service::WatchSupervisor;
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
+    pub auth: Arc<AuthStore>,
     pub catalog: Arc<Catalog>,
     pub mihomo: Arc<MihomoManager>,
     pub packs: Arc<PackStore>,
@@ -38,6 +41,15 @@ impl AppState {
         std::fs::create_dir_all(&export_dir)?;
         let packs = Arc::new(PackStore::new(pack_dir, config.pack_target_bytes)?);
         let catalog = Arc::new(Catalog::default());
+        let auth = Arc::new(AuthStore::new(
+            &data_dir,
+            &config.admin_email,
+            &config.admin_password,
+            config.public_url.clone(),
+            config.email_api_url.clone(),
+            config.email_api_token.clone(),
+            config.email_from.clone(),
+        )?);
         let watch = Arc::new(WatchRegistry::default());
         let mihomo = Arc::new(MihomoManager::new(
             data_dir.join("mihomo"),
@@ -58,6 +70,7 @@ impl AppState {
             dependencies,
         )?);
         Ok(Self {
+            auth,
             packs,
             catalog,
             mihomo,

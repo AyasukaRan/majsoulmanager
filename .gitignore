@@ -9,6 +9,8 @@ __pycache__/
 htmlcov/
 dist/
 build/
+!web/build/
+!web/build/sites-vite-plugin.ts
 target/
 .DS_Store
 data/
