@@ -1,0 +1,36 @@
+use std::path::PathBuf;
+
+use clap::Parser;
+
+#[derive(Clone, Debug, Parser)]
+#[command(version, about)]
+pub struct Config {
+    #[arg(long, env = "MJAI_LISTEN", default_value = "0.0.0.0:8000")]
+    pub listen: String,
+
+    #[arg(long, env = "MJAI_API_KEY", default_value = "change-me")]
+    pub api_key: String,
+
+    #[arg(long, env = "MJAI_DATA_DIR", default_value = "data")]
+    pub data_dir: PathBuf,
+
+    #[arg(long, env = "MJAI_MAX_RECORD_BYTES", default_value_t = 16 * 1024)]
+    pub max_record_bytes: usize,
+
+    #[arg(
+        long,
+        env = "MJAI_MAX_BATCH_BYTES",
+        default_value_t = 512 * 1024 * 1024
+    )]
+    pub max_batch_bytes: usize,
+
+    #[arg(long, env = "MJAI_MAX_BATCH_RECORDS", default_value_t = 50_000)]
+    pub max_batch_records: usize,
+
+    #[arg(
+        long,
+        env = "MJAI_PACK_TARGET_BYTES",
+        default_value_t = 256 * 1024 * 1024
+    )]
+    pub pack_target_bytes: u64,
+}
