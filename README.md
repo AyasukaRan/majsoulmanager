@@ -1,6 +1,7 @@
 # mjai management
 
-[![CI](https://github.com/AyasukaRan/majsoulmanager/actions/workflows/ci.yml/badge.svg)](https://github.com/AyasukaRan/majsoulmanager/actions/workflows/ci.yml)
+[![CI](https://github.com/AyasukaRan/majsoulmanager/actions/workflows/ci.yml/badge.svg?event=pull_request)](https://github.com/AyasukaRan/majsoulmanager/actions/workflows/ci.yml)
+[![Release](https://github.com/AyasukaRan/majsoulmanager/actions/workflows/release.yml/badge.svg)](https://github.com/AyasukaRan/majsoulmanager/actions/workflows/release.yml)
 
 面向数亿级 mjai 对局日志的采集、索引、筛选和批量下载服务。
 
@@ -89,11 +90,15 @@ MJAI_EMAIL_FROM=mjai@example.com
 make image-build
 ```
 
-GitHub Actions 会在 PR 中验证镜像构建，并在 push 时发布到 GHCR：
+GitHub Actions 分为 `CI` 与 `Release` 两个工作流，共用 `Checks`（Rust 与 Web
+的格式化、Lint、测试）作为门禁：
 
-- 非 `main` 分支：`ghcr.io/ayasukaran/majsoulmanager-api:dev` 与 `ghcr.io/ayasukaran/majsoulmanager-web:dev`
-- `main`：`ghcr.io/ayasukaran/majsoulmanager-api:latest` 与 `ghcr.io/ayasukaran/majsoulmanager-web:latest`
-- `v*` 标签：发布去掉 `v` 前缀后的版本标签
+- `CI`：只在 PR 上运行，执行检查并试构建镜像，不发布任何产物。
+- `Release`：只在 push `main`、推送 `v*` 标签或手动触发时运行，检查通过后
+  发布镜像到 GHCR：
+  - `main`：`ghcr.io/ayasukaran/majsoulmanager-api:latest` 与 `ghcr.io/ayasukaran/majsoulmanager-web:latest`
+  - `v*` 标签：发布去掉 `v` 前缀后的版本标签
+  - 其他分支仅可手动触发（workflow_dispatch），发布 `dev` 标签
 
 前端工程说明见 [web/README.md](web/README.md)。
 
