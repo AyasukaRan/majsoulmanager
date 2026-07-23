@@ -39,6 +39,7 @@ use crate::{
     },
     mihomo::{MihomoAction, MihomoError, MihomoStatus, ProxySelection, SubscriptionUpdate},
     mjai,
+    watch_log::WatchLogEntry,
     watch_service::{
         InstallModuleRequest, InstalledModule, WatchAction, WatchDashboard, WatchRuntimeStatus,
         WatchServiceConfig, WatchServiceError, module_protocol_contract,
@@ -56,6 +57,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/downloads/{id}", get(get_download))
         .route("/api/v1/downloads/{id}/file", get(download_file))
         .route("/api/v1/watch/status", get(get_watch_status))
+        .route("/api/v1/watch/logs", get(get_watch_logs))
         .route("/api/v1/watch/config", get(get_watch_config))
         .route("/api/v1/watch/config", put(put_watch_config))
         .route("/api/v1/watch/actions", post(post_watch_action))
@@ -219,6 +221,40 @@ async fn get_watch_status(
             .watch_service
             .dashboard(query.state.as_deref(), query.limit),
     ))
+}
+
+#[derive(Deserialize)]
+struct WatchLogQuery {
+    after: Option<u64>,
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct WatchLogPage {
+    boot_id: Uuid,
+    items: Vec<WatchLogEntry>,
+    next_cursor: Option<u64>,
+}
+
+async fn get_watch_logs(
+    State(state): State<AppState>,
+    Query(query): Query<WatchLogQuery>,
+) -> Result<Json<WatchLogPage>, ApiError> {
+    let limit = query.limit.unwrap_or(200);
+    if !(1..=1000).contains(&limit) {
+        return Err(ApiError::BadRequest(
+            "limit must be between 1 and 1000".into(),
+        ));
+    }
+    let items = state
+        .watch_service
+        .logs_after(query.after.unwrap_or(0), limit);
+    let next_cursor = items.last().map(|entry| entry.seq);
+    Ok(Json(WatchLogPage {
+        boot_id: state.watch_service.log_buffer().boot_id(),
+        items,
+        next_cursor,
+    }))
 }
 
 async fn get_watch_config(State(state): State<AppState>) -> Json<WatchServiceConfig> {

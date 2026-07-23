@@ -1,4 +1,5 @@
 import { WatchControlPanel } from "@/components/watch-control-panel";
+import { WatchLogPanel } from "@/components/watch-log-panel";
 import { WatchStatusPanel } from "@/components/watch-status-panel";
 
 export default function WatchPage() {
@@ -10,6 +11,7 @@ export default function WatchPage() {
         <p className="mt-1 text-sm text-muted-foreground">管理采集任务、热更新协议模块、代理节点及逐条转换状态。</p>
       </div>
       <WatchControlPanel />
+      <WatchLogPanel />
       <WatchStatusPanel />
     </div>
   );

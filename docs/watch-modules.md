@@ -18,7 +18,10 @@ Watch 是 `mjai-management-api` 进程内的受管后台任务。API 负责队�
 6. 安装、健康检查或启动失败时保留原配置和原版本。
 
 模块目录按 `watch/modules/{login|pb_fetch}/{name}/{version}` 隔离。不要在
-模块 stdout 写日志；stdout 只用于协议，日志写 stderr。
+模块 stdout 写日志；stdout 只用于协议，日志写 stderr。模块 stderr 会被逐行
+采集进服务日志缓冲并展示在管理台「服务日志」面板（单行截断 8KB），因此
+不要在 stderr 回显收到的请求参数（如 `open_session` 的密码、代理凭据）；
+后端会对已知机密做替换兜底，但不能覆盖变形输出。
 
 ## 通用传输
 

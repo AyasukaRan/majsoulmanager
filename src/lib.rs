@@ -8,6 +8,7 @@ pub mod mihomo;
 pub mod mjai;
 pub mod pack;
 pub mod watch;
+pub mod watch_log;
 pub mod watch_service;
 
 use std::{path::PathBuf, sync::Arc};
@@ -19,6 +20,7 @@ use managed_watch::ManagedWatchDependencies;
 use mihomo::MihomoManager;
 use pack::PackStore;
 use watch::WatchRegistry;
+use watch_log::WatchLogBuffer;
 use watch_service::WatchSupervisor;
 
 #[derive(Clone)]
@@ -57,17 +59,20 @@ impl AppState {
             config.mihomo_secret.clone(),
             config.mihomo_proxy_url.clone(),
         )?);
+        let watch_logs = Arc::new(WatchLogBuffer::default());
         let dependencies = Arc::new(ManagedWatchDependencies {
             data_dir: data_dir.clone(),
             catalog: Arc::clone(&catalog),
             packs: Arc::clone(&packs),
             registry: Arc::clone(&watch),
             mihomo: Arc::clone(&mihomo),
+            logs: Arc::clone(&watch_logs),
         });
         let watch_service = Arc::new(WatchSupervisor::new(
             &data_dir,
             Arc::clone(&watch),
             dependencies,
+            watch_logs,
         )?);
         Ok(Self {
             auth,
