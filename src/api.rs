@@ -29,6 +29,10 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
+    auth::{
+        AuthError, AuthSettings, CreateUserRequest, LoginRequest, LoginResponse, RegisterRequest,
+        RegistrationStatus, UpdateUserRequest, UserView, VerifyEmailRequest,
+    },
     catalog::{
         DownloadFormat, DownloadJob, DownloadRequest, IdempotencyClaim, IdempotencyError, JobState,
         Record, RecordFilter,
@@ -70,13 +74,124 @@ pub fn router(state: AppState) -> Router {
             put(put_watch_proxy_selection),
         )
         .route("/api/v1/watch/proxy/actions", post(post_watch_proxy_action))
+        .route("/api/v1/users", get(get_users).post(create_user))
+        .route("/api/v1/users/{id}", put(update_user))
+        .route(
+            "/api/v1/auth/settings",
+            get(get_auth_settings).put(put_auth_settings),
+        )
         .layer(DefaultBodyLimit::max(max_batch))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
     Router::new()
         .route("/healthz", get(health))
+        .route("/api/v1/auth/status", get(get_registration_status))
+        .route("/api/v1/auth/login", post(login))
+        .route("/api/v1/auth/register", post(register))
+        .route("/api/v1/auth/verify-email", post(verify_email))
+        .route("/api/v1/auth/me", get(get_current_user))
+        .route("/api/v1/auth/logout", post(logout))
         .merge(protected)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+const USER_SESSION_HEADER: &str = "x-mjai-user-session";
+
+async fn get_registration_status(State(state): State<AppState>) -> Json<RegistrationStatus> {
+    Json(state.auth.registration_status())
+}
+
+async fn login(
+    State(state): State<AppState>,
+    Json(request): Json<LoginRequest>,
+) -> Result<Json<LoginResponse>, ApiError> {
+    Ok(Json(state.auth.login(request)?))
+}
+
+async fn register(
+    State(state): State<AppState>,
+    Json(request): Json<RegisterRequest>,
+) -> Result<StatusCode, ApiError> {
+    state.auth.register(request).await?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn verify_email(
+    State(state): State<AppState>,
+    Json(request): Json<VerifyEmailRequest>,
+) -> Result<StatusCode, ApiError> {
+    state.auth.verify_email(request)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_current_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<UserView>, ApiError> {
+    Ok(Json(state.auth.user_for_session(user_session(&headers)?)?))
+}
+
+async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
+    state.auth.logout(user_session(&headers)?);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_users(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<UserView>>, ApiError> {
+    Ok(Json(state.auth.users(user_session(&headers)?)?))
+}
+
+async fn create_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateUserRequest>,
+) -> Result<(StatusCode, Json<UserView>), ApiError> {
+    Ok((
+        StatusCode::CREATED,
+        Json(state.auth.create_user(user_session(&headers)?, request)?),
+    ))
+}
+
+async fn update_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(request): Json<UpdateUserRequest>,
+) -> Result<Json<UserView>, ApiError> {
+    Ok(Json(state.auth.update_user(
+        user_session(&headers)?,
+        id,
+        request,
+    )?))
+}
+
+async fn get_auth_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<RegistrationStatus>, ApiError> {
+    Ok(Json(state.auth.settings(user_session(&headers)?)?))
+}
+
+async fn put_auth_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(settings): Json<AuthSettings>,
+) -> Result<Json<RegistrationStatus>, ApiError> {
+    Ok(Json(
+        state
+            .auth
+            .update_settings(user_session(&headers)?, settings)?,
+    ))
+}
+
+fn user_session(headers: &HeaderMap) -> Result<&str, ApiError> {
+    headers
+        .get(USER_SESSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .ok_or(ApiError::Unauthorized)
 }
 
 #[derive(Deserialize)]
@@ -670,6 +785,8 @@ enum ApiError {
     #[error("not found")]
     NotFound,
     #[error("{0}")]
+    Forbidden(String),
+    #[error("{0}")]
     Conflict(String),
     #[error("{0}")]
     Internal(String),
@@ -709,6 +826,26 @@ impl From<MihomoError> for ApiError {
     }
 }
 
+impl From<AuthError> for ApiError {
+    fn from(error: AuthError) -> Self {
+        match error {
+            AuthError::InvalidCredentials => ApiError::Unauthorized,
+            AuthError::Forbidden
+            | AuthError::EmailNotVerified
+            | AuthError::Disabled
+            | AuthError::RegistrationDisabled => ApiError::Forbidden(error.to_string()),
+            AuthError::NotFound => ApiError::NotFound,
+            AuthError::EmailExists => ApiError::Conflict(error.to_string()),
+            AuthError::EmailUnavailable
+            | AuthError::InvalidVerification
+            | AuthError::InvalidInput(_) => ApiError::BadRequest(error.to_string()),
+            AuthError::Io(_) | AuthError::Json(_) | AuthError::Email(_) => {
+                ApiError::Internal(error.to_string())
+            }
+        }
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match self {
@@ -716,6 +853,7 @@ impl IntoResponse for ApiError {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::NotFound => StatusCode::NOT_FOUND,
+            Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };

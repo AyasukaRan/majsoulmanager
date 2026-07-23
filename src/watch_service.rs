@@ -896,8 +896,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn installs_only_a_health_checked_module_artifact() {
-        let root =
-            std::env::temp_dir().join(format!("mjai-module-test-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("mjai-module-test-{}", uuid::Uuid::new_v4()));
         let store = ModuleStore::new(root.clone()).unwrap();
         let artifact =
             b"#!/bin/sh\nIFS= read -r request\nprintf '%s\\n' '{\"id\":1,\"ok\":true,\"result\":{\"version\":\"test\"}}'\n";
@@ -918,10 +917,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(installed.name, "test-login");
-        assert!(
-            root.join("login/test-login/1.0.0/manifest.json")
-                .exists()
-        );
+        assert!(root.join("login/test-login/1.0.0/manifest.json").exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 }
