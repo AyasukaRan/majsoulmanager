@@ -58,14 +58,21 @@ curl -X POST http://localhost:8000/api/v1/records/batch \
 
 ## 本地基础设施
 
+Compose 有两套用法：默认直接拉取已发布镜像；本地开发时叠加
+`docker-compose.build.yml` 从当前源码构建。
+
 ```bash
-docker compose up -d
+# 默认：拉取 GHCR 已发布镜像（MJAI_IMAGE_TAG 指定版本，默认 latest）
+docker compose up -d          # 或 make infra-up；更新镜像用 make infra-pull
+
+# 本地构建：api/web 从当前源码构建，每次 up 自动重建
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d   # 或 make infra-up-local
 ```
 
-Compose 会构建并启动两个应用镜像：
+两个应用镜像：
 
-- `mjai-management-api:local`：Rust/Axum API，端口 `8000`。
-- `mjai-management-web:local`：React + shadcn/ui 管理台，端口 `3000`。
+- `majsoulmanager-api`：Rust/Axum API，端口 `8000`（本地构建时标签为 `majsoulmanager-api:local`）。
+- `majsoulmanager-web`：React + shadcn/ui 管理台，端口 `3000`（本地构建时标签为 `majsoulmanager-web:local`）。
 - `metacubex/mihomo:v1.19.27`：Watch 专用代理内核，仅在 Compose 内网暴露控制与代理端口。
 
 其余本地端口：PostgreSQL `5432`、ClickHouse HTTP `8123`、RustFS S3 `9000`、RustFS 控制台 `9002`、Redpanda `9092`。
@@ -99,6 +106,8 @@ GitHub Actions 分为 `CI` 与 `Release` 两个工作流，共用 `Checks`（Rus
   - `main`：`ghcr.io/ayasukaran/majsoulmanager-api:latest` 与 `ghcr.io/ayasukaran/majsoulmanager-web:latest`
   - `v*` 标签：发布去掉 `v` 前缀后的版本标签
   - 其他分支仅可手动触发（workflow_dispatch），发布 `dev` 标签
+  - 配置 `DOCKERHUB_USERNAME` 与 `DOCKERHUB_TOKEN` 两个 secrets 后，
+    同一批标签会同步推送到 Docker Hub（`docker.io/<用户名>/majsoulmanager-*`）
 
 前端工程说明见 [web/README.md](web/README.md)。
 
