@@ -82,7 +82,7 @@ services:
       - ./migrations/clickhouse:/docker-entrypoint-initdb.d:ro
       - ./deploy/clickhouse/listen-ipv4.xml:/etc/clickhouse-server/config.d/zz-listen-ipv4.xml:ro
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping"]
       interval: 5s
       timeout: 3s
       retries: 20
