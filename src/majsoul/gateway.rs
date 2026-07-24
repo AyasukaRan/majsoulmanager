@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use regex::Regex;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
@@ -266,6 +267,40 @@ pub async fn discover_gateway(
     info!("Discovered gateway: {} (route_id: {})", endpoint, route_id);
 
     Ok((endpoint, version, route_id))
+}
+
+/// Extract the Unity build version (`productVersion`, e.g. "4.0.45") from the
+/// game's index.html. This is the login `client_version.package`; it changes
+/// only on Unity rebuilds. Cache-backed with a fallback to the last good
+/// value, then the caller's pinned default.
+pub async fn discover_package_version(
+    client: &reqwest::Client,
+    server: &str,
+    cache_dir: &Path,
+) -> Result<String> {
+    let ms_host = server_base_url(server);
+    let prefix = server_path_prefix(server);
+    let index_url = format!("{ms_host}{prefix}/");
+    let cache = cache_dir.join("package_version");
+    let pattern = Regex::new(r#"productVersion:\s*"([0-9]+\.[0-9]+\.[0-9]+)""#)?;
+
+    if let Ok(html) = fetch_text_cached(client, &index_url, cache_dir, true, REQUEST_TIMEOUT).await
+    {
+        if let Some(caps) = pattern.captures(&html) {
+            let version = caps[1].to_string();
+            write_cache_atomic(&cache, &version);
+            return Ok(version);
+        }
+    }
+
+    if let Ok(cached) = std::fs::read_to_string(&cache) {
+        let cached = cached.trim().to_string();
+        if !cached.is_empty() {
+            warn!("Using cached package version {cached} after index.html lookup failed");
+            return Ok(cached);
+        }
+    }
+    anyhow::bail!("could not determine package version from index.html")
 }
 
 #[cfg(test)]

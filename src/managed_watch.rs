@@ -20,7 +20,7 @@ use crate::{
     majsoul::{
         BROWSER_USER_AGENT,
         convert::{GameMetadata, convert_record_bytes},
-        gateway::discover_gateway,
+        gateway::{discover_gateway, discover_package_version},
         modes::{mode_metadata, room_modes, uuid_year},
         proto::{FieldIterator, extract_string, extract_varint},
         rpc::{
@@ -40,11 +40,13 @@ use crate::{
 const FILTER_ID_OFFSET: i32 = 200;
 const SETTLE_SECS: u64 = 120;
 const RECONNECT_DELAY_SECS: u64 = 5;
-// Client code version and framework build sent in the login request. These
-// differ from the resource version in version.json (which tracks assets) and
-// are not exposed in code.js, so they are pinned to a captured real-client
-// value and overridable via config.client_version. Bump when Majsoul updates.
-const CN_CODE_VERSION: &str = "0.16.256";
+// Login client version numbers. The package (Unity build, e.g. 4.0.45) is
+// discovered dynamically from index.html. The code version (res_version, e.g.
+// 0.16.257) lives only in the Unity runtime with no lightweight HTTP source,
+// so it is pinned here as a fallback and overridable via config.client_version;
+// the server rejects a stale value with error 151, so bump it (or set the
+// config) when Majsoul updates. Both defaults are captured real-client values.
+const CN_CODE_VERSION: &str = "0.16.257";
 const CN_PACKAGE_VERSION: &str = "4.0.45";
 
 pub struct ManagedWatchDependencies {
@@ -208,12 +210,21 @@ pub(crate) async fn run(
                 transport.close().await;
             }
             Err(error) => {
-                warn!(error = %format!("{error:#}"), "watch login failed");
+                let detail = format!("{error:#}");
+                warn!(error = %detail, "watch login failed");
                 dependencies.logs.append(
                     WatchLogLevel::Error,
                     "collector",
-                    format!("登录失败: {error:#}"),
+                    format!("登录失败: {detail}"),
                 );
+                if detail.contains("151") {
+                    dependencies.logs.append(
+                        WatchLogLevel::Warn,
+                        "collector",
+                        "error 151 通常是客户端版本过期。请运行版本探测脚本抓取最新 res_version,在 Watch 配置的 client_version 里更新。"
+                            .to_string(),
+                    );
+                }
             }
         }
         dependencies.logs.append(
@@ -406,15 +417,19 @@ async fn connect(
     );
     // Login sends client_version_string = WebGL_2022-<code_version>; the code
     // version differs from the resource version and is pinned (overridable via
-    // config.client_version).
+    // config.client_version). The package (Unity build) is discovered from
+    // index.html, falling back to the pinned default.
     let code_version = config
         .client_version
         .clone()
         .unwrap_or_else(|| CN_CODE_VERSION.to_string());
+    let package_version = discover_package_version(&http, &config.server, cache_dir)
+        .await
+        .unwrap_or_else(|_| CN_PACKAGE_VERSION.to_string());
     logs.append(
         WatchLogLevel::Info,
         "collector",
-        format!("客户端版本 WebGL_2022-{code_version}"),
+        format!("客户端版本 WebGL_2022-{code_version} (package {package_version})"),
     );
     let rpc = MajsoulRpc::connect_with_proxy(&endpoint, proxy).await?;
     logs.append(WatchLogLevel::Info, "collector", "WebSocket 已连接");
@@ -422,7 +437,7 @@ async fn connect(
         username,
         password,
         &code_version,
-        CN_PACKAGE_VERSION,
+        &package_version,
         &config.server,
         &route_id,
     )
