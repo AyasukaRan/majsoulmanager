@@ -290,26 +290,32 @@ mod requests {
         buf.extend(inner);
     }
 
-    /// Build ReqRequestConnection for route handshake (required before login)
-    /// Field numbers from protobuf: type=2, route_id=3, timestamp=4
+    /// Build ReqRequestConnection for the route handshake (required before
+    /// login). Verified against a captured real-client frame: type=1,
+    /// route_id, unix-second timestamp, and field 6 = "web". Sending type=3
+    /// (or no "web") leaves the session in a state where login is rejected
+    /// with server error 151.
     pub fn build_request_connection(route_id: &str, timestamp: u64) -> Vec<u8> {
         let mut buf = Vec::new();
-        // Field 2: type = 3 (varint)
-        encode_varint_field(&mut buf, 2, 3);
+        // Field 2: type = 1
+        encode_varint_field(&mut buf, 2, 1);
         // Field 3: route_id (string)
         encode_string(&mut buf, 3, route_id);
-        // Field 4: timestamp (varint, milliseconds)
+        // Field 4: timestamp (varint, unix seconds)
         encode_varint_field(&mut buf, 4, timestamp);
+        // Field 6: client kind = "web"
+        encode_string(&mut buf, 6, "web");
         buf
     }
 
     /// Build ReqHeartbeat for Route.heartbeat
     pub fn build_heartbeat() -> Vec<u8> {
         let mut buf = Vec::new();
-        encode_varint_field(&mut buf, 1, 0); // delay
+        // Values copied from a captured real-client heartbeat.
+        encode_varint_field(&mut buf, 1, 5000); // delay
         encode_varint_field(&mut buf, 2, 0); // no_operation_counter
         encode_varint_field(&mut buf, 3, 11); // platform (Web)
-        encode_varint_field(&mut buf, 4, 0); // network_quality
+        encode_varint_field(&mut buf, 4, 5000); // network_quality
         buf
     }
 }
@@ -496,7 +502,7 @@ impl MajsoulRpc {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_millis() as u64;
+            .as_secs();
 
         debug!(
             "Sending route connection (route_id: {}, timestamp: {})",
