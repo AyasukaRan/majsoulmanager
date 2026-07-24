@@ -20,7 +20,7 @@ use crate::{
     majsoul::{
         BROWSER_USER_AGENT,
         convert::{GameMetadata, convert_record_bytes},
-        gateway::{discover_client_version, discover_gateway},
+        gateway::discover_gateway,
         modes::{mode_metadata, room_modes, uuid_year},
         proto::{FieldIterator, extract_string, extract_varint},
         rpc::{
@@ -398,11 +398,12 @@ async fn connect(
         "collector",
         format!("网关发现完成 ({})", endpoint_host(&endpoint)),
     );
+    // The login version string is `web-<version>` (the resource version with
+    // the trailing `.w` stripped), matching the official web client; the login
+    // request also carries the full resource version (with `.w`) separately.
     let client_version = match &config.client_version {
         Some(version) => version.clone(),
-        None => {
-            discover_client_version(&http, &config.server, &resource_version, cache_dir).await?
-        }
+        None => format!("web-{}", resource_version.trim_end_matches(".w")),
     };
     logs.append(
         WatchLogLevel::Info,
@@ -411,8 +412,14 @@ async fn connect(
     );
     let rpc = MajsoulRpc::connect_with_proxy(&endpoint, proxy).await?;
     logs.append(WatchLogLevel::Info, "collector", "WebSocket 已连接");
-    rpc.login_native_exact(username, password, &client_version, &route_id)
-        .await?;
+    rpc.login_native_exact(
+        username,
+        password,
+        &client_version,
+        &resource_version,
+        &route_id,
+    )
+    .await?;
     logs.append(WatchLogLevel::Info, "collector", "登录成功");
     Ok((LoginTransport::Builtin(rpc), client_version))
 }

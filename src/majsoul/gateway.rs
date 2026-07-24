@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use regex::Regex;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
@@ -10,11 +9,6 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const CODE_JS_TIMEOUT: Duration = Duration::from_secs(60);
-// Last-resort client version when neither the live assets nor the on-disk
-// cache yield one. It goes stale over time, so it is only a floor: the
-// resversion-driven fetch and cache above it keep the value current.
-const KNOWN_CLIENT_VERSION: &str = "WebGL_2022-0.16.251";
 
 /// Get base URL for server
 pub fn server_base_url(server: &str) -> &'static str {
@@ -215,7 +209,6 @@ pub async fn discover_gateway(
         .context("Failed to fetch version.json")?;
 
     let version = version_info.version.clone();
-    let version_clean = version.replace(".w", "");
     info!("Majsoul version: {}", version);
 
     // Step 2: Resolve config.json through the resversion manifest. Fall back
@@ -272,85 +265,7 @@ pub async fn discover_gateway(
     let endpoint = format!("wss://{}/gateway", route_domain);
     info!("Discovered gateway: {} (route_id: {})", endpoint, route_id);
 
-    Ok((endpoint, version_clean, route_id))
-}
-
-/// Discover the client version string embedded in the current web client.
-/// The resource version (`0.11.xxx.w`) is not the same value sent to
-/// fetchGameRecord; current clients send strings such as
-/// `WebGL_2022-0.16.251`.
-///
-/// The extracted value is cached in `cache_dir`; if the live code.js cannot be
-/// fetched or parsed, the last successfully extracted value is reused before
-/// falling back to the hard-coded floor. This keeps the version current
-/// without a stale constant, matching the reference client's cache-as-fallback
-/// behaviour.
-pub async fn discover_client_version(
-    client: &reqwest::Client,
-    server: &str,
-    resource_version: &str,
-    cache_dir: &Path,
-) -> Result<String> {
-    let ms_host = server_base_url(server);
-    let prefix = server_path_prefix(server);
-    let pattern = Regex::new(r"WebGL_[0-9]{4}-[0-9]+\.[0-9]+\.[0-9]+")?;
-    let version_cache = cache_dir.join("client_version");
-    let mut versions = vec![resource_version.to_string()];
-    if !resource_version.ends_with(".w") {
-        versions.insert(0, format!("{}.w", resource_version));
-    }
-
-    let mut last_error = None;
-    for version in versions {
-        let code_url = format!("{ms_host}{prefix}/v{version}/code.js");
-        let response = tokio::time::timeout(CODE_JS_TIMEOUT, async {
-            client.get(&code_url).send().await?.error_for_status()
-        })
-        .await;
-        let response = match response {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => {
-                last_error = Some(format!("{}: {}", code_url, error));
-                continue;
-            }
-            Err(error) => {
-                last_error = Some(format!("{}: {}", code_url, error));
-                continue;
-            }
-        };
-        let code = match response.text().await {
-            Ok(code) => code,
-            Err(error) => {
-                last_error = Some(format!("{}: {}", code_url, error));
-                continue;
-            }
-        };
-        if let Some(found) = pattern.find(&code) {
-            let version = found.as_str().to_string();
-            write_cache_atomic(&version_cache, &version);
-            return Ok(version);
-        }
-        last_error = Some(format!("No WebGL client version found in {}", code_url));
-    }
-
-    if let Ok(cached) = std::fs::read_to_string(&version_cache) {
-        let cached = cached.trim().to_string();
-        if !cached.is_empty() {
-            warn!(
-                "Could not extract client_version_string from official assets ({}); using cached {}",
-                last_error.unwrap_or_else(|| "no candidate resource version".to_string()),
-                cached
-            );
-            return Ok(cached);
-        }
-    }
-
-    warn!(
-        "Could not extract client_version_string from official assets ({}) and no cache exists; using known compatible {}",
-        last_error.unwrap_or_else(|| "no candidate resource version".to_string()),
-        KNOWN_CLIENT_VERSION
-    );
-    Ok(KNOWN_CLIENT_VERSION.to_string())
+    Ok((endpoint, version, route_id))
 }
 
 #[cfg(test)]
