@@ -181,14 +181,17 @@ mod requests {
         buf
     }
 
-    /// Build ReqLogin for CN native login (username/password)
-    /// Field numbers from protobuf: account=1, password=2, device=4, random_key=5,
-    /// gen_access_token=7, currency_platforms=8, client_version_string=11
+    /// Build ReqLogin for CN native login (username/password), matching the
+    /// fields a real web client sends so risk control does not reject it.
+    /// Field numbers from protobuf: account=1, password=2, device=4,
+    /// random_key=5, client_version=6, gen_access_token=7,
+    /// currency_platforms=8, client_version_string=11.
     pub fn build_login_request(
         account: &str,
         password_hash: &str,
         random_key: &str,
-        version: &str,
+        client_version_string: &str,
+        resource: &str,
     ) -> Vec<u8> {
         let mut buf = Vec::new();
 
@@ -196,16 +199,18 @@ mod requests {
         encode_string(&mut buf, 1, account);
         // Field 2: password (string, hashed)
         encode_string(&mut buf, 2, password_hash);
-        // Field 4: device { is_browser: true }
-        encode_nested_device_simple(&mut buf);
+        // Field 4: device — full ClientDeviceInfo like a real browser
+        encode_device(&mut buf);
         // Field 5: random_key (string)
         encode_string(&mut buf, 5, random_key);
+        // Field 6: client_version { resource } — full version with `.w`
+        encode_client_version(&mut buf, resource);
         // Field 7: gen_access_token (bool = true)
         encode_bool(&mut buf, 7, true);
         // Field 8: currency_platforms (repeated int32 = [2])
         encode_varint_field(&mut buf, 8, 2);
-        // Field 11: client_version_string
-        encode_string(&mut buf, 11, version);
+        // Field 11: client_version_string (web-<version>)
+        encode_string(&mut buf, 11, client_version_string);
 
         buf
     }
@@ -236,15 +241,31 @@ mod requests {
         encode_varint(buf, value);
     }
 
-    /// Encode device message with just is_browser = true (for native login)
-    fn encode_nested_device_simple(buf: &mut Vec<u8>) {
-        // Field 4: device message with is_browser = true (field 5 in device)
+    /// Encode ClientDeviceInfo (field 4) with the fields a real web client
+    /// sends, so risk control does not flag the login as a bare script.
+    fn encode_device(buf: &mut Vec<u8>) {
         let mut inner = Vec::new();
-        // Field 5: is_browser = true
-        inner.push(0x28); // (5 << 3) | 0
-        inner.push(0x01);
+        encode_string(&mut inner, 1, "pc"); // platform
+        encode_string(&mut inner, 2, "pc"); // hardware
+        encode_string(&mut inner, 3, "windows"); // os
+        encode_string(&mut inner, 4, "win10"); // os_version
+        encode_bool(&mut inner, 5, true); // is_browser
+        encode_string(&mut inner, 6, "Chrome"); // software
+        encode_string(&mut inner, 7, "web"); // sale_platform
 
         let tag = (4 << 3) | 2;
+        encode_varint(buf, tag as u64);
+        encode_varint(buf, inner.len() as u64);
+        buf.extend(inner);
+    }
+
+    /// Encode ClientVersionInfo (field 6) { resource } — the full version
+    /// string keeping the trailing `.w`, exactly as the real client sends.
+    fn encode_client_version(buf: &mut Vec<u8>, resource: &str) {
+        let mut inner = Vec::new();
+        encode_string(&mut inner, 1, resource); // resource
+
+        let tag = (6 << 3) | 2;
         encode_varint(buf, tag as u64);
         encode_varint(buf, inner.len() as u64);
         buf.extend(inner);
@@ -490,6 +511,7 @@ impl MajsoulRpc {
         username: &str,
         password: &str,
         client_version: &str,
+        resource: &str,
         route_id: &str,
     ) -> Result<()> {
         use crate::majsoul::auth::hash_password;
@@ -509,8 +531,13 @@ impl MajsoulRpc {
         debug!("Authenticating with native login (account={})", username);
 
         // Build ReqLogin protobuf
-        let request =
-            requests::build_login_request(username, &password_hash, &random_key, client_version);
+        let request = requests::build_login_request(
+            username,
+            &password_hash,
+            &random_key,
+            client_version,
+            resource,
+        );
 
         let response = self.call(".lq.Lobby.login", &request).await?;
 
