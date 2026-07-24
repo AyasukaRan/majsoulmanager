@@ -40,6 +40,12 @@ use crate::{
 const FILTER_ID_OFFSET: i32 = 200;
 const SETTLE_SECS: u64 = 120;
 const RECONNECT_DELAY_SECS: u64 = 5;
+// Client code version and framework build sent in the login request. These
+// differ from the resource version in version.json (which tracks assets) and
+// are not exposed in code.js, so they are pinned to a captured real-client
+// value and overridable via config.client_version. Bump when Majsoul updates.
+const CN_CODE_VERSION: &str = "0.16.256";
+const CN_PACKAGE_VERSION: &str = "4.0.45";
 
 pub struct ManagedWatchDependencies {
     pub data_dir: PathBuf,
@@ -391,37 +397,41 @@ async fn connect(
         builder = builder.proxy(reqwest::Proxy::all(proxy)?);
     }
     let http = builder.build()?;
-    let (endpoint, resource_version, route_id) =
+    let (endpoint, _resource_version, route_id) =
         discover_gateway(&http, &config.server, cache_dir).await?;
     logs.append(
         WatchLogLevel::Info,
         "collector",
         format!("网关发现完成 ({})", endpoint_host(&endpoint)),
     );
-    // The login version string is `web-<version>` (the resource version with
-    // the trailing `.w` stripped), matching the official web client; the login
-    // request also carries the full resource version (with `.w`) separately.
-    let client_version = match &config.client_version {
-        Some(version) => version.clone(),
-        None => format!("web-{}", resource_version.trim_end_matches(".w")),
-    };
+    // Login sends client_version_string = WebGL_2022-<code_version>; the code
+    // version differs from the resource version and is pinned (overridable via
+    // config.client_version).
+    let code_version = config
+        .client_version
+        .clone()
+        .unwrap_or_else(|| CN_CODE_VERSION.to_string());
     logs.append(
         WatchLogLevel::Info,
         "collector",
-        format!("客户端版本 {client_version}"),
+        format!("客户端版本 WebGL_2022-{code_version}"),
     );
     let rpc = MajsoulRpc::connect_with_proxy(&endpoint, proxy).await?;
     logs.append(WatchLogLevel::Info, "collector", "WebSocket 已连接");
     rpc.login_native_exact(
         username,
         password,
-        &client_version,
-        &resource_version,
+        &code_version,
+        CN_PACKAGE_VERSION,
+        &config.server,
         &route_id,
     )
     .await?;
     logs.append(WatchLogLevel::Info, "collector", "登录成功");
-    Ok((LoginTransport::Builtin(rpc), client_version))
+    Ok((
+        LoginTransport::Builtin(rpc),
+        format!("WebGL_2022-{code_version}"),
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
