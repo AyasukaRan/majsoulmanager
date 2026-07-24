@@ -139,6 +139,7 @@ pub(crate) async fn run(
         }
     }
     let state_path = dependencies.data_dir.join("watch/state.json");
+    let cache_dir = dependencies.data_dir.join("watch/cache");
     let (tracked_state, pending_state) = load_state(&state_path)?;
     let mut tracked = tracked_state
         .into_iter()
@@ -167,6 +168,7 @@ pub(crate) async fn run(
             proxy.as_deref(),
             login_worker.clone(),
             &dependencies.logs,
+            &cache_dir,
         )
         .await
         {
@@ -356,6 +358,7 @@ async fn connect(
     proxy: Option<&str>,
     worker: Option<Arc<PluginWorker>>,
     logs: &WatchLogBuffer,
+    cache_dir: &Path,
 ) -> Result<(LoginTransport, String)> {
     if let Some(worker) = worker {
         let result = worker
@@ -388,7 +391,8 @@ async fn connect(
         builder = builder.proxy(reqwest::Proxy::all(proxy)?);
     }
     let http = builder.build()?;
-    let (endpoint, resource_version, route_id) = discover_gateway(&http, &config.server).await?;
+    let (endpoint, resource_version, route_id) =
+        discover_gateway(&http, &config.server, cache_dir).await?;
     logs.append(
         WatchLogLevel::Info,
         "collector",
@@ -396,7 +400,9 @@ async fn connect(
     );
     let client_version = match &config.client_version {
         Some(version) => version.clone(),
-        None => discover_client_version(&http, &config.server, &resource_version).await?,
+        None => {
+            discover_client_version(&http, &config.server, &resource_version, cache_dir).await?
+        }
     };
     logs.append(
         WatchLogLevel::Info,
