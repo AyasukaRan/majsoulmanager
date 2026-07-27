@@ -47,6 +47,29 @@ test("protects the dashboard and server-renders the login page", async () => {
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/);
 });
 
+test("dashboard pages read from the API instead of literals", async () => {
+  const pages = await Promise.all(
+    ["page.tsx", "records/page.tsx", "exports/page.tsx"].map((file) =>
+      readFile(new URL(`../app/(dashboard)/${file}`, import.meta.url), "utf8"),
+    ),
+  );
+  for (const source of pages) {
+    // The placeholder pages were literal arrays. A page that grows one again is
+    // indistinguishable from real data on screen, which is the bug being fixed.
+    assert.doesNotMatch(source, /428,719,506|1\.84 TB|Asapin|2,841,932/);
+  }
+
+  // Every panel has to reach the backend through a proxy route, because the API
+  // key those calls need is server-only.
+  await Promise.all(
+    [
+      "app/api/stats/route.ts",
+      "app/api/records/[[...path]]/route.ts",
+      "app/api/downloads/[[...path]]/route.ts",
+    ].map((route) => access(new URL(route, projectRoot))),
+  );
+});
+
 test("contains shadcn configuration and no disposable starter", async () => {
   const [components, packageJson] = await Promise.all([
     readFile(new URL("../components.json", import.meta.url), "utf8"),

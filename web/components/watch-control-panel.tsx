@@ -14,12 +14,13 @@ import {
   Trash2,
 } from "lucide-react";
 
-import type {
-  InstalledWatchModule,
-  MihomoStatus,
-  WatchInstance,
-  WatchModuleRef,
-  WatchServiceConfig,
+import {
+  jsonRequest,
+  type InstalledWatchModule,
+  type MihomoStatus,
+  type WatchInstance,
+  type WatchModuleRef,
+  type WatchServiceConfig,
 } from "@/lib/mjai-api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -32,28 +33,7 @@ import {
 } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
-
-const selectClass =
-  "h-9 w-full rounded-lg border border-input bg-background px-3 text-sm outline-none focus:border-ring focus:ring-3 focus:ring-ring/30";
-
-async function jsonRequest<T>(
-  path: string,
-  init?: RequestInit,
-): Promise<T> {
-  const response = await fetch(path, {
-    cache: "no-store",
-    ...init,
-    headers: {
-      "content-type": "application/json",
-      ...init?.headers,
-    },
-  });
-  const value = (await response.json()) as T & { error?: string };
-  if (!response.ok) {
-    throw new Error(value.error ?? `request failed (${response.status})`);
-  }
-  return value;
-}
+import { selectClass } from "@/lib/utils";
 
 function moduleValue(module: WatchModuleRef) {
   return `${module.name}@${module.version}`;

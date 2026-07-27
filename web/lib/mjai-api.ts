@@ -23,15 +23,69 @@ export type RecordPage = {
   next_cursor: string | null;
 };
 
-export type RecordFilters = {
+/** The six fields an export job stores as its snapshot; timestamps are RFC 3339. */
+export type RecordFilter = {
   source?: string;
   player?: string;
   received_from?: string;
   received_to?: string;
   played_from?: string;
   played_to?: string;
+};
+
+export type RecordFilters = RecordFilter & {
   cursor?: string;
   limit?: number;
+};
+
+export type JobState = "queued" | "running" | "completed" | "failed";
+
+export type DownloadJob = {
+  id: string;
+  state: JobState;
+  created_at: string;
+  /** Only final once the job completes; before that it counts what has been written so far. */
+  record_count: number;
+  download_url: string | null;
+  error: string | null;
+};
+
+/** Serde renames these variants, so the wire literals carry the file extension. */
+export type DownloadFormat = "tar.gz" | "manifest.jsonl";
+
+export type DownloadRequest = {
+  filter: RecordFilter;
+  format: DownloadFormat;
+};
+
+export type DownloadJobPage = {
+  items: DownloadJob[];
+};
+
+export type SourceStat = {
+  source: string;
+  records: number;
+};
+
+export type StatsSummary = {
+  records: {
+    total: number;
+    last_24h: number;
+    sources: SourceStat[];
+  };
+  storage: {
+    packs: number;
+    raw_bytes: number;
+    compressed_bytes: number;
+  };
+  downloads: Record<JobState, number>;
+  watch: {
+    phase: string;
+    live: number;
+    pending: number;
+    completed: number;
+    failed: number;
+  };
 };
 
 export type WatchUuidState =
@@ -154,6 +208,44 @@ export type MihomoStatus = {
   error: string | null;
 };
 
+/**
+ * Every proxy route answers `{ error }` on failure, so the backend's own wording
+ * — "received_at range must not exceed 90 days" and friends — is what reaches
+ * the operator instead of a generic status code.
+ */
+export async function jsonRequest<T>(
+  path: string,
+  init?: RequestInit,
+): Promise<T> {
+  const response = await fetch(path, {
+    cache: "no-store",
+    ...init,
+    headers: {
+      "content-type": "application/json",
+      ...init?.headers,
+    },
+  });
+  // Parsed by hand rather than with `response.json()` because a failure can also
+  // come from a layer that answers no body at all — a proxy timeout, or a method
+  // the backend does not route — and a JSON parse error there would hide the
+  // status code that actually explains it.
+  const raw = await response.text();
+  let value: (T & { error?: string }) | null = null;
+  try {
+    value = raw ? (JSON.parse(raw) as T & { error?: string }) : null;
+  } catch {
+    value = null;
+  }
+  if (!response.ok || value === null) {
+    throw new Error(value?.error ?? `请求失败(${response.status})`);
+  }
+  return value;
+}
+
+/**
+ * Points at the browser-reachable proxy, not at the Rust path: the API key that
+ * `/api/v1/records` needs only ever exists on the server side of that route.
+ */
 export function buildRecordSearch(filters: RecordFilters): string {
   const query = new URLSearchParams();
   for (const [key, value] of Object.entries(filters)) {
@@ -161,5 +253,5 @@ export function buildRecordSearch(filters: RecordFilters): string {
       query.set(key, String(value));
     }
   }
-  return `/api/v1/records?${query.toString()}`;
+  return `/api/records?${query.toString()}`;
 }
