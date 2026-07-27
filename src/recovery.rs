@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     catalog::{Catalog, Record},
     mjai,
-    pack::PackStore,
+    pack::{self, PackStore},
 };
 
 /// Ingest source stamped on rows the scan rebuilt. The original source lives
@@ -20,7 +20,10 @@ const RECOVERED_SOURCE: &str = "recovered";
 pub async fn recover(catalog: &Catalog, packs: &PackStore) -> anyhow::Result<usize> {
     let indexed: HashMap<String, u64> = catalog.indexed_counts().await?.into_iter().collect();
     let mut recovered = 0usize;
-    for pack in packs.scan()? {
+    // One pack's entries are resident at a time; the whole corpus at once grows
+    // with every record ever collected.
+    for path in packs.packs()? {
+        let pack = pack::scan_pack(&path)?;
         let entries = pack.entries.len() as u64;
         if indexed.get(&pack.key).copied().unwrap_or(0) >= entries {
             continue;
@@ -52,7 +55,13 @@ pub async fn recover(catalog: &Catalog, packs: &PackStore) -> anyhow::Result<usi
                     sha256: hex::encode(Sha256::digest(&raw)),
                     // The pack mtime is the only timestamp the bytes still
                     // carry, and it is stable across boots, so a replay lands
-                    // on the same ReplacingMergeTree key.
+                    // on the same ReplacingMergeTree key. The cost is that a
+                    // whole pack collapses to one instant: received_at is also
+                    // the partition key, so a 256MB pack spanning weeks lands
+                    // in the partition of its last write and the ordering
+                    // within it says nothing. Only a per-record timestamp in
+                    // the pack header would fix that, and only for packs
+                    // written after the format changed.
                     received_at,
                     played_at: None,
                     players: metadata.players,

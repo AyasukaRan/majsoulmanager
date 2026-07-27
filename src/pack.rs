@@ -86,23 +86,23 @@ impl PackStore {
         })
     }
 
-    /// Rebuilds every entry location from the pack headers alone, which is what
-    /// docs/architecture.md means by "可以离线扫描 RustFS 重建 ClickHouse 索引".
-    /// Frames are skipped by seeking, so the cost is one 24 byte read per
-    /// record and no decompression.
-    pub fn scan(&self) -> Result<Vec<PackFile>, PackError> {
-        let mut packs = Vec::new();
+    /// The pack files on disk, by path only. Callers walk them one at a time
+    /// through `scan_pack`: an entry list for the whole corpus would be one
+    /// allocation that grows with every record ever collected, and nothing
+    /// needs more than a single pack's entries at once.
+    pub fn packs(&self) -> Result<Vec<PathBuf>, PackError> {
+        let mut paths = Vec::new();
         for entry in std::fs::read_dir(&self.root)? {
             let path = entry?.path();
             if path
                 .extension()
                 .is_some_and(|extension| extension == "mjpack")
             {
-                packs.push(scan_pack(&path)?);
+                paths.push(path);
             }
         }
-        packs.sort_by(|left, right| left.key.cmp(&right.key));
-        Ok(packs)
+        paths.sort();
+        Ok(paths)
     }
 
     pub fn read(&self, location: &PackLocation) -> Result<Vec<u8>, PackError> {
@@ -139,13 +139,18 @@ pub struct PackFile {
     pub entries: Vec<(Uuid, PackLocation)>,
 }
 
-fn scan_pack(path: &Path) -> Result<PackFile, PackError> {
-    let key = format!(
-        "packs/{}",
-        path.file_name()
-            .ok_or(PackError::Corrupt)?
-            .to_string_lossy()
-    );
+/// The index key a pack file is stored under, which is what `pack_key` on a
+/// `PackLocation` holds.
+pub fn pack_key(path: &Path) -> Option<String> {
+    Some(format!("packs/{}", path.file_name()?.to_string_lossy()))
+}
+
+/// Rebuilds one pack's entry locations from its headers alone, which is what
+/// docs/architecture.md means by "可以离线扫描 RustFS 重建 ClickHouse 索引".
+/// Frames are skipped by seeking, so the cost is one 24 byte read per record
+/// and no decompression.
+pub fn scan_pack(path: &Path) -> Result<PackFile, PackError> {
+    let key = pack_key(path).ok_or(PackError::Corrupt)?;
     let mut file = File::open(path)?;
     let length = file.metadata()?.len();
     let mut magic = [0u8; MAGIC.len()];
@@ -163,6 +168,22 @@ fn scan_pack(path: &Path) -> Result<PackFile, PackError> {
         let record_id = Uuid::from_slice(&header[0..16]).map_err(|_| PackError::Corrupt)?;
         let raw_size = u32::from_be_bytes(header[16..20].try_into().expect("4 bytes"));
         let compressed_size = u32::from_be_bytes(header[20..24].try_into().expect("4 bytes"));
+        // A tail of zeroes is what a truncated or sparsely extended file reads
+        // as, and it parses as a perfectly well formed entry: the nil UUID with
+        // an empty frame. Accepting those would invent one phantom entry per 24
+        // bytes, none of which can ever match an indexed record, so the pack
+        // would come up short of its entry count and be re-scanned on every
+        // boot for as long as it exists. No real entry has either field zero:
+        // ids come from `Uuid::new_v4`, and zstd emits a frame header even for
+        // an empty input, so a written frame is never 0 bytes.
+        if record_id.is_nil() || compressed_size == 0 {
+            tracing::warn!(
+                pack = key,
+                offset = position,
+                "pack ends in unwritten bytes; stopping the scan there"
+            );
+            break;
+        }
         let offset = position + ENTRY_HEADER_LEN;
         if offset + u64::from(compressed_size) > length {
             break;
@@ -214,10 +235,11 @@ mod tests {
             })
             .collect();
 
-        let packs = store.scan().unwrap();
-        assert_eq!(packs.len(), 1);
-        assert_eq!(packs[0].entries.len(), 3);
-        for ((id, location, raw), (scanned_id, scanned)) in written.iter().zip(&packs[0].entries) {
+        let paths = store.packs().unwrap();
+        assert_eq!(paths.len(), 1);
+        let pack = scan_pack(&paths[0]).unwrap();
+        assert_eq!(pack.entries.len(), 3);
+        for ((id, location, raw), (scanned_id, scanned)) in written.iter().zip(&pack.entries) {
             assert_eq!(id, scanned_id);
             assert_eq!(location.pack_key, scanned.pack_key);
             assert_eq!(location.offset, scanned.offset);
@@ -241,8 +263,29 @@ mod tests {
             .set_len(length - 4)
             .unwrap();
 
-        let packs = store.scan().unwrap();
-        assert_eq!(packs[0].entries.len(), 1);
+        assert_eq!(scan_pack(&path).unwrap().entries.len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A pack extended but not written — a torn write, or a file grown by a
+    /// sparse seek — reads back as zeroes, and 24 zero bytes parse as a valid
+    /// entry header. Inventing those entries left the pack permanently short of
+    /// its indexed count, so recovery re-scanned it on every single boot.
+    #[test]
+    fn scan_stops_at_a_tail_of_zeroes_instead_of_inventing_entries() {
+        let root = std::env::temp_dir().join(format!("mjai-pack-test-{}", Uuid::new_v4()));
+        let store = PackStore::new(root.clone(), 1024 * 1024).unwrap();
+        let location = store.append(Uuid::new_v4(), &[7; 64]).unwrap();
+        let path = root.join(Path::new(&location.pack_key).file_name().unwrap());
+        let written = std::fs::metadata(&path).unwrap().len();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[0u8; 240]).unwrap();
+        file.flush().unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), written + 240);
+
+        let entries = scan_pack(&path).unwrap().entries;
+        assert_eq!(entries.len(), 1, "zero bytes were scanned as entries");
+        assert!(entries.iter().all(|(id, _)| !id.is_nil()));
         std::fs::remove_dir_all(root).unwrap();
     }
 
