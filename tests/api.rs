@@ -1281,6 +1281,157 @@ async fn reports_watch_uuid_and_conversion_transitions() {
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 
+/// The console's overview. Everything but the watch block is an aggregate over
+/// the index and the job table the whole suite shares, so the exact assertions
+/// are the ones a shared store can carry — this run's own source in the
+/// breakdown, and floors on the totals it contributed to. The watch counters
+/// are a per-process registry, so those are exact.
+#[tokio::test]
+async fn reports_index_storage_download_and_watch_totals() {
+    let (state, data_dir) = test_state().await;
+    let source = test_source(&data_dir);
+    let app = api::router(state.clone());
+    let raw = r#"{"type":"start_game","names":["a","b","c","d"]}"#;
+    for key in ["stats-1", "stats-2"] {
+        let response = app
+            .clone()
+            .oneshot(ingest_request(&source, key, raw))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+    // The aggregates read the index, so an accepted record counts for nothing
+    // until the worker has packed it.
+    index_pending(&state).await;
+    state
+        .watch
+        .apply(WatchEvent {
+            uuid: "260727-abcdef01-2345-6789-abcd-ef0123456789".into(),
+            event: WatchEventKind::Live,
+            mode_id: Some(16),
+            started_at: None,
+            message: None,
+            record_id: None,
+        })
+        .unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/stats")
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let stats = json_body(response).await;
+
+    let mine = stats["records"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["source"] == source.as_str())
+        .unwrap_or_else(|| panic!("the source breakdown never mentioned {source}: {stats}"));
+    assert_eq!(mine["records"], 2);
+    assert!(stats["records"]["total"].as_u64().unwrap() >= 2, "{stats}");
+    assert!(
+        stats["records"]["last_24h"].as_u64().unwrap() >= 2,
+        "{stats}"
+    );
+    assert!(stats["storage"]["packs"].as_u64().unwrap() >= 1, "{stats}");
+    assert!(
+        stats["storage"]["raw_bytes"].as_u64().unwrap() >= 2 * raw.len() as u64,
+        "{stats}"
+    );
+    assert!(
+        stats["storage"]["compressed_bytes"].as_u64().unwrap() >= 1,
+        "{stats}"
+    );
+    assert!(stats["downloads"]["queued"].is_u64(), "{stats}");
+    assert_eq!(stats["watch"]["phase"], "stopped");
+    assert_eq!(stats["watch"]["live"], 1);
+    assert_eq!(stats["watch"]["completed"], 0);
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+/// The export page's list. The job table is shared too, so this asserts its own
+/// job is in the page and that the page is ordered newest first, not how long
+/// the page is.
+#[tokio::test]
+async fn lists_the_newest_download_jobs() {
+    let (state, data_dir) = test_state().await;
+    let source = test_source(&data_dir);
+    let app = api::router(state);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/downloads")
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"filter":{{"source":"{source}"}},"format":"manifest.jsonl"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let created = json_body(response).await;
+    let job_id = created["id"].as_str().unwrap().to_owned();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/downloads?limit=1000")
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = json_body(response).await;
+    let items = page["items"].as_array().unwrap();
+    let mine = items
+        .iter()
+        .find(|item| item["id"] == job_id.as_str())
+        .unwrap_or_else(|| panic!("the job list never mentioned {job_id}"));
+    // The same shape `GET /api/v1/downloads/{id}` answers with, because it is
+    // the same type.
+    assert!(mine["state"].is_string(), "{mine}");
+    assert!(mine["record_count"].is_u64(), "{mine}");
+    // Parsed rather than compared as strings: chrono drops a whole second's
+    // empty fraction, so two RFC 3339 timestamps do not always sort in their
+    // own order lexicographically and the check would fail once in a million
+    // runs for the wrong reason.
+    let created_at: Vec<chrono::DateTime<Utc>> = items
+        .iter()
+        .map(|item| item["created_at"].as_str().unwrap().parse().unwrap())
+        .collect();
+    let mut newest_first = created_at.clone();
+    newest_first.sort_unstable_by(|left, right| right.cmp(left));
+    assert_eq!(created_at, newest_first, "the page was not newest first");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/downloads?limit=0")
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
 #[tokio::test]
 async fn updates_and_persists_online_watch_configuration() {
     let (state, data_dir) = test_state().await;

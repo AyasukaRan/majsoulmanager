@@ -35,16 +35,16 @@ use crate::{
         RegistrationStatus, UpdateUserRequest, UserView, VerifyEmailRequest,
     },
     catalog::{
-        CatalogError, Cursor, DownloadFormat, DownloadJob, DownloadRequest, JobState, Record,
-        RecordFilter,
+        CatalogError, Cursor, DownloadCounts, DownloadFormat, DownloadJob, DownloadRequest,
+        JobState, Record, RecordFilter, RecordStats, StorageStats,
     },
     indexer::{self, Claimed, IngestError},
     kafka::MAX_PRODUCE_BATCH_BYTES,
     mihomo::{MihomoAction, MihomoError, MihomoStatus, ProxySelection, SubscriptionUpdate},
     watch_log::WatchLogEntry,
     watch_service::{
-        InstallModuleRequest, InstalledModule, WatchAction, WatchDashboard, WatchRuntimeStatus,
-        WatchServiceConfig, WatchServiceError, module_protocol_contract,
+        InstallModuleRequest, InstalledModule, ServicePhase, WatchAction, WatchDashboard,
+        WatchRuntimeStatus, WatchServiceConfig, WatchServiceError, module_protocol_contract,
     },
 };
 
@@ -55,7 +55,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/records/batch", post(ingest_batch))
         .route("/api/v1/records/{id}", get(get_record))
         .route("/api/v1/records/{id}/raw", get(get_raw))
-        .route("/api/v1/downloads", post(create_download))
+        .route("/api/v1/stats", get(get_stats))
+        .route(
+            "/api/v1/downloads",
+            post(create_download).get(list_downloads),
+        )
         .route("/api/v1/downloads/{id}", get(get_download))
         .route("/api/v1/downloads/{id}/file", get(download_file))
         .route("/api/v1/watch/status", get(get_watch_status))
@@ -960,6 +964,77 @@ async fn download_file(
             .map_err(|error| ApiError::Internal(error.to_string()))?,
     );
     Ok(response)
+}
+
+#[derive(Deserialize)]
+struct DownloadListQuery {
+    #[serde(default = "default_page_size")]
+    limit: usize,
+}
+
+#[derive(Serialize)]
+struct DownloadPage {
+    items: Vec<DownloadJob>,
+}
+
+async fn list_downloads(
+    State(state): State<AppState>,
+    Query(query): Query<DownloadListQuery>,
+) -> Result<Json<DownloadPage>, ApiError> {
+    if !(1..=1000).contains(&query.limit) {
+        return Err(ApiError::BadRequest(
+            "limit must be between 1 and 1000".into(),
+        ));
+    }
+    Ok(Json(DownloadPage {
+        items: state.catalog.recent_jobs(query.limit).await?,
+    }))
+}
+
+#[derive(Serialize)]
+struct StatsResponse {
+    records: RecordStats,
+    storage: StorageStats,
+    downloads: DownloadCounts,
+    watch: WatchStats,
+}
+
+/// The supervisor's counters without its item list, which is what
+/// `/api/v1/watch/status` is for.
+#[derive(Serialize)]
+struct WatchStats {
+    phase: ServicePhase,
+    live: u64,
+    pending: u64,
+    completed: u64,
+    failed: u64,
+}
+
+/// The console polls this. The two stores are asked at once because neither
+/// answer depends on the other, and the supervisor is asked afterwards because
+/// its dashboard is a lock and a clone rather than a query. What each aggregate
+/// costs, and which of them is deliberately approximate, is on `Catalog::stats`.
+async fn get_stats(State(state): State<AppState>) -> Result<Json<StatsResponse>, ApiError> {
+    let (index, downloads) =
+        tokio::try_join!(state.catalog.stats(), state.catalog.download_counts())?;
+    // A limit of zero: the counters are summed over every tracked game and only
+    // the item list is truncated, so this asks for none of it. Building that
+    // empty list still clones and sorts the registry, which is bounded by the
+    // 10,000 games it keeps; if this poll ever shows up in a profile the answer
+    // is a count-only path in `WatchRegistry`, not a change here.
+    let watch = state.watch_service.dashboard(None, 0);
+    Ok(Json(StatsResponse {
+        records: index.records,
+        storage: index.storage,
+        downloads,
+        watch: WatchStats {
+            phase: watch.service.phase,
+            live: watch.records.live as u64,
+            pending: watch.records.pending as u64,
+            completed: watch.records.completed as u64,
+            failed: watch.records.failed as u64,
+        },
+    }))
 }
 
 fn required_header(headers: &HeaderMap, name: &'static str) -> Result<String, ApiError> {

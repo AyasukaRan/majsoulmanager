@@ -44,6 +44,10 @@ const DOWNLOAD_JOB_RETENTION_DAYS: i32 = 7;
 /// Arbitrary but stable: "mjai" as ASCII.
 const MIGRATION_LOCK: i64 = 0x6D6A_6169;
 
+/// The overview names the busiest collectors, not every value that has ever
+/// appeared in an `X-Mjai-Source` header.
+const MAX_REPORTED_SOURCES: usize = 100;
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Record {
     pub id: Uuid,
@@ -609,28 +613,138 @@ impl Catalog {
     }
 
     pub async fn get_job(&self, id: Uuid) -> Result<Option<DownloadJob>, CatalogError> {
-        let row = sqlx::query(
-            "SELECT id, state, record_count, result_object_key, error, created_at
-             FROM download_jobs WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_optional(&self.postgres)
-        .await?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let state: String = row.try_get("state")?;
-        Ok(Some(DownloadJob {
-            id,
-            state: JobState::from_column(&state),
-            created_at: row.try_get("created_at")?,
-            record_count: row.try_get::<i64, _>("record_count")?.max(0) as usize,
-            download_url: row
-                .try_get::<Option<String>, _>("result_object_key")?
-                .map(|_| format!("/api/v1/downloads/{id}/file")),
-            error: row.try_get("error")?,
-        }))
+        let row = sqlx::query(&format!("{JOB_COLUMNS} WHERE id = $1"))
+            .bind(id)
+            .fetch_optional(&self.postgres)
+            .await?;
+        Ok(row.as_ref().map(job_from_row).transpose()?)
     }
+
+    /// The newest jobs first. A sort with no index behind it, deliberately:
+    /// `prune` deletes everything past `DOWNLOAD_JOB_RETENTION_DAYS`, so this
+    /// orders a few days of exports rather than a history, and the partial
+    /// index the schema does carry covers only the unfinished ones. It wants a
+    /// `created_at` index the day exports become frequent enough that a week of
+    /// them stops being a small table.
+    pub async fn recent_jobs(&self, limit: usize) -> Result<Vec<DownloadJob>, CatalogError> {
+        let rows = sqlx::query(&format!("{JOB_COLUMNS} ORDER BY created_at DESC LIMIT $1"))
+            .bind(limit as i64)
+            .fetch_all(&self.postgres)
+            .await?;
+        Ok(rows.iter().map(job_from_row).collect::<Result<_, _>>()?)
+    }
+
+    /// Grouped rather than counted four times, over the same few days of rows
+    /// `recent_jobs` orders; a state with no jobs is simply absent from the
+    /// answer and keeps its zero.
+    pub async fn download_counts(&self) -> Result<DownloadCounts, CatalogError> {
+        let rows = sqlx::query("SELECT state, count(*) AS jobs FROM download_jobs GROUP BY state")
+            .fetch_all(&self.postgres)
+            .await?;
+        let mut counts = DownloadCounts::default();
+        for row in rows {
+            let jobs = row.try_get::<i64, _>("jobs")?.max(0) as u64;
+            match JobState::from_column(&row.try_get::<String, _>("state")?) {
+                JobState::Queued => counts.queued = jobs,
+                JobState::Running => counts.running = jobs,
+                JobState::Completed => counts.completed = jobs,
+                JobState::Failed => counts.failed = jobs,
+            }
+        }
+        Ok(counts)
+    }
+
+    /// The console's overview, polled. Three statements rather than one because
+    /// they cost wildly different amounts and folding them together would drag
+    /// the cheap ones up to the price of the dear one; issued together because
+    /// they are independent and the poll waits for all three anyway.
+    ///
+    /// None of them uses FINAL, and none of them counts distinct record ids. A
+    /// replayed insert batch leaves a second row for a record until the parts
+    /// merge, so every count here can read a few rows high inside that window.
+    /// That is the trade: `uniqExact(record_id)` would be exact and would build
+    /// a hash set of every id in a table sized for hundreds of millions of
+    /// them, on every poll, which is not a price an overview may charge.
+    pub async fn stats(&self) -> Result<IndexStats, CatalogError> {
+        #[derive(Default, Deserialize)]
+        struct Totals {
+            total: u64,
+            packs: u64,
+            raw_bytes: u64,
+            compressed_bytes: u64,
+        }
+        #[derive(Default, Deserialize)]
+        struct Recent {
+            last_24h: u64,
+        }
+        // The dear one. `count()` on its own would be answered out of part
+        // metadata without reading a column at all, but the two sums read eight
+        // bytes per row whatever else the statement does, so the count rides
+        // along free; `uniqExact(pack_key)` accumulates one entry per 256MB
+        // pack rather than one per record, which is what makes it affordable
+        // here where `uniqExact(record_id)` is not. This is the statement to
+        // replace with an AggregatingMergeTree rollup maintained on insert if
+        // the overview ever becomes the slowest thing the console does.
+        let totals_sql = format!(
+            "SELECT count() AS total, uniqExact(pack_key) AS packs, \
+             sum(raw_size) AS raw_bytes, sum(compressed_size) AS compressed_bytes \
+             FROM {RECORDS_TABLE}"
+        );
+        // Cheap: `toYYYYMM(received_at)` is the partition key and
+        // `toDate(received_at)` leads the sorting key, so a lower bound on
+        // `received_at` reaches both and the scan is one day of granules.
+        let recent_sql = format!(
+            "SELECT count() AS last_24h FROM {RECORDS_TABLE} \
+             WHERE received_at >= now() - toIntervalDay(1)"
+        );
+        // `source` is LowCardinality, so grouping by it reads a dictionary-coded
+        // column that compresses to a rounding error beside the table. Capped
+        // because the value arrives in a collector's header: nothing stops an
+        // authenticated collector from inventing a source per request, and an
+        // overview answering with an unbounded array is the wrong place to find
+        // that out.
+        let sources_sql = format!(
+            "SELECT source, count() AS records FROM {RECORDS_TABLE} \
+             GROUP BY source ORDER BY records DESC LIMIT {MAX_REPORTED_SOURCES}"
+        );
+        let (totals, recent, sources) = tokio::try_join!(
+            self.index.query::<Totals>(&totals_sql, &[]),
+            self.index.query::<Recent>(&recent_sql, &[]),
+            self.index.query::<SourceCount>(&sources_sql, &[]),
+        )?;
+        let totals = totals.into_iter().next().unwrap_or_default();
+        Ok(IndexStats {
+            records: RecordStats {
+                total: totals.total,
+                last_24h: recent.into_iter().next().unwrap_or_default().last_24h,
+                sources,
+            },
+            storage: StorageStats {
+                packs: totals.packs,
+                raw_bytes: totals.raw_bytes,
+                compressed_bytes: totals.compressed_bytes,
+            },
+        })
+    }
+}
+
+/// Every column a `DownloadJob` is built from, in the one place both readers of
+/// the table select them.
+const JOB_COLUMNS: &str = "SELECT id, state, record_count, result_object_key, error, created_at \
+                           FROM download_jobs";
+
+fn job_from_row(row: &sqlx::postgres::PgRow) -> Result<DownloadJob, sqlx::Error> {
+    let id: Uuid = row.try_get("id")?;
+    Ok(DownloadJob {
+        id,
+        state: JobState::from_column(&row.try_get::<String, _>("state")?),
+        created_at: row.try_get("created_at")?,
+        record_count: row.try_get::<i64, _>("record_count")?.max(0) as usize,
+        download_url: row
+            .try_get::<Option<String>, _>("result_object_key")?
+            .map(|_| format!("/api/v1/downloads/{id}/file")),
+        error: row.try_get("error")?,
+    })
 }
 
 fn record_json(
@@ -811,6 +925,46 @@ impl JobState {
             _ => Self::Queued,
         }
     }
+}
+
+/// What the console's overview asks the index for. `records.total` is a row
+/// count, not a distinct record count, and `storage` is what the index says the
+/// packs hold rather than what the bucket bills for; both are documented on
+/// `Catalog::stats`, which is where the reasons are.
+#[derive(Clone, Debug, Serialize)]
+pub struct IndexStats {
+    pub records: RecordStats,
+    pub storage: StorageStats,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RecordStats {
+    pub total: u64,
+    pub last_24h: u64,
+    /// The busiest `MAX_REPORTED_SOURCES`, so this does not have to sum to
+    /// `total`.
+    pub sources: Vec<SourceCount>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SourceCount {
+    pub source: String,
+    pub records: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct StorageStats {
+    pub packs: u64,
+    pub raw_bytes: u64,
+    pub compressed_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct DownloadCounts {
+    pub queued: u64,
+    pub running: u64,
+    pub completed: u64,
+    pub failed: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -12,6 +12,8 @@
 - `GET /api/v1/records`：按来源、时间、玩家筛选，使用游标分页。
 - `POST /api/v1/downloads`：创建异步批量导出任务。
 - `GET /api/v1/downloads/{job_id}`：查询导出进度和下载地址。
+- `GET /api/v1/downloads`：按创建时间倒序列出最近的导出任务。
+- `GET /api/v1/stats`：管理台概览的聚合，包含记录总量与近 24 小时增量、按来源的分布、数据包数量与体积、导出任务状态和 Watch 运行状态；计数不使用 FINAL，重放插入后的合并窗口内可能略高。
 - 内置 majsoul2mjai Watch：在线配置房间、模式、账号密钥引用、代理和轮询频率，展示 UUID 获取与转换状态。
 - 登录与 PB 获取采用版本化进程模块，安装时校验 SHA-256 和协议健康状态，可在线切换、失败回滚。
 - 集成 mihomo：网页配置订阅、刷新 provider、测试节点延迟并切换 Watch 专用节点。
