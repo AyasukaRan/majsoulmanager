@@ -34,7 +34,7 @@ use crate::{
     pack::PackStore,
     watch::{WatchEvent, WatchEventKind, WatchRegistry},
     watch_log::{WatchLogBuffer, WatchLogLevel},
-    watch_service::{PluginWorker, WatchProxyMode, WatchServiceConfig},
+    watch_service::{PluginWorker, WatchInstance, WatchProxyMode, WatchServiceConfig},
 };
 
 const FILTER_ID_OFFSET: i32 = 200;
@@ -127,13 +127,17 @@ struct RpcRequest {
 }
 
 pub(crate) async fn run(
-    mut config: WatchServiceConfig,
+    config: WatchServiceConfig,
+    mut instance: WatchInstance,
     dependencies: Arc<ManagedWatchDependencies>,
     login_worker: Option<Arc<PluginWorker>>,
     pb_worker: Option<Arc<PluginWorker>>,
 ) -> Result<()> {
-    let modes = room_modes(&config.room, &config.modes, config.players)?;
-    let (username, password) = load_first_account(&config.account_secret_ref)?;
+    // Every log line this collector emits carries its instance id, which is
+    // how the console tells concurrent collectors apart.
+    let source = format!("collector:{}", instance.id);
+    let modes = room_modes(&instance.room, &instance.modes, instance.players)?;
+    let (username, password) = load_first_account(&instance.account_secret_ref)?;
     let proxy = match config.proxy_mode {
         WatchProxyMode::Direct => None,
         WatchProxyMode::Mihomo => Some(dependencies.mihomo.proxy_url().to_owned()),
@@ -153,16 +157,21 @@ pub(crate) async fn run(
             }
         }
     }
-    let state_path = dependencies.data_dir.join("watch/state.json");
+    let state_path = dependencies
+        .data_dir
+        .join(format!("watch/state-{}.json", instance.id));
+    // Shared: the gateway, package version and version floor are properties of
+    // the Majsoul deployment, not of the account, so instances benefit from
+    // each other's lookups.
     let cache_dir = dependencies.data_dir.join("watch/cache");
     // A previously discovered floor, so a restart does not pay for the search
     // again. Ignored when it is below the pinned default, which a code update
     // may have moved past it.
-    if config.client_version.is_none()
+    if instance.client_version.is_none()
         && let Some(stored) = load_client_version(&cache_dir)
         && parse_version(&stored) > parse_version(CN_CODE_VERSION)
     {
-        config.client_version = Some(stored);
+        instance.client_version = Some(stored);
     }
     let (tracked_state, pending_state) = load_state(&state_path)?;
     let mut tracked = tracked_state
@@ -182,16 +191,18 @@ pub(crate) async fn run(
     loop {
         dependencies.logs.append(
             WatchLogLevel::Info,
-            "collector",
+            &source,
             format!("开始连接雀魂服务器 (账号 {username}, 代理 {proxy_label})"),
         );
         match connect(
             &config,
+            &instance,
             &username,
             &password,
             proxy.as_deref(),
             login_worker.clone(),
             &dependencies.logs,
+            &source,
             &cache_dir,
         )
         .await
@@ -219,7 +230,7 @@ pub(crate) async fn run(
                     warn!(error = %format!("{error:#}"), "watch session disconnected");
                     dependencies.logs.append(
                         WatchLogLevel::Warn,
-                        "collector",
+                        &source,
                         format!("会话断开: {error:#}"),
                     );
                 }
@@ -230,54 +241,72 @@ pub(crate) async fn run(
                 warn!(error = %detail, "watch login failed");
                 dependencies.logs.append(
                     WatchLogLevel::Error,
-                    "collector",
+                    &source,
                     format!("登录失败: {detail}"),
                 );
                 if detail.contains("151") {
-                    let rejected = config
+                    let rejected = instance
                         .client_version
                         .clone()
                         .unwrap_or_else(|| CN_CODE_VERSION.to_string());
-                    dependencies.logs.append(
-                        WatchLogLevel::Warn,
-                        "collector",
-                        format!(
-                            "error 151 = 客户端版本 {rejected} 已过期,开始探测服务端接受的最低版本"
-                        ),
-                    );
-                    match discover_version_floor(
-                        &config,
-                        &username,
-                        &password,
-                        proxy.as_deref(),
-                        login_worker.clone(),
-                        &dependencies.logs,
-                        &cache_dir,
-                        &rejected,
-                    )
-                    .await
-                    {
-                        Ok(version) => {
-                            store_client_version(&cache_dir, &version);
-                            config.client_version = Some(version.clone());
-                            dependencies.logs.append(
-                                WatchLogLevel::Info,
-                                "collector",
-                                format!("客户端版本已自动更新为 {version}"),
-                            );
+                    // A sibling instance hits the same server-wide bump at the
+                    // same time. Whoever finishes first publishes the floor, so
+                    // check for it before paying for a second search.
+                    let shared = load_client_version(&cache_dir)
+                        .filter(|shared| parse_version(shared) > parse_version(&rejected));
+                    if let Some(shared) = shared {
+                        dependencies.logs.append(
+                            WatchLogLevel::Info,
+                            &source,
+                            format!(
+                                "error 151 = 客户端版本 {rejected} 已过期,采用其他实例探测到的 {shared}"
+                            ),
+                        );
+                        instance.client_version = Some(shared);
+                    } else {
+                        dependencies.logs.append(
+                            WatchLogLevel::Warn,
+                            &source,
+                            format!(
+                                "error 151 = 客户端版本 {rejected} 已过期,开始探测服务端接受的最低版本"
+                            ),
+                        );
+                        match discover_version_floor(
+                            &config,
+                            &instance,
+                            &username,
+                            &password,
+                            proxy.as_deref(),
+                            login_worker.clone(),
+                            &dependencies.logs,
+                            &source,
+                            &cache_dir,
+                            &rejected,
+                        )
+                        .await
+                        {
+                            Ok(version) => {
+                                store_client_version(&cache_dir, &version);
+                                instance.client_version = Some(version.clone());
+                                dependencies.logs.append(
+                                    WatchLogLevel::Info,
+                                    &source,
+                                    format!("客户端版本已自动更新为 {version}"),
+                                );
+                            }
+                            Err(error) => dependencies.logs.append(
+                                WatchLogLevel::Error,
+                                &source,
+                                format!("版本探测失败: {error:#}"),
+                            ),
                         }
-                        Err(error) => dependencies.logs.append(
-                            WatchLogLevel::Error,
-                            "collector",
-                            format!("版本探测失败: {error:#}"),
-                        ),
                     }
                 }
             }
         }
         dependencies.logs.append(
             WatchLogLevel::Info,
-            "collector",
+            &source,
             format!("等待 {RECONNECT_DELAY_SECS} 秒后重连"),
         );
         tokio::time::sleep(Duration::from_secs(RECONNECT_DELAY_SECS)).await;
@@ -428,9 +457,14 @@ fn load_client_version(cache_dir: &Path) -> Option<String> {
 }
 
 fn store_client_version(cache_dir: &Path, version: &str) {
+    // Written via a temporary file because instances share this path: a reader
+    // must never see a half-written version.
+    let temporary = cache_dir.join(format!("client_version.{}", Uuid::new_v4().simple()));
     if std::fs::create_dir_all(cache_dir).is_ok()
-        && let Err(error) = std::fs::write(client_version_path(cache_dir), version)
+        && let Err(error) = std::fs::write(&temporary, version)
+            .and_then(|()| std::fs::rename(&temporary, client_version_path(cache_dir)))
     {
+        let _ = std::fs::remove_file(&temporary);
         warn!(error = %error, "failed to persist discovered client version");
     }
 }
@@ -462,18 +496,20 @@ fn format_version(value: u32) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn probe_version(
     config: &WatchServiceConfig,
+    instance: &WatchInstance,
     username: &str,
     password: &str,
     proxy: Option<&str>,
     worker: Option<Arc<PluginWorker>>,
     logs: &WatchLogBuffer,
+    source: &str,
     cache_dir: &Path,
     version: &str,
 ) -> Result<bool> {
-    let mut candidate = config.clone();
+    let mut candidate = instance.clone();
     candidate.client_version = Some(version.to_string());
     match connect(
-        &candidate, username, password, proxy, worker, logs, cache_dir,
+        config, &candidate, username, password, proxy, worker, logs, source, cache_dir,
     )
     .await
     {
@@ -497,11 +533,13 @@ async fn probe_version(
 #[allow(clippy::too_many_arguments)]
 async fn discover_version_floor(
     config: &WatchServiceConfig,
+    instance: &WatchInstance,
     username: &str,
     password: &str,
     proxy: Option<&str>,
     worker: Option<Arc<PluginWorker>>,
     logs: &WatchLogBuffer,
+    source: &str,
     cache_dir: &Path,
     rejected: &str,
 ) -> Result<String> {
@@ -513,12 +551,13 @@ async fn discover_version_floor(
         async move {
             let version = format_version(value);
             let accepted = probe_version(
-                config, username, password, proxy, worker, logs, cache_dir, &version,
+                config, instance, username, password, proxy, worker, logs, source, cache_dir,
+                &version,
             )
             .await?;
             logs.append(
                 WatchLogLevel::Info,
-                "collector",
+                source,
                 format!(
                     "版本探测 {version} -> {}",
                     if accepted { "接受" } else { "拒绝" }
@@ -567,13 +606,16 @@ where
     Ok(accepted)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect(
     config: &WatchServiceConfig,
+    instance: &WatchInstance,
     username: &str,
     password: &str,
     proxy: Option<&str>,
     worker: Option<Arc<PluginWorker>>,
     logs: &WatchLogBuffer,
+    source: &str,
     cache_dir: &Path,
 ) -> Result<(LoginTransport, String)> {
     if let Some(worker) = worker {
@@ -585,7 +627,7 @@ async fn connect(
                     "username": username,
                     "password": password,
                     "proxy_url": proxy,
-                    "client_version": config.client_version,
+                    "client_version": instance.client_version,
                 }),
             )
             .await
@@ -594,7 +636,7 @@ async fn connect(
         let client_version = required_string(&result, "client_version")?;
         logs.append(
             WatchLogLevel::Info,
-            "collector",
+            source,
             format!("登录成功 (外置模块, 客户端版本 {client_version})"),
         );
         return Ok((
@@ -611,15 +653,15 @@ async fn connect(
         discover_gateway(&http, &config.server, cache_dir).await?;
     logs.append(
         WatchLogLevel::Info,
-        "collector",
+        source,
         format!("网关发现完成 ({})", endpoint_host(&endpoint)),
     );
     // Login sends client_version_string = WebGL_2022-<code_version>; the code
-    // version differs from the resource version and is pinned, overridable via
-    // config.client_version — which is also how a discovered floor is applied.
-    // The package (Unity build) is discovered from index.html, falling back to
-    // the pinned default.
-    let code_version = config
+    // version differs from the resource version and is pinned, overridable per
+    // instance — which is also how a discovered floor is applied. The package
+    // (Unity build) is discovered from index.html, falling back to the pinned
+    // default.
+    let code_version = instance
         .client_version
         .clone()
         .unwrap_or_else(|| CN_CODE_VERSION.to_string());
@@ -628,11 +670,11 @@ async fn connect(
         .unwrap_or_else(|_| CN_PACKAGE_VERSION.to_string());
     logs.append(
         WatchLogLevel::Info,
-        "collector",
+        source,
         format!("客户端版本 WebGL_2022-{code_version} (package {package_version})"),
     );
     let rpc = MajsoulRpc::connect_with_proxy(&endpoint, proxy).await?;
-    logs.append(WatchLogLevel::Info, "collector", "WebSocket 已连接");
+    logs.append(WatchLogLevel::Info, source, "WebSocket 已连接");
     rpc.login_native_exact(
         username,
         password,
@@ -642,7 +684,7 @@ async fn connect(
         &route_id,
     )
     .await?;
-    logs.append(WatchLogLevel::Info, "collector", "登录成功");
+    logs.append(WatchLogLevel::Info, source, "登录成功");
     Ok((
         LoginTransport::Builtin(rpc),
         format!("WebGL_2022-{code_version}"),
