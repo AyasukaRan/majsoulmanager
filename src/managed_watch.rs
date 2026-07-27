@@ -11,12 +11,13 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{TimeZone, Utc};
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
-    catalog::{Catalog, IdempotencyClaim, Record},
+    catalog::Catalog,
+    indexer,
+    kafka::Kafka,
     majsoul::{
         BROWSER_USER_AGENT,
         convert::{GameMetadata, convert_record_bytes},
@@ -30,8 +31,6 @@ use crate::{
         },
     },
     mihomo::MihomoManager,
-    mjai,
-    pack::PackStore,
     watch::{WatchEvent, WatchEventKind, WatchRegistry},
     watch_log::{WatchLogBuffer, WatchLogLevel},
     watch_service::{PluginWorker, WatchInstance, WatchProxyMode, WatchServiceConfig},
@@ -62,7 +61,7 @@ const VERSION_PROBE_DELAY_SECS: u64 = 5;
 pub struct ManagedWatchDependencies {
     pub data_dir: PathBuf,
     pub catalog: Arc<Catalog>,
-    pub packs: Arc<PackStore>,
+    pub kafka: Arc<Kafka>,
     pub registry: Arc<WatchRegistry>,
     pub mihomo: Arc<MihomoManager>,
     pub logs: Arc<WatchLogBuffer>,
@@ -831,7 +830,9 @@ async fn watch_session(
                     dependencies.registry.apply(event(
                         &game,
                         WatchEventKind::Completed,
-                        Some("已转换并写入 mjai pack".into()),
+                        // 打包和写索引已经移到 worker 里，这一步只保证记录已经
+                        // 被 broker 确认，不再是“已经落到 pack 里”。
+                        Some("已转换并提交到打包队列".into()),
                         Some(record_id),
                     ))?;
                     pending.remove(&game.uuid);
@@ -855,6 +856,21 @@ async fn watch_session(
     }
 }
 
+/// The live collector's ingest, which is the path that actually feeds the
+/// corpus. It goes through the same claim-and-produce as the HTTP API rather
+/// than keeping a second copy of it: the two drifted apart once already, and a
+/// change that only fixed `src/api.rs` would leave production on the old one.
+///
+/// Two things have to survive that unification exactly, because the live
+/// PostgreSQL table and the live index both depend on them. The source is
+/// `majsoul-watch` and the key is the game uuid, which `indexer::claim` scopes
+/// as `majsoul-watch\0{uuid}` — byte for byte what this used to build itself,
+/// so every existing claim is still found. And `played_at` is still derived
+/// from the uuid's `yymmdd` prefix, which is midnight UTC of the day the game
+/// was played; it travels as the explicit override, so it still wins over the
+/// record's own `majsoul.start_time`. The only behaviour that changes is a uuid
+/// that carries no parsable date, which used to index a null `played_at` and
+/// now falls back to the converted record's header.
 async fn ingest(
     game_uuid: &str,
     compressed: &[u8],
@@ -863,53 +879,21 @@ async fn ingest(
     let mut decoder = GzDecoder::new(compressed);
     let mut raw = Vec::new();
     decoder.read_to_end(&mut raw)?;
-    let metadata = mjai::parse_metadata(&raw)?;
-    let sha256 = hex::encode(Sha256::digest(&raw));
-    let id = Uuid::new_v4();
-    let idempotency_key = format!("majsoul-watch\0{game_uuid}");
-    match dependencies
-        .catalog
-        .claim(&idempotency_key, id, &sha256)
-        .await?
-    {
-        IdempotencyClaim::Existing(record) => Ok(record.id),
-        IdempotencyClaim::New => {
-            let location = match dependencies.packs.append(id, &raw) {
-                Ok(location) => location,
-                Err(error) => {
-                    // Keep the pack failure as the reported cause; a leaked
-                    // claim only delays a retry of this one game uuid.
-                    if let Err(claim) = dependencies
-                        .catalog
-                        .abandon_claim(&idempotency_key, id)
-                        .await
-                    {
-                        tracing::warn!(%claim, "could not release the idempotency claim");
-                    }
-                    return Err(error.into());
-                }
-            };
-            dependencies
-                .catalog
-                .insert(Record {
-                    id,
-                    source: "majsoul-watch".into(),
-                    sha256,
-                    received_at: Utc::now(),
-                    played_at: game_uuid
-                        .get(0..6)
-                        .and_then(|value| chrono::NaiveDate::parse_from_str(value, "%y%m%d").ok())
-                        .and_then(|date| date.and_hms_opt(0, 0, 0))
-                        .map(|date| Utc.from_utc_datetime(&date)),
-                    players: metadata.players,
-                    rule: metadata.rule,
-                    event_count: metadata.event_count,
-                    storage: location,
-                })
-                .await?;
-            Ok(id)
-        }
-    }
+    let played_at = game_uuid
+        .get(0..6)
+        .and_then(|value| chrono::NaiveDate::parse_from_str(value, "%y%m%d").ok())
+        .and_then(|date| date.and_hms_opt(0, 0, 0))
+        .map(|date| Utc.from_utc_datetime(&date));
+    let accepted = indexer::ingest_one(
+        &dependencies.catalog,
+        &dependencies.kafka,
+        "majsoul-watch",
+        game_uuid,
+        played_at,
+        &raw,
+    )
+    .await?;
+    Ok(accepted.id)
 }
 
 fn parse_live_list(data: &[u8], fallback_mode_id: i32) -> Result<Vec<LiveGame>> {

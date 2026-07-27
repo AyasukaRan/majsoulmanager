@@ -21,6 +21,26 @@ services:
       MJAI_CLICKHOUSE_URL: http://clickhouse:8123
       MJAI_CLICKHOUSE_USER: mjai
       MJAI_CLICKHOUSE_PASSWORD: mjai
+      # Addresses are pinned to the service names rather than interpolated, the
+      # same as the two above: a deployment's .env names these hosts as
+      # localhost, which is right from the operator's shell and wrong from
+      # inside this network. Redpanda's internal listener, not the external one,
+      # because the external one advertises `localhost` and a client that
+      # followed that would dial itself.
+      MJAI_KAFKA_BOOTSTRAP_SERVERS: redpanda:29092
+      MJAI_S3_ENDPOINT_URL: http://rustfs:9000
+      MJAI_S3_ACCESS_KEY: rustfsadmin
+      MJAI_S3_SECRET_KEY: rustfsadmin
+      MJAI_S3_BUCKET: mjai-raw
+      MJAI_S3_REGION: us-east-1
+      # Tuning knobs, passed through so that setting them in .env does
+      # something. See .env.example for what each one trades.
+      MJAI_KAFKA_TOPIC: ${MJAI_KAFKA_TOPIC:-mjai.records.raw}
+      MJAI_KAFKA_PARTITIONS: ${MJAI_KAFKA_PARTITIONS:-1}
+      MJAI_KAFKA_MAX_LAG: ${MJAI_KAFKA_MAX_LAG:-50000}
+      MJAI_PACK_MAX_AGE_SECS: ${MJAI_PACK_MAX_AGE_SECS:-300}
+      MJAI_GC_GRACE_SECS: ${MJAI_GC_GRACE_SECS:-86400}
+      MJAI_GC_INTERVAL_SECS: ${MJAI_GC_INTERVAL_SECS:-3600}
       MJAI_MIHOMO_CONTROLLER_URL: http://mihomo:9090
       MJAI_MIHOMO_SECRET: ${MJAI_MIHOMO_SECRET:-change-mihomo-me}
       MJAI_MIHOMO_PROXY_URL: http://mihomo:7890
@@ -42,6 +62,16 @@ services:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
+      # Ingest cannot accept a record without the broker, so the API exits if it
+      # cannot reach one at boot. Waiting for the health check rather than the
+      # container turns the ten seconds Redpanda takes to elect a leader from a
+      # crash loop into a wait.
+      redpanda:
+        condition: service_healthy
+      # No health condition: the API only reaches the bucket behind the
+      # listener, and the sidecar that creates it races with this either way.
+      create-bucket:
+        condition: service_started
     restart: unless-stopped
 
   mihomo:
@@ -145,6 +175,11 @@ services:
       - --node-id=0
       - --kafka-addr=internal://0.0.0.0:29092,external://0.0.0.0:9092
       - --advertise-kafka-addr=internal://redpanda:29092,external://localhost:9092
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
     volumes:
       - redpanda-data:/var/lib/redpanda/data
 

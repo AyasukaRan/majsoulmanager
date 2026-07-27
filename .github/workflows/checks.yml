@@ -47,10 +47,44 @@ jobs:
       MJAI_CLICKHOUSE_URL: http://127.0.0.1:8123
       MJAI_CLICKHOUSE_USER: mjai
       MJAI_CLICKHOUSE_PASSWORD: mjai
+      MJAI_KAFKA_BOOTSTRAP_SERVERS: 127.0.0.1:9092
+      MJAI_S3_ENDPOINT_URL: http://127.0.0.1:9000
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
+      AWS_DEFAULT_REGION: us-east-1
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      # Not service containers: neither image runs as a broker or an object
+      # store on its default command, and a service container cannot override
+      # one. Ingest produces to Redpanda before it answers, and the pack worker
+      # uploads to RustFS before it indexes, so the suite needs both.
+      - name: Start Redpanda and RustFS
+        run: |
+          docker run -d --name redpanda -p 9092:9092 redpandadata/redpanda:v25.1.3 \
+            redpanda start --overprovisioned --smp=1 --memory=1G --reserve-memory=0M \
+            --node-id=0 --kafka-addr=external://0.0.0.0:9092 \
+            --advertise-kafka-addr=external://127.0.0.1:9092
+          docker run -d --name rustfs -p 9000:9000 \
+            -e RUSTFS_ACCESS_KEY=rustfsadmin -e RUSTFS_SECRET_KEY=rustfsadmin \
+            rustfs/rustfs:latest /data
+          # A broker that is up but has not elected a leader fails
+          # `partition_client`, and a bucket that does not exist fails every
+          # upload, so both are waited for rather than assumed.
+          for _ in $(seq 60); do
+            docker exec redpanda rpk cluster health | grep -q 'Healthy:.*true' && break
+            sleep 2
+          done
+          for _ in $(seq 60); do
+            aws --endpoint-url http://127.0.0.1:9000 s3api create-bucket \
+              --bucket mjai-raw >/dev/null 2>&1 && break
+            aws --endpoint-url http://127.0.0.1:9000 s3api head-bucket \
+              --bucket mjai-raw >/dev/null 2>&1 && break
+            sleep 2
+          done
+          aws --endpoint-url http://127.0.0.1:9000 s3api head-bucket --bucket mjai-raw
 
       - name: Install Rust 1.95
         run: |

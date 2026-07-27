@@ -53,7 +53,10 @@ use crate::config::Config;
 /// 256 KiB, so 768 KiB leaves room for the batch framing, the headers, and the
 /// one record that crosses the bound. Counting uncompressed bytes against a
 /// limit the broker applies to the compressed batch errs the safe way.
-const MAX_PRODUCE_BATCH_BYTES: usize = 768 * 1024;
+///
+/// Public because the batch import path stops accumulating at the same bound,
+/// which is what makes one `produce_batch` call one produce request.
+pub const MAX_PRODUCE_BATCH_BYTES: usize = 768 * 1024;
 
 /// rskafka hardcodes `acks = -1` and a 30 second broker-side produce timeout,
 /// and has no request timeout of its own: a half-open connection hangs the
@@ -211,6 +214,7 @@ pub struct Kafka {
     partitions: Vec<Arc<PartitionClient>>,
     /// The backlog per partition as of the last sample. See `lag`.
     lag: Vec<AtomicI64>,
+    max_lag: i64,
 }
 
 impl Kafka {
@@ -299,11 +303,19 @@ impl Kafka {
             topic: config.kafka_topic.clone(),
             lag: (0..partitions.len()).map(|_| AtomicI64::new(0)).collect(),
             partitions,
+            max_lag: config.kafka_max_lag,
         })
     }
 
     pub fn topic(&self) -> &str {
         &self.topic
+    }
+
+    /// The backlog at which ingest is refused. Carried here rather than read
+    /// from the configuration at every call site so that the reading and the
+    /// ceiling it is compared against cannot come from two different places.
+    pub fn max_lag(&self) -> i64 {
+        self.max_lag
     }
 
     pub fn partition_count(&self) -> i32 {

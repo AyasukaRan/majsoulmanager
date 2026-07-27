@@ -1,9 +1,17 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use clap::Parser;
-use mjai_management::{AppState, api, config::Config, gc};
-use tokio::net::TcpListener;
+use mjai_management::{AppState, api, config::Config, gc, indexer};
+use tokio::{net::TcpListener, sync::watch};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+/// How often the ingest path's view of the topic backlog is refreshed. Two
+/// broker round trips and a query per partition, so it is periodic rather than
+/// per request; between samples the backlog is only ever underestimated, which
+/// makes `MJAI_KAFKA_MAX_LAG` a ceiling overshot by at most one interval's
+/// ingest rather than one that refuses work a healthy worker is keeping up
+/// with.
+const LAG_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -31,18 +39,39 @@ async fn main() -> anyhow::Result<()> {
     // bucket that quietly stays empty.
     tokio::spawn(upload_legacy_packs(state.clone()));
     tokio::spawn(collect_orphans(state.clone()));
+    // What the ingest path's backlog ceiling reads. Nothing samples it in the
+    // test suite, which is why an unsampled reading of zero has to mean "no
+    // backlog" rather than "unknown".
+    tokio::spawn(
+        Arc::clone(&state.kafka)
+            .sample_lag_forever(state.catalog.postgres().clone(), LAG_SAMPLE_INTERVAL),
+    );
+
+    // One shutdown signal for the whole process: axum's graceful shutdown waits
+    // on it, and when `serve` returns the workers are told the same way rather
+    // than through a second handler that could fire at a different time.
+    let (stopping, shutdown) = watch::channel(false);
+    let workers = indexer::spawn_workers(&state, &shutdown);
+
     let listener = TcpListener::bind(&listen).await?;
     tracing::info!(%listen, "mjai management API listening");
-    axum::serve(listener, api::router(state.clone()))
+    let served = axum::serve(listener, api::router(state.clone()))
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
-    // The startup pack scan would re-index whatever is still buffered, but only
-    // under `source = recovered`, because the pack bytes do not carry the
-    // original source. Flushing on a planned shutdown keeps it.
-    if let Err(error) = state.catalog.flush().await {
-        tracing::error!(%error, "could not flush the record index on shutdown");
+        .await;
+
+    // Sent even when the server failed, so a listener that died does not leave
+    // the workers running against a process nobody will stop cleanly.
+    let _ = stopping.send(true);
+    for worker in workers {
+        // A pack worth of records, already durable in the topic, is waiting on
+        // the seal each of these is finishing. Exiting without it costs no
+        // data — the offset was never committed, so they replay — but it makes
+        // every redeploy re-pack and re-upload up to one pack per partition.
+        if let Err(error) = worker.await {
+            tracing::error!(%error, "a pack/index worker did not stop cleanly");
+        }
     }
-    Ok(())
+    Ok(served?)
 }
 
 /// Runs once per boot. Uploading a pack that is already there is a `HEAD` and

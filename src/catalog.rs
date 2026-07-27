@@ -9,7 +9,6 @@ use chrono::{DateTime, NaiveDateTime, SubsecRound, TimeDelta, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use sqlx::{Row, postgres::PgPoolOptions};
 use thiserror::Error;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
@@ -29,18 +28,6 @@ const CLICKHOUSE_SCHEMA: &str = include_str!("../migrations/clickhouse/001_recor
 const RECORDS_TABLE: &str = "mjai.records";
 const RECORD_COLUMNS: &str = "record_id, source, sha256, received_at, played_at, players, rule, \
                               event_count, pack_key, pack_offset, compressed_size, raw_size";
-
-/// A flush turns the whole buffer into one MergeTree part, so the batch size
-/// trades insert amplification against how many packed-but-unindexed records a
-/// crash leaves behind. Both ends are safe: the pack file is written first, and
-/// the startup scan re-indexes anything the index is missing.
-const INSERT_BATCH_ROWS: usize = 1_000;
-
-/// A flush that fails leaves its rows buffered, so a ClickHouse outage under
-/// sustained ingest grows the buffer without limit. This caps it at a hundred
-/// batches — tens of megabytes — after which ingest is refused rather than the
-/// process being killed for the memory.
-const MAX_PENDING_ROWS: usize = 100 * INSERT_BATCH_ROWS;
 
 /// docs/architecture.md line 76 — a query either carries a time range or is
 /// bounded by a server-side maximum window.
@@ -153,10 +140,6 @@ pub enum CatalogError {
     Pending,
     #[error("received_at range must not exceed {0} days")]
     WindowTooWide(i64),
-    #[error(
-        "{0} records are waiting to be indexed; the packed records will be indexed at the next start"
-    )]
-    Backlogged(usize),
     #[error("record index is unavailable: {0}")]
     Index(#[from] ClickHouseError),
     #[error("idempotency store is unavailable: {0}")]
@@ -165,22 +148,17 @@ pub enum CatalogError {
 
 pub enum IdempotencyClaim {
     New,
-    Existing(Record),
+    /// The record id the first request with this key was given. Only the id,
+    /// never the indexed row: under the Kafka pipeline a duplicate routinely
+    /// arrives before the worker has indexed the first copy, and reading the
+    /// row back to prove the claim would answer `Pending` — a `409` — for every
+    /// one of them, turning an ordinary re-import into a wall of conflicts.
+    Existing(Uuid),
 }
 
 pub struct Catalog {
     index: ClickHouse,
     postgres: sqlx::PgPool,
-    /// Records packed and claimed but not yet in a ClickHouse part. `get` reads
-    /// it directly — an id match needs no ordering and no filter, so it cannot
-    /// disagree with the index — while `page` flushes it and reads only the
-    /// index. This lock is never held across a ClickHouse call: one slow insert
-    /// would otherwise block every read behind it.
-    pending: Mutex<Vec<Record>>,
-    /// Held for the whole of a flush, so two concurrent flushes cannot send and
-    /// then discard the same rows. Separate from `pending` precisely because it
-    /// is the one that spans the network call.
-    flushing: Mutex<()>,
 }
 
 impl Catalog {
@@ -193,9 +171,9 @@ impl Catalog {
         )?;
         let dsn = config.postgres_dsn.as_str();
         let postgres = wait_ready("PostgreSQL", deadline, || {
-            // PostgreSQL only sees one small statement per ingest and the pack
-            // writer serialises ingest anyway, so a wide pool would buy
-            // nothing and the test suite opens one pool per case.
+            // PostgreSQL sees one small statement per ingested record and one
+            // more per sealed pack, so a wide pool would buy nothing and the
+            // test suite opens one pool per case.
             PgPoolOptions::new()
                 .max_connections(4)
                 .acquire_timeout(Duration::from_secs(5))
@@ -262,12 +240,7 @@ impl Catalog {
         }
         migration.commit().await?;
 
-        let catalog = Self {
-            index,
-            postgres,
-            pending: Mutex::new(Vec::new()),
-            flushing: Mutex::new(()),
-        };
+        let catalog = Self { index, postgres };
         catalog.prune().await?;
         Ok(catalog)
     }
@@ -295,7 +268,8 @@ impl Catalog {
 
     /// The `INSERT ... ON CONFLICT DO NOTHING` is the whole check-and-set: two
     /// concurrent requests with the same key reach PostgreSQL, exactly one gets
-    /// a row back and packs the record, the other falls through to the lookup.
+    /// a row back and produces the record, the other falls through to the
+    /// lookup.
     pub async fn claim(
         &self,
         key: &str,
@@ -331,10 +305,7 @@ impl Catalog {
         if row.try_get::<String, _>("content_sha256")? != sha256 {
             return Err(CatalogError::Conflict);
         }
-        self.get(row.try_get("record_id")?)
-            .await?
-            .map(IdempotencyClaim::Existing)
-            .ok_or(CatalogError::Pending)
+        Ok(IdempotencyClaim::Existing(row.try_get("record_id")?))
     }
 
     pub async fn abandon_claim(&self, key: &str, id: Uuid) -> Result<(), CatalogError> {
@@ -348,74 +319,41 @@ impl Catalog {
         Ok(())
     }
 
-    pub async fn insert(&self, mut record: Record) -> Result<(), CatalogError> {
-        // Milliseconds are the resolution the index and the cursor both have:
-        // the columns are DateTime64(3) and a cursor token is epoch millis.
-        // Truncating on the way in means a record `get` answers out of the
-        // buffer carries the timestamp the index will hand back once it is
-        // flushed, so a caller reading twice either side of a flush does not see
-        // it move. Every producer of a `Record` reaches the buffer through here,
-        // so this is the only place it needs doing.
-        record.received_at = record.received_at.trunc_subsecs(3);
-        record.played_at = record.played_at.map(|at| at.trunc_subsecs(3));
-        let full = {
-            let mut pending = self.pending.lock().await;
-            if pending.len() >= MAX_PENDING_ROWS {
-                // The pack file was written before this call, so refusing here
-                // costs visibility until the next boot re-indexes the pack, not
-                // the record. Accepting without bound would trade that for an
-                // out-of-memory kill, which loses the whole buffer instead.
-                return Err(CatalogError::Backlogged(pending.len()));
-            }
-            pending.push(record);
-            pending.len() >= INSERT_BATCH_ROWS
-        };
-        if full {
-            self.flush().await?;
+    /// One sealed pack's rows, in one statement and therefore one MergeTree
+    /// part. The batch is whatever the pack worker sealed, which at the 256MB
+    /// pack target and the measured record sizes is 2,500 to 23,000 rows and a
+    /// few megabytes of JSON — well inside what one HTTP insert carries, and
+    /// the ceiling only moves if `MJAI_PACK_TARGET_BYTES` is raised by orders
+    /// of magnitude, at which point the worker would chunk this call.
+    ///
+    /// Called only after the pack is durably in the bucket, and the Kafka
+    /// offset is committed only after this returns, which is the ordering the
+    /// whole pipeline's failure story rests on: a crash here replays the batch
+    /// and the replay converges through ReplacingMergeTree.
+    pub async fn insert_batch(&self, records: &[Record]) -> Result<(), CatalogError> {
+        if records.is_empty() {
+            return Ok(());
         }
+        // Milliseconds are the resolution the index and the cursor both have:
+        // the columns are DateTime64(3) and a cursor token is epoch millis. A
+        // replay must land on the byte-identical sorting key, so truncating
+        // here rather than at the call site keeps every producer of a `Record`
+        // — the worker and the recovery scan alike — on one resolution.
+        let rows: Vec<String> = records
+            .iter()
+            .map(|record| {
+                record_json(
+                    record,
+                    record.received_at.trunc_subsecs(3),
+                    record.played_at.map(|at| at.trunc_subsecs(3)),
+                )
+            })
+            .collect();
+        self.index.insert(RECORDS_TABLE, rows.join("\n")).await?;
         Ok(())
     }
 
-    /// Drains the buffer one batch at a time. A failed batch stays buffered and
-    /// the error propagates, so the caller sees a `500` and backs off; the next
-    /// flush retries from the front and a retry that lands twice converges
-    /// through ReplacingMergeTree.
-    pub async fn flush(&self) -> Result<(), CatalogError> {
-        let _flushing = self.flushing.lock().await;
-        loop {
-            // Only ever a batch's worth is serialised, never the whole buffer:
-            // with ClickHouse down the backlog grows, and rebuilding all of it
-            // on every insert would make the work per insert grow with it.
-            let batch: Vec<String> = {
-                let pending = self.pending.lock().await;
-                pending
-                    .iter()
-                    .take(INSERT_BATCH_ROWS)
-                    .map(record_json)
-                    .collect()
-            };
-            if batch.is_empty() {
-                return Ok(());
-            }
-            let sent = batch.len();
-            self.index.insert(RECORDS_TABLE, batch.join("\n")).await?;
-            // Rows are only ever appended, and `flushing` admits one flush at a
-            // time, so the rows just sent are still the front of the buffer.
-            self.pending.lock().await.drain(..sent);
-        }
-    }
-
     pub async fn get(&self, id: Uuid) -> Result<Option<Record>, CatalogError> {
-        if let Some(record) = self
-            .pending
-            .lock()
-            .await
-            .iter()
-            .rev()
-            .find(|record| record.id == id)
-        {
-            return Ok(Some(record.clone()));
-        }
         // `record_id` is last in the sorting key, so this leans on the bloom
         // filter added for it; `ORDER BY indexed_at` picks the newest of any
         // replayed rows without paying for FINAL.
@@ -464,18 +402,19 @@ impl Catalog {
         cursor: Option<Cursor>,
         limit: usize,
     ) -> Result<(Vec<Record>, Option<Cursor>), CatalogError> {
-        // A page is ordered by `(received_at DESC, record_id DESC)`, so a
-        // timestamp tie rests the whole order on the collation of `record_id` —
-        // and ClickHouse compares a UUID as (low 64 bits, high 64 bits) while
-        // `Uuid: Ord` compares the sixteen bytes big-endian. Merging the buffer
-        // in Rust therefore needs Rust to reproduce ClickHouse's collation for
-        // every column the cursor touches, and the buffer-side filter to
-        // reproduce every `WHERE` clause built below. Two attempts at that lost
-        // records; flushing first leaves one sort, one filter and one collation,
-        // all of them ClickHouse's, with nothing to reconcile. It costs one
-        // insert round-trip on the first read after a write, and nothing at all
-        // on a read that follows one — an empty flush never leaves the process.
-        self.flush().await?;
+        // Every row this answers with comes from ClickHouse and nowhere else,
+        // and nothing may ever merge a second source into it again. A page is
+        // ordered by `(received_at DESC, record_id DESC)`, so a timestamp tie
+        // rests the whole order on the collation of `record_id` — and
+        // ClickHouse compares a UUID as (low 64 bits, high 64 bits) while
+        // `Uuid: Ord` compares the sixteen bytes big-endian. Merging an
+        // in-memory buffer in Rust therefore needed Rust to reproduce
+        // ClickHouse's collation for every column the cursor touches and its
+        // filter to reproduce every `WHERE` clause built below. Two rounds of
+        // that lost records. The buffer is gone with the inline ingest path
+        // that needed it — rows now reach the index in one batch per sealed
+        // pack — which leaves one sort, one filter and one collation, all of
+        // them ClickHouse's, with nothing to reconcile.
 
         // FINAL collapses rows a replayed insert batch duplicated;
         // ReplacingMergeTree otherwise only dedups within a merged part.
@@ -694,13 +633,17 @@ impl Catalog {
     }
 }
 
-fn record_json(record: &Record) -> String {
+fn record_json(
+    record: &Record,
+    received_at: DateTime<Utc>,
+    played_at: Option<DateTime<Utc>>,
+) -> String {
     serde_json::json!({
         "record_id": record.id,
         "source": record.source,
         "sha256": record.sha256,
-        "received_at": clickhouse_timestamp(record.received_at),
-        "played_at": record.played_at.map(clickhouse_timestamp),
+        "received_at": clickhouse_timestamp(received_at),
+        "played_at": played_at.map(clickhouse_timestamp),
         "players": record.players,
         // LowCardinality(String) is not nullable; no mjai `start_game.rule` is
         // an empty string, so "" round-trips back to None.

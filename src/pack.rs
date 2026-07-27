@@ -7,7 +7,6 @@ use std::{
 };
 
 use chrono::Utc;
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -122,6 +121,12 @@ impl PackWriter {
         self.size
     }
 
+    /// The local file being filled. The pack worker needs it to delete a pack
+    /// it is abandoning; a pack it seals gets the same path back from `seal`.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// How long the oldest record in this pack has been waiting to be indexed,
     /// or `None` while the pack is still empty. An age-based seal reads this
     /// rather than the file's creation time so that it never produces an empty
@@ -149,22 +154,13 @@ pub struct PackStore {
     legacy: PathBuf,
     staging: PathBuf,
     objects: Arc<Objects>,
-    target_bytes: u64,
-    /// The pre-Kafka ingest path still appends inline, from many request tasks
-    /// at once, so its writer needs a lock the worker's will not. Both this
-    /// field and `append` go away with that path.
-    inline: Mutex<Option<PackWriter>>,
 }
 
 impl PackStore {
     /// Both directories are derived from `data_dir` here rather than passed in,
     /// which is what makes `discard_staging` safe by construction: no caller
     /// can hand it a path, so no caller can point it at the legacy corpus.
-    pub fn new(
-        data_dir: &Path,
-        target_bytes: u64,
-        objects: Arc<Objects>,
-    ) -> Result<Self, PackError> {
+    pub fn new(data_dir: &Path, objects: Arc<Objects>) -> Result<Self, PackError> {
         let legacy = data_dir.join(LEGACY_DIR);
         let staging = data_dir.join(STAGING_DIR);
         std::fs::create_dir_all(&legacy)?;
@@ -173,8 +169,6 @@ impl PackStore {
             legacy,
             staging,
             objects,
-            target_bytes,
-            inline: Mutex::new(None),
         })
     }
 
@@ -277,31 +271,19 @@ impl PackStore {
         Ok(uploaded)
     }
 
-    /// The pre-Kafka ingest path: append and index inline, under the flat
-    /// `packs/{uuid}.mjpack` key. It deliberately does not use the dated key
-    /// scheme, because `pack_key` derives a flat key from a file name in this
-    /// directory and both the recovery scan and the boot-time upload depend on
-    /// that derivation matching what the index rows say. Removed when the
-    /// producer replaces this path.
-    pub fn append(&self, record_id: Uuid, raw: &[u8]) -> Result<PackLocation, PackError> {
-        let mut inline = self.inline.lock();
-        let writer = match inline.as_mut() {
-            Some(writer) => writer,
-            None => {
-                let key = format!("{PACK_PREFIX}{}{PACK_SUFFIX}", Uuid::new_v4());
-                inline.insert(PackWriter::create(&self.legacy, &key)?)
-            }
-        };
-        let location = writer.append(record_id, raw)?;
-        // Sealed after the append that reached the target rather than before
-        // the one that would overflow it, which is the rule the pack worker
-        // applies too because it also has to check an age limit after each
-        // record. A pack overshoots by at most one record, which against a
-        // 256MB target is noise.
-        if writer.size() >= self.target_bytes {
-            *inline = None;
-        }
-        Ok(location)
+    /// A pack in the legacy directory, under the flat `packs/{uuid}.mjpack`
+    /// key the pre-Kafka ingest path wrote. Nothing in the pipeline calls this:
+    /// records now reach a pack only through the worker's staging writer, and
+    /// the legacy corpus is append-only history that is read and uploaded but
+    /// never extended. It exists so the recovery scan can be exercised against
+    /// a pack of the shape the live corpus actually has — flat key included,
+    /// since `pack_key` derives that shape from a file name and both the scan
+    /// and the boot-time upload depend on the derivation matching the index.
+    pub fn legacy_writer(&self) -> Result<PackWriter, PackError> {
+        PackWriter::create(
+            &self.legacy,
+            &format!("{PACK_PREFIX}{}{PACK_SUFFIX}", Uuid::new_v4()),
+        )
     }
 }
 
@@ -424,10 +406,10 @@ mod tests {
 
     /// Every read in these tests resolves locally, so the endpoint is only ever
     /// contacted by the one test that means to prove the fallback happens.
-    fn store(root: &Path, target_bytes: u64) -> PackStore {
+    fn store(root: &Path) -> PackStore {
         let objects =
             Objects::new("http://127.0.0.1:1", "mjai-raw", "us-east-1", "k", "s").unwrap();
-        PackStore::new(root, target_bytes, Arc::new(objects)).unwrap()
+        PackStore::new(root, Arc::new(objects)).unwrap()
     }
 
     fn temp_dir() -> PathBuf {
@@ -437,9 +419,13 @@ mod tests {
     #[tokio::test]
     async fn round_trips_one_record_by_offset() {
         let root = temp_dir();
-        let store = store(&root, 1024);
+        let store = store(&root);
         let raw = br#"{"type":"start_game","names":["a","b","c","d"]}"#;
-        let location = store.append(Uuid::new_v4(), raw).unwrap();
+        let location = store
+            .staging_writer(0)
+            .unwrap()
+            .append(Uuid::new_v4(), raw)
+            .unwrap();
         assert_eq!(store.read(&location).await.unwrap(), raw);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -447,12 +433,13 @@ mod tests {
     #[tokio::test]
     async fn scan_rebuilds_every_location_from_the_headers() {
         let root = temp_dir();
-        let store = store(&root, 1024 * 1024);
+        let store = store(&root);
+        let mut writer = store.legacy_writer().unwrap();
         let written: Vec<_> = (0..3u8)
             .map(|index| {
                 let id = Uuid::new_v4();
                 let raw = vec![index; 64 + usize::from(index)];
-                let location = store.append(id, &raw).unwrap();
+                let location = writer.append(id, &raw).unwrap();
                 (id, location, raw)
             })
             .collect();
@@ -473,9 +460,10 @@ mod tests {
     #[test]
     fn scan_stops_at_a_torn_trailing_entry() {
         let root = temp_dir();
-        let store = store(&root, 1024 * 1024);
-        let location = store.append(Uuid::new_v4(), &[7; 64]).unwrap();
-        store.append(Uuid::new_v4(), &[8; 64]).unwrap();
+        let store = store(&root);
+        let mut writer = store.legacy_writer().unwrap();
+        let location = writer.append(Uuid::new_v4(), &[7; 64]).unwrap();
+        writer.append(Uuid::new_v4(), &[8; 64]).unwrap();
         let path = root
             .join(LEGACY_DIR)
             .join(Path::new(&location.pack_key).file_name().unwrap());
@@ -498,8 +486,12 @@ mod tests {
     #[test]
     fn scan_stops_at_a_tail_of_zeroes_instead_of_inventing_entries() {
         let root = temp_dir();
-        let store = store(&root, 1024 * 1024);
-        let location = store.append(Uuid::new_v4(), &[7; 64]).unwrap();
+        let store = store(&root);
+        let location = store
+            .legacy_writer()
+            .unwrap()
+            .append(Uuid::new_v4(), &[7; 64])
+            .unwrap();
         let path = root
             .join(LEGACY_DIR)
             .join(Path::new(&location.pack_key).file_name().unwrap());
@@ -515,16 +507,21 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// The seal now happens after the append that reaches the target, not
-    /// before the one that would overflow it, so the target here is small
-    /// enough that a single record trips it. What the test pins is unchanged:
-    /// a location handed out before a rollover still reads afterwards.
+    /// Rolling over is now the worker sealing one pack and opening the next.
+    /// What the test pins is unchanged: a location handed out before the
+    /// rollover still reads afterwards, from the sealed pack it was written to.
     #[tokio::test]
     async fn rolls_over_without_breaking_old_locations() {
         let root = temp_dir();
-        let store = store(&root, 8);
-        let first = store.append(Uuid::new_v4(), &[1; 128]).unwrap();
-        let second = store.append(Uuid::new_v4(), &[2; 128]).unwrap();
+        let store = store(&root);
+        let mut writer = store.staging_writer(0).unwrap();
+        let first = writer.append(Uuid::new_v4(), &[1; 128]).unwrap();
+        writer.seal().unwrap();
+        let second = store
+            .staging_writer(0)
+            .unwrap()
+            .append(Uuid::new_v4(), &[2; 128])
+            .unwrap();
         assert_ne!(first.pack_key, second.pack_key);
         assert_eq!(store.read(&first).await.unwrap(), vec![1; 128]);
         std::fs::remove_dir_all(root).unwrap();
@@ -537,11 +534,15 @@ mod tests {
     #[tokio::test]
     async fn resolves_flat_legacy_keys_and_dated_staging_keys_alike() {
         let root = temp_dir();
-        let store = store(&root, 1024 * 1024);
-        let legacy = store.append(Uuid::new_v4(), b"legacy record").unwrap();
+        let store = store(&root);
+        let legacy = store
+            .legacy_writer()
+            .unwrap()
+            .append(Uuid::new_v4(), b"legacy record")
+            .unwrap();
         assert!(
             legacy.pack_key.matches('/').count() == 1,
-            "the inline path must keep writing flat keys, got {}",
+            "the legacy corpus is keyed flat, got {}",
             legacy.pack_key
         );
         assert_eq!(
@@ -571,7 +572,7 @@ mod tests {
     #[tokio::test]
     async fn falls_back_to_object_storage_for_either_key_shape() {
         let root = temp_dir();
-        let store = store(&root, 1024 * 1024);
+        let store = store(&root);
         for key in [
             "packs/00000000-0000-4000-8000-000000000000.mjpack",
             "packs/2026/07/27/0-00000000-0000-4000-8000-000000000000.mjpack",
@@ -596,8 +597,12 @@ mod tests {
     #[test]
     fn discarding_staging_leaves_the_legacy_corpus_alone() {
         let root = temp_dir();
-        let store = store(&root, 1024 * 1024);
-        store.append(Uuid::new_v4(), b"legacy record").unwrap();
+        let store = store(&root);
+        store
+            .legacy_writer()
+            .unwrap()
+            .append(Uuid::new_v4(), b"legacy record")
+            .unwrap();
         store
             .staging_writer(0)
             .unwrap()
@@ -613,7 +618,7 @@ mod tests {
     #[test]
     fn a_writer_has_no_age_until_it_holds_a_record() {
         let root = temp_dir();
-        let store = store(&root, 1024 * 1024);
+        let store = store(&root);
         let mut writer = store.staging_writer(0).unwrap();
         assert_eq!(writer.age(), None);
         assert_eq!(writer.size(), MAGIC.len() as u64);

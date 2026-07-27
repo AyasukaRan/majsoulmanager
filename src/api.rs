@@ -35,11 +35,12 @@ use crate::{
         RegistrationStatus, UpdateUserRequest, UserView, VerifyEmailRequest,
     },
     catalog::{
-        CatalogError, Cursor, DownloadFormat, DownloadJob, DownloadRequest, IdempotencyClaim,
-        JobState, Record, RecordFilter,
+        CatalogError, Cursor, DownloadFormat, DownloadJob, DownloadRequest, JobState, Record,
+        RecordFilter,
     },
+    indexer::{self, Claimed, IngestError},
+    kafka::MAX_PRODUCE_BATCH_BYTES,
     mihomo::{MihomoAction, MihomoError, MihomoStatus, ProxySelection, SubscriptionUpdate},
-    mjai,
     watch_log::WatchLogEntry,
     watch_service::{
         InstallModuleRequest, InstalledModule, WatchAction, WatchDashboard, WatchRuntimeStatus,
@@ -364,6 +365,9 @@ async fn require_auth(
 #[derive(Serialize)]
 struct IngestResponse {
     id: Uuid,
+    /// `accepted`, not `indexed`: the record is durably in the topic and the
+    /// pack worker has not seen it yet, so a read of it can still answer 404
+    /// for as long as the worker takes to seal the pack it lands in.
     status: &'static str,
     duplicate: bool,
     sha256: String,
@@ -400,6 +404,13 @@ async fn ingest(
     Ok((status, Json(response)))
 }
 
+/// Validate, hash, claim, produce, `202`. Nothing here packs or indexes any
+/// more: the record is handed to the topic and the pack worker does both.
+///
+/// A batch carries one `X-Mjai-Played-At` header for tens of thousands of
+/// games, so the record's own `majsoul.start_time` is the only usable
+/// `played_at` and the header stays an override. The worker resolves that,
+/// because only it parses the record for the index row.
 async fn ingest_one(
     state: &AppState,
     idempotency_key: &str,
@@ -407,74 +418,35 @@ async fn ingest_one(
     played_at: Option<DateTime<Utc>>,
     body: &[u8],
 ) -> Result<IngestResponse, ApiError> {
-    // Reported separately from the size limit: a batch that stores nothing now
-    // answers 422, so this error string becomes the operator's whole diagnosis,
-    // and calling an empty record oversized points them at the wrong knob.
+    check_record_size(state, body)?;
+    let accepted = indexer::ingest_one(
+        &state.catalog,
+        &state.kafka,
+        source,
+        idempotency_key,
+        played_at,
+        body,
+    )
+    .await?;
+    Ok(IngestResponse {
+        id: accepted.id,
+        status: "accepted",
+        duplicate: accepted.duplicate,
+        sha256: accepted.sha256,
+    })
+}
+
+/// Reported separately from the size limit: a batch that stores nothing answers
+/// 422, so this error string becomes the operator's whole diagnosis, and
+/// calling an empty record oversized points them at the wrong knob.
+fn check_record_size(state: &AppState, body: &[u8]) -> Result<(), ApiError> {
     if body.is_empty() {
         return Err(ApiError::BadRequest("record is empty".into()));
     }
     if body.len() > state.config.max_record_bytes {
         return Err(ApiError::PayloadTooLarge(state.config.max_record_bytes));
     }
-    let metadata =
-        mjai::parse_metadata(body).map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    let sha256 = hex::encode(Sha256::digest(body));
-    let id = Uuid::new_v4();
-
-    let scoped_idempotency_key = format!("{source}\0{idempotency_key}");
-    match state
-        .catalog
-        .claim(&scoped_idempotency_key, id, &sha256)
-        .await?
-    {
-        IdempotencyClaim::Existing(record) => Ok(IngestResponse {
-            id: record.id,
-            status: "indexed",
-            duplicate: true,
-            sha256,
-        }),
-        IdempotencyClaim::New => {
-            let location = match state.packs.append(id, body) {
-                Ok(location) => location,
-                Err(error) => {
-                    // A claim left behind only costs the collector a `409` on
-                    // its next retry of this key, and reporting it would hide
-                    // the pack failure that actually stopped the ingest.
-                    if let Err(claim) = state
-                        .catalog
-                        .abandon_claim(&scoped_idempotency_key, id)
-                        .await
-                    {
-                        tracing::warn!(%claim, "could not release the idempotency claim");
-                    }
-                    return Err(ApiError::Internal(error.to_string()));
-                }
-            };
-            state
-                .catalog
-                .insert(Record {
-                    id,
-                    source: source.to_owned(),
-                    sha256: sha256.clone(),
-                    received_at: Utc::now(),
-                    // A batch carries one header for tens of thousands of games, so the record's
-                    // own majsoul.start_time is the only usable played_at; the header stays an
-                    // override.
-                    played_at: played_at.or(metadata.played_at),
-                    players: metadata.players,
-                    rule: metadata.rule,
-                    event_count: metadata.event_count,
-                    storage: location,
-                })
-                .await?;
-            Ok(IngestResponse {
-                id,
-                status: "indexed",
-                duplicate: false,
-                sha256,
-            })
-        }
-    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -595,6 +567,8 @@ async fn process_batch_archive(
             rejected: 0,
             errors: Vec::new(),
         };
+        let mut pending: Vec<Claimed> = Vec::new();
+        let mut pending_bytes = 0usize;
         for (index, entry) in entries.enumerate() {
             if index >= state.config.max_batch_records {
                 return Err(ApiError::BadRequest(format!(
@@ -643,26 +617,70 @@ async fn process_batch_archive(
                 }
             }
             let item_key = format!("{batch_key}/{member_path}");
-            match ingest_one(state, &item_key, source, played_at, &raw).await {
-                Ok(result) if result.duplicate => response.duplicates += 1,
-                Ok(_) => response.accepted += 1,
-                // Storage failing is this server losing a record the caller handed over, not the
-                // member being bad. Counting it as a rejection would bury a full disk in the
-                // error list of a 202 and let a losing import look healthy.
+            let member = match check_record_size(state, &raw) {
+                Ok(()) => indexer::claim(
+                    &state.catalog,
+                    &state.kafka,
+                    source,
+                    &item_key,
+                    played_at,
+                    &raw,
+                )
+                .await
+                .map_err(ApiError::from),
+                Err(error) => Err(error),
+            };
+            let claimed = match member {
+                Ok(claimed) => claimed,
+                // Losing a record the caller handed over is not the member being bad. Counting it
+                // as a rejection would bury a full disk — or a broker that will not take the
+                // record — in the error list of a 202 and let a losing import look healthy.
                 Err(ApiError::Internal(error)) => {
                     return Err(ApiError::Internal(format!("{member_path}: {error}")));
                 }
                 Err(error) => {
                     response.rejected += 1;
                     push_batch_error(&mut response.errors, format!("{member_path}: {error}"));
+                    continue;
                 }
+            };
+            if claimed.is_duplicate() {
+                response.duplicates += 1;
+                continue;
             }
+            response.accepted += 1;
+            // Produced in size-bounded chunks rather than one request at the end: a 50,000 member
+            // import is gigabytes, and holding all of it to produce at once would trade the pack
+            // worker's memory bound for the API's. Flushed before the record that would cross the
+            // bound rather than after it, which is the rule the producer chunks by, so one flush is
+            // exactly one produce request and a failed flush leaves the smallest possible set of
+            // claims to release.
+            if pending_bytes + claimed.raw_len() > MAX_PRODUCE_BATCH_BYTES {
+                produce_batch_chunk(state, &mut pending, &mut pending_bytes).await?;
+            }
+            pending_bytes += claimed.raw_len();
+            pending.push(claimed);
         }
+        produce_batch_chunk(state, &mut pending, &mut pending_bytes).await?;
         Ok(response)
     }
     .await;
     let _ = std::fs::remove_file(path);
     result
+}
+
+/// Hands one chunk of claimed records to the topic. A failure fails the whole
+/// import: the earlier chunks are durably produced and their claims stand, so
+/// the collector's retry finds them as duplicates and only re-sends what is
+/// actually missing.
+async fn produce_batch_chunk(
+    state: &AppState,
+    pending: &mut Vec<Claimed>,
+    pending_bytes: &mut usize,
+) -> Result<(), ApiError> {
+    *pending_bytes = 0;
+    indexer::produce_claimed(&state.catalog, &state.kafka, std::mem::take(pending)).await?;
+    Ok(())
 }
 
 /// MultiGzDecoder, not GzDecoder: concatenated gzip streams are one valid file (that is what
@@ -980,10 +998,29 @@ impl From<CatalogError> for ApiError {
         match error {
             CatalogError::Conflict | CatalogError::Pending => ApiError::Conflict(error.to_string()),
             CatalogError::WindowTooWide(_) => ApiError::BadRequest(error.to_string()),
-            // A `500` is what makes the collector back off, which is the point:
-            // the record is already packed, so the backlog needs ingest to stop
-            // long enough for the index to catch up, not a retry loop.
-            CatalogError::Backlogged(_) | CatalogError::Index(_) | CatalogError::Store(_) => {
+            CatalogError::Index(_) | CatalogError::Store(_) => {
+                ApiError::Internal(error.to_string())
+            }
+        }
+    }
+}
+
+impl From<IngestError> for ApiError {
+    fn from(error: IngestError) -> Self {
+        match error {
+            // The caller's record, not this server's problem: in a batch this
+            // is one rejected member inside an otherwise fine import.
+            IngestError::Malformed(_) => ApiError::BadRequest(error.to_string()),
+            IngestError::Catalog(error) => error.into(),
+            // A `500` is what makes a collector back off, which is the point in
+            // both cases. A produce that failed is a record this server was
+            // handed and did not keep, and it must never be reported as
+            // anything a `2xx` covers. A backlog past the ceiling is the same
+            // answer for the opposite reason: nothing was lost, and ingest has
+            // to stop long enough for the pack worker to drain the topic, or
+            // the topic outgrows its retention and drops records the API has
+            // already acknowledged.
+            IngestError::Produce(_) | IngestError::Backlogged(_) => {
                 ApiError::Internal(error.to_string())
             }
         }
