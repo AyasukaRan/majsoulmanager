@@ -47,16 +47,14 @@ const RECONNECT_DELAY_SECS: u64 = 5;
 // accepts anything at or above roughly (current - 3 patches) and accepts
 // arbitrarily future values, while `client_version { resource, package }` is
 // not checked at all. So the pinned code version only has to be recent enough,
-// and on rejection any high value restores service (see CN_FALLBACK_VERSION).
+// and on rejection the floor can be found by search (discover_version_floor).
 const CN_CODE_VERSION: &str = "0.16.257";
 const CN_PACKAGE_VERSION: &str = "4.0.45";
-// Used after the server rejects the pinned version with error 151. Being above
-// the floor is all that matters, so this needs no discovery and never goes
-// stale.
-// ponytail: relies on the check staying a lower bound; if Majsoul ever adds an
-// upper bound, discover the real version instead (binary-searching the floor
-// with real credentials costs ~6 logins).
-const CN_FALLBACK_VERSION: &str = "0.99.999";
+// Ceiling for the version search: four minor releases above the rejected
+// value. Reaching it means the login is failing for some reason other than a
+// raised version floor.
+const VERSION_SEARCH_SPAN: u32 = 4096;
+const VERSION_PROBE_DELAY_SECS: u64 = 5;
 
 pub struct ManagedWatchDependencies {
     pub data_dir: PathBuf,
@@ -129,7 +127,7 @@ struct RpcRequest {
 }
 
 pub(crate) async fn run(
-    config: WatchServiceConfig,
+    mut config: WatchServiceConfig,
     dependencies: Arc<ManagedWatchDependencies>,
     login_worker: Option<Arc<PluginWorker>>,
     pb_worker: Option<Arc<PluginWorker>>,
@@ -157,6 +155,15 @@ pub(crate) async fn run(
     }
     let state_path = dependencies.data_dir.join("watch/state.json");
     let cache_dir = dependencies.data_dir.join("watch/cache");
+    // A previously discovered floor, so a restart does not pay for the search
+    // again. Ignored when it is below the pinned default, which a code update
+    // may have moved past it.
+    if config.client_version.is_none()
+        && let Some(stored) = load_client_version(&cache_dir)
+        && parse_version(&stored) > parse_version(CN_CODE_VERSION)
+    {
+        config.client_version = Some(stored);
+    }
     let (tracked_state, pending_state) = load_state(&state_path)?;
     let mut tracked = tracked_state
         .into_iter()
@@ -172,11 +179,6 @@ pub(crate) async fn run(
         .map(proxy_display)
         .unwrap_or_else(|| "直连".into());
 
-    // Set once the server rejects our client version (151); the reconnect below
-    // then retries with CN_FALLBACK_VERSION, which the version floor always
-    // accepts.
-    let mut bump_version = false;
-
     loop {
         dependencies.logs.append(
             WatchLogLevel::Info,
@@ -191,7 +193,6 @@ pub(crate) async fn run(
             login_worker.clone(),
             &dependencies.logs,
             &cache_dir,
-            bump_version,
         )
         .await
         {
@@ -232,15 +233,45 @@ pub(crate) async fn run(
                     "collector",
                     format!("登录失败: {detail}"),
                 );
-                if detail.contains("151") && !bump_version {
-                    bump_version = true;
+                if detail.contains("151") {
+                    let rejected = config
+                        .client_version
+                        .clone()
+                        .unwrap_or_else(|| CN_CODE_VERSION.to_string());
                     dependencies.logs.append(
                         WatchLogLevel::Warn,
                         "collector",
                         format!(
-                            "error 151 = 客户端版本过期,重连时自动改用 {CN_FALLBACK_VERSION}(服务端只校验版本下限)。"
+                            "error 151 = 客户端版本 {rejected} 已过期,开始探测服务端接受的最低版本"
                         ),
                     );
+                    match discover_version_floor(
+                        &config,
+                        &username,
+                        &password,
+                        proxy.as_deref(),
+                        login_worker.clone(),
+                        &dependencies.logs,
+                        &cache_dir,
+                        &rejected,
+                    )
+                    .await
+                    {
+                        Ok(version) => {
+                            store_client_version(&cache_dir, &version);
+                            config.client_version = Some(version.clone());
+                            dependencies.logs.append(
+                                WatchLogLevel::Info,
+                                "collector",
+                                format!("客户端版本已自动更新为 {version}"),
+                            );
+                        }
+                        Err(error) => dependencies.logs.append(
+                            WatchLogLevel::Error,
+                            "collector",
+                            format!("版本探测失败: {error:#}"),
+                        ),
+                    }
                 }
             }
         }
@@ -385,19 +416,157 @@ fn decode_base64_field(value: &serde_json::Value, field: &str) -> Result<Vec<u8>
     Ok(STANDARD.decode(encoded)?)
 }
 
-/// Client code version to send at login. `bump` wins over the configured value
-/// because it is only set once the server has already rejected that value.
-fn login_code_version(config: &WatchServiceConfig, bump: bool) -> String {
-    if bump {
-        return CN_FALLBACK_VERSION.to_string();
-    }
-    config
-        .client_version
-        .clone()
-        .unwrap_or_else(|| CN_CODE_VERSION.to_string())
+fn client_version_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("client_version")
 }
 
+/// Last discovered version floor, if one was ever written and still parses.
+fn load_client_version(cache_dir: &Path) -> Option<String> {
+    let stored = std::fs::read_to_string(client_version_path(cache_dir)).ok()?;
+    let stored = stored.trim().to_string();
+    parse_version(&stored).map(|_| stored)
+}
+
+fn store_client_version(cache_dir: &Path, version: &str) {
+    if std::fs::create_dir_all(cache_dir).is_ok()
+        && let Err(error) = std::fs::write(client_version_path(cache_dir), version)
+    {
+        warn!(error = %error, "failed to persist discovered client version");
+    }
+}
+
+/// Parse `0.<minor>.<patch>` into one number so the two moving components can
+/// be searched as a single ordered value.
+fn parse_version(version: &str) -> Option<u32> {
+    let mut parts = version.split('.');
+    if parts.next()? != "0" {
+        return None;
+    }
+    let minor: u32 = parts.next()?.parse().ok()?;
+    let patch: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || patch >= 1000 {
+        return None;
+    }
+    Some(minor * 1000 + patch)
+}
+
+/// Inverse of [`parse_version`]; patch overflow carries into minor, which is
+/// what Majsoul itself does when a patch series rolls over.
+fn format_version(value: u32) -> String {
+    format!("0.{}.{}", value / 1000, value % 1000)
+}
+
+/// Try one candidate version. `Ok(false)` means the server rejected it as too
+/// old (151); any other failure is a real error and must abort the search
+/// rather than be mistaken for a rejection.
 #[allow(clippy::too_many_arguments)]
+async fn probe_version(
+    config: &WatchServiceConfig,
+    username: &str,
+    password: &str,
+    proxy: Option<&str>,
+    worker: Option<Arc<PluginWorker>>,
+    logs: &WatchLogBuffer,
+    cache_dir: &Path,
+    version: &str,
+) -> Result<bool> {
+    let mut candidate = config.clone();
+    candidate.client_version = Some(version.to_string());
+    match connect(
+        &candidate, username, password, proxy, worker, logs, cache_dir,
+    )
+    .await
+    {
+        Ok((transport, _)) => {
+            transport.close().await;
+            Ok(true)
+        }
+        Err(error) if format!("{error:#}").contains("151") => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Find the lowest client version the server still accepts.
+///
+/// The server validates `client_version_string` as a lower bound, so the set of
+/// accepted versions is upward-closed: escalate until one is accepted, then
+/// binary-search back down to the boundary. Costs about six logins, and only
+/// when Majsoul raises the floor. The floor is returned rather than something
+/// comfortably above it because the floor is what a browser tab a few patches
+/// behind reports, whereas an arbitrarily high version is a giveaway.
+#[allow(clippy::too_many_arguments)]
+async fn discover_version_floor(
+    config: &WatchServiceConfig,
+    username: &str,
+    password: &str,
+    proxy: Option<&str>,
+    worker: Option<Arc<PluginWorker>>,
+    logs: &WatchLogBuffer,
+    cache_dir: &Path,
+    rejected: &str,
+) -> Result<String> {
+    let rejected_value =
+        parse_version(rejected).with_context(|| format!("unparsable client version {rejected}"))?;
+
+    let floor = search_version_floor(rejected_value, |value: u32| {
+        let worker = worker.clone();
+        async move {
+            let version = format_version(value);
+            let accepted = probe_version(
+                config, username, password, proxy, worker, logs, cache_dir, &version,
+            )
+            .await?;
+            logs.append(
+                WatchLogLevel::Info,
+                "collector",
+                format!(
+                    "版本探测 {version} -> {}",
+                    if accepted { "接受" } else { "拒绝" }
+                ),
+            );
+            // A burst of back-to-back failed logins is itself worth hiding, and
+            // the search runs rarely enough that pacing it costs nothing.
+            tokio::time::sleep(Duration::from_secs(VERSION_PROBE_DELAY_SECS)).await;
+            Ok(accepted)
+        }
+    })
+    .await?;
+    Ok(format_version(floor))
+}
+
+/// Lowest value for which `probe` returns true, given that the accepted set is
+/// upward-closed and `rejected` is known to be below it.
+async fn search_version_floor<F, Fut>(rejected: u32, mut probe: F) -> Result<u32>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: Future<Output = Result<bool>>,
+{
+    // Escalate until something is accepted, remembering the highest rejection
+    // so the binary search starts from a known-bad bound.
+    let (mut too_low, mut accepted) = (rejected, None);
+    let mut step = 4;
+    while step <= VERSION_SEARCH_SPAN {
+        let candidate = rejected + step;
+        if probe(candidate).await? {
+            accepted = Some(candidate);
+            break;
+        }
+        too_low = candidate;
+        step *= 4;
+    }
+    let mut accepted = accepted.context("no accepted client version within the search span")?;
+
+    while too_low + 1 < accepted {
+        let middle = too_low + (accepted - too_low) / 2;
+        if probe(middle).await? {
+            accepted = middle;
+        } else {
+            too_low = middle;
+        }
+    }
+    Ok(accepted)
+}
+
 async fn connect(
     config: &WatchServiceConfig,
     username: &str,
@@ -406,7 +575,6 @@ async fn connect(
     worker: Option<Arc<PluginWorker>>,
     logs: &WatchLogBuffer,
     cache_dir: &Path,
-    bump_version: bool,
 ) -> Result<(LoginTransport, String)> {
     if let Some(worker) = worker {
         let result = worker
@@ -417,13 +585,7 @@ async fn connect(
                     "username": username,
                     "password": password,
                     "proxy_url": proxy,
-                    // None lets the module pick its own default; once the
-                    // server has rejected a version we force the safe one.
-                    "client_version": if bump_version {
-                        Some(CN_FALLBACK_VERSION.to_string())
-                    } else {
-                        config.client_version.clone()
-                    },
+                    "client_version": config.client_version,
                 }),
             )
             .await
@@ -453,11 +615,14 @@ async fn connect(
         format!("网关发现完成 ({})", endpoint_host(&endpoint)),
     );
     // Login sends client_version_string = WebGL_2022-<code_version>; the code
-    // version differs from the resource version and is pinned (overridable via
-    // config.client_version). `bump_version` takes precedence because it is only
-    // set after the server rejected whatever we tried last. The package (Unity
-    // build) is discovered from index.html, falling back to the pinned default.
-    let code_version = login_code_version(config, bump_version);
+    // version differs from the resource version and is pinned, overridable via
+    // config.client_version — which is also how a discovered floor is applied.
+    // The package (Unity build) is discovered from index.html, falling back to
+    // the pinned default.
+    let code_version = config
+        .client_version
+        .clone()
+        .unwrap_or_else(|| CN_CODE_VERSION.to_string());
     let package_version = discover_package_version(&http, &config.server, cache_dir)
         .await
         .unwrap_or_else(|_| CN_PACKAGE_VERSION.to_string());
@@ -800,16 +965,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bumped_version_overrides_pin_and_config() {
-        let mut config = WatchServiceConfig::default();
-        assert_eq!(login_code_version(&config, false), CN_CODE_VERSION);
-        assert_eq!(login_code_version(&config, true), CN_FALLBACK_VERSION);
+    fn version_round_trips_and_carries_patch_overflow() {
+        assert_eq!(parse_version("0.16.257"), Some(16257));
+        assert_eq!(format_version(16257), "0.16.257");
+        assert_eq!(format_version(16999 + 3), "0.17.2");
+        assert_eq!(parse_version("0.16.257.w"), None);
+        assert_eq!(parse_version("1.0.0"), None);
+        assert_eq!(parse_version("WebGL_2022-0.16.257"), None);
+    }
 
-        config.client_version = Some("0.16.100".to_string());
-        assert_eq!(login_code_version(&config, false), "0.16.100");
-        // The configured value is what the server just rejected, so the bump
-        // must win over it too.
-        assert_eq!(login_code_version(&config, true), CN_FALLBACK_VERSION);
+    #[tokio::test]
+    async fn finds_the_exact_version_floor() {
+        // The observed live behaviour: 0.16.254 accepted, 0.16.253 rejected.
+        for floor in [16254u32, 16255, 17000, 16240 + 1] {
+            let probed = std::cell::Cell::new(0u32);
+            let found = search_version_floor(16240, |value| {
+                probed.set(probed.get() + 1);
+                async move { Ok(value >= floor) }
+            })
+            .await
+            .unwrap();
+            assert_eq!(found, floor, "floor {floor}");
+            // 6 escalation probes plus a binary search over the last bracket.
+            // A floor a few patches away — the normal case — costs about 6.
+            assert!(
+                probed.get() <= 18,
+                "floor {floor} took {} probes",
+                probed.get()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn version_search_gives_up_rather_than_climbing_forever() {
+        let result = search_version_floor(16240, |_| async { Ok(false) }).await;
+        assert!(result.is_err());
     }
 
     #[test]
