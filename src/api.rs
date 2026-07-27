@@ -407,7 +407,13 @@ async fn ingest_one(
     played_at: Option<DateTime<Utc>>,
     body: &[u8],
 ) -> Result<IngestResponse, ApiError> {
-    if body.is_empty() || body.len() > state.config.max_record_bytes {
+    // Reported separately from the size limit: a batch that stores nothing now
+    // answers 422, so this error string becomes the operator's whole diagnosis,
+    // and calling an empty record oversized points them at the wrong knob.
+    if body.is_empty() {
+        return Err(ApiError::BadRequest("record is empty".into()));
+    }
+    if body.len() > state.config.max_record_bytes {
         return Err(ApiError::PayloadTooLarge(state.config.max_record_bytes));
     }
     let metadata =
@@ -451,7 +457,10 @@ async fn ingest_one(
                     source: source.to_owned(),
                     sha256: sha256.clone(),
                     received_at: Utc::now(),
-                    played_at,
+                    // A batch carries one header for tens of thousands of games, so the record's
+                    // own majsoul.start_time is the only usable played_at; the header stays an
+                    // override.
+                    played_at: played_at.or(metadata.played_at),
                     players: metadata.players,
                     rule: metadata.rule,
                     event_count: metadata.event_count,
@@ -542,7 +551,18 @@ async fn ingest_batch(
     })
     .await
     .map_err(|error| ApiError::Internal(error.to_string()))?;
-    result.map(|response| (StatusCode::ACCEPTED, Json(response)))
+    result.map(|response| {
+        // A batch that landed nothing is not an accepted batch. Answering 202 to it is how a
+        // systematically broken import — wrong format, every record over the limit — runs for
+        // hours while every response says the collector is fine.
+        let status = if response.accepted == 0 && response.duplicates == 0 && response.rejected > 0
+        {
+            StatusCode::UNPROCESSABLE_ENTITY
+        } else {
+            StatusCode::ACCEPTED
+        };
+        (status, Json(response))
+    })
 }
 
 async fn process_batch_archive(
@@ -561,7 +581,7 @@ async fn process_batch_archive(
         file.rewind()
             .map_err(|error| ApiError::Internal(error.to_string()))?;
         let reader: Box<dyn Read> = if magic == [0x1f, 0x8b] {
-            Box::new(flate2::read::GzDecoder::new(file))
+            Box::new(flate2::read::MultiGzDecoder::new(file))
         } else {
             Box::new(file)
         };
@@ -593,6 +613,8 @@ async fn process_batch_archive(
                 .to_string_lossy()
                 .into_owned();
             let size = entry.size() as usize;
+            // Stored size, which for a gzip member is the compressed one, so this only bounds the
+            // read; the record limit is enforced against the decompressed payload below.
             if size == 0 || size > state.config.max_record_bytes {
                 response.rejected += 1;
                 push_batch_error(
@@ -607,10 +629,29 @@ async fn process_batch_archive(
                 push_batch_error(&mut response.errors, format!("{member_path}: {error}"));
                 continue;
             }
+            // Detected by content, not by name: the collector's files are all named `.mjson` but
+            // are gzip on disk, and decompressing 3.2GB into ~34GB to build an archive is wasted
+            // work.
+            if raw.starts_with(&[0x1f, 0x8b]) {
+                match inflate_member(&raw, state.config.max_record_bytes) {
+                    Ok(inflated) => raw = inflated,
+                    Err(error) => {
+                        response.rejected += 1;
+                        push_batch_error(&mut response.errors, format!("{member_path}: {error}"));
+                        continue;
+                    }
+                }
+            }
             let item_key = format!("{batch_key}/{member_path}");
             match ingest_one(state, &item_key, source, played_at, &raw).await {
                 Ok(result) if result.duplicate => response.duplicates += 1,
                 Ok(_) => response.accepted += 1,
+                // Storage failing is this server losing a record the caller handed over, not the
+                // member being bad. Counting it as a rejection would bury a full disk in the
+                // error list of a 202 and let a losing import look healthy.
+                Err(ApiError::Internal(error)) => {
+                    return Err(ApiError::Internal(format!("{member_path}: {error}")));
+                }
                 Err(error) => {
                     response.rejected += 1;
                     push_batch_error(&mut response.errors, format!("{member_path}: {error}"));
@@ -622,6 +663,25 @@ async fn process_batch_archive(
     .await;
     let _ = std::fs::remove_file(path);
     result
+}
+
+/// MultiGzDecoder, not GzDecoder: concatenated gzip streams are one valid file (that is what
+/// `gzip -c a b` and every block-gzip writer produce) and GzDecoder stops after the first one,
+/// which would store a truncated record and index it as complete.
+///
+/// The reader stops one byte past the limit, which is what keeps a small member from inflating
+/// without bound — deflate reaches 1032:1, so an entry just under the limit could otherwise
+/// expand to hundreds of megabytes before anything looked at its size.
+fn inflate_member(raw: &[u8], limit: usize) -> Result<Vec<u8>, String> {
+    let mut inflated = Vec::new();
+    flate2::read::MultiGzDecoder::new(raw)
+        .take(limit as u64 + 1)
+        .read_to_end(&mut inflated)
+        .map_err(|error| error.to_string())?;
+    if inflated.len() > limit {
+        return Err(format!("decompresses past the {limit} byte record limit"));
+    }
+    Ok(inflated)
 }
 
 fn push_batch_error(errors: &mut Vec<String>, error: String) {

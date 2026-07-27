@@ -56,8 +56,11 @@ ClickHouse 的 `pack_offset` 指向 Zstandard frame 起点，而不是 entry hea
 
 - 单条：`POST /api/v1/records`，body 为原始 JSON array 或 NDJSON。
 - 每次必须带 `Idempotency-Key` 和 `X-Mjai-Source`；可带 RFC 3339 格式的 `X-Mjai-Played-At`。
-- 默认单条上限 16KiB，略高于业务声明的 10KB，防止边界误差。
+- `played_at` 默认取 payload 里 `start_game` 事件上的 `majsoul.start_time`（unix 秒），`X-Mjai-Played-At` 是显式覆盖。批次内每条记录各有自己的对局时间，不能整批共用一个时间戳。
+- 默认单条上限 256KiB，针对解压后的字节数。“单条约 10KB”说的是磁盘上的 gzip 文件；实测 300 条真实 4p 王座记录解压后 min 11,352 / p50 53,668 / p95 80,374 / max 106,157 字节，旧的 16KiB 上限会拒绝其中每一条。老部署的 `.env` 里如果仍写死 16384，升级镜像不会改动它，因此启动时会针对低于 128KiB 的上限打一条警告。
 - 生产批量入口使用 tar/tar.zst，每个 member 是一个 `.mjson`；建议单批 10,000–50,000 条或 64–512MB。
+- tar member 允许本身是 gzip 的（按内容 magic `1f 8b` 判断，不看文件名）；解压读取以单条上限为界，超过上限的 member 直接拒绝，不会无界分配。采集器磁盘布局因此可以原样打包上传，不必先把 3.2GB 展开成约 34GB。归档本身和 member 都按多流 gzip 解压：拼接出来的 gzip 是合法文件，只读第一段会静默丢掉后面的内容。
+- 批次响应区分三种结局：有记录落库就是 `202`（坏 member 记在 `errors` 里）；一条都没落库且存在被拒 member 时是 `422`，避免整批格式不对的导入连着几小时都返回成功；写 pack 失败是服务端丢数据而不是 member 有问题，整批以 `5xx` 结束。
 - API 只在 Kafka 已确认写入后返回 `202`。消费者上传不可变 pack、批量写 ClickHouse，最后提交 Kafka offset。
 
 幂等 ID 应由 `source + Idempotency-Key` 确定，或由服务端生成 UUIDv5。内容 SHA-256 不同却复用同一幂等键时返回 `409`。PostgreSQL 的幂等表只保留业务允许重试的时间窗口（例如 7–30 天），不要永久保存数亿行。

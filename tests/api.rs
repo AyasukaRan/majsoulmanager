@@ -6,7 +6,7 @@ use axum::{
     routing::post,
 };
 use chrono::{SubsecRound, TimeDelta, Utc};
-use flate2::read::GzDecoder;
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use mjai_management::auth::{
     AuthError, AuthSettings, LoginRequest, RegisterRequest, UserRole, VerifyEmailRequest,
 };
@@ -15,7 +15,7 @@ use mjai_management::pack::PackStore;
 use mjai_management::watch::{WatchEvent, WatchEventKind};
 use mjai_management::{AppState, api, config::Config, recovery};
 use serde_json::Value;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -29,7 +29,8 @@ fn test_config(data_dir: &std::path::Path, email_api_url: Option<String>) -> Con
         listen: "127.0.0.1:0".into(),
         api_key: "test-secret".into(),
         data_dir: data_dir.to_path_buf(),
-        max_record_bytes: 16 * 1024,
+        // The fixtures are real records; 16 KiB would reject every one of them.
+        max_record_bytes: 256 * 1024,
         max_batch_bytes: 1024 * 1024,
         max_batch_records: 100,
         pack_target_bytes: 1024 * 1024,
@@ -105,6 +106,42 @@ fn ingest_request(source: &str, key: &str, body: &'static str) -> Request<Body> 
         .header("x-mjai-source", source)
         .body(Body::from(body))
         .unwrap()
+}
+
+fn tar_of(members: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    let mut archive = tar::Builder::new(Vec::new());
+    for (name, raw) in members {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(raw.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, name, raw.as_slice())
+            .unwrap();
+    }
+    archive.into_inner().unwrap()
+}
+
+fn gzip(raw: &[u8]) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(raw).unwrap();
+    encoder.finish().unwrap()
+}
+
+fn batch_request(source: &str, key: &str, body: Vec<u8>) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/api/v1/records/batch")
+        .header(header::AUTHORIZATION, "Bearer test-secret")
+        .header(header::CONTENT_TYPE, "application/x-tar")
+        .header("idempotency-key", key)
+        .header("x-mjai-source", source)
+        .body(Body::from(body))
+        .unwrap()
+}
+
+async fn json_body(response: axum::response::Response) -> Value {
+    serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
 }
 
 #[tokio::test]
@@ -319,47 +356,253 @@ async fn ingests_a_tar_batch_as_independent_records() {
     let (state, data_dir) = test_state().await;
     let source = test_source(&data_dir);
     let app = api::router(state);
-    let records = [
+    let body = tar_of(&two_records());
+
+    let response = app
+        .oneshot(batch_request(&source, "batch-1", body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let json = json_body(response).await;
+    assert_eq!(json["accepted"], 2);
+    assert_eq!(json["rejected"], 0);
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+fn two_records() -> [(&'static str, Vec<u8>); 2] {
+    [
         (
             "one.mjson",
-            r#"{"type":"start_game","names":["a","b","c","d"]}"#,
+            br#"{"type":"start_game","names":["a","b","c","d"]}"#.to_vec(),
         ),
         (
             "two.mjson",
-            r#"{"type":"start_game","names":["e","f","g","h"]}"#,
+            br#"{"type":"start_game","names":["e","f","g","h"]}"#.to_vec(),
         ),
+    ]
+}
+
+/// Two real majsoul2mjai records, gzip exactly as the collector left them on disk (48,590 and
+/// 25,575 bytes decompressed, both over the old 16 KiB record limit), plus a member that inflates
+/// past the limit so a partially bad batch still answers 202.
+#[tokio::test]
+async fn ingests_gzip_tar_members_with_their_own_played_at() {
+    let (state, data_dir) = test_state().await;
+    let source = test_source(&data_dir);
+    let app = api::router(state);
+    let throne_4p =
+        include_bytes!("fixtures/260716-00000000-0000-4000-8000-000000000004.mjson").to_vec();
+    let members = [
+        (
+            "260716-00000000-0000-4000-8000-000000000004.mjson",
+            throne_4p.clone(),
+        ),
+        (
+            "260716-00000000-0000-4000-8000-000000000003.mjson",
+            include_bytes!("fixtures/260716-00000000-0000-4000-8000-000000000003.mjson").to_vec(),
+        ),
+        ("oversize.mjson", gzip(&vec![b'{'; 1024 * 1024])),
     ];
-    let mut archive = tar::Builder::new(Vec::new());
-    for (name, raw) in records {
-        let mut header = tar::Header::new_gnu();
-        header.set_size(raw.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        archive
-            .append_data(&mut header, name, raw.as_bytes())
-            .unwrap();
-    }
-    let body = archive.into_inner().unwrap();
 
     let response = app
+        .clone()
+        .oneshot(batch_request(&source, "batch-real", tar_of(&members)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let json = json_body(response).await;
+    assert_eq!(json["accepted"], 2);
+    assert_eq!(json["rejected"], 1);
+    assert!(json["errors"][0].as_str().unwrap().starts_with("oversize"));
+
+    // A batch-wide played_at would return both records or neither; only the 4p throne game
+    // started inside this window (majsoul.start_time 1784207242 = 2026-07-16T13:07:22Z).
+    let response = app
+        .clone()
         .oneshot(
             Request::builder()
-                .method("POST")
-                .uri("/api/v1/records/batch")
+                .uri("/api/v1/records?played_from=2026-07-16T13:00:00Z&played_to=2026-07-16T14:00:00Z")
                 .header(header::AUTHORIZATION, "Bearer test-secret")
-                .header(header::CONTENT_TYPE, "application/x-tar")
-                .header("idempotency-key", "batch-1")
-                .header("x-mjai-source", source.as_str())
-                .body(Body::from(body))
+                .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = json_body(response).await;
+    assert_eq!(page["items"].as_array().unwrap().len(), 1);
+    assert_eq!(page["items"][0]["played_at"], "2026-07-16T13:07:22Z");
+    assert_eq!(page["items"][0]["players"].as_array().unwrap().len(), 4);
+    let id = page["items"][0]["id"].as_str().unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/records/{id}/raw"))
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut expected = Vec::new();
+    GzDecoder::new(throne_4p.as_slice())
+        .read_to_end(&mut expected)
+        .unwrap();
+    // The point of the fixture: a real record is far past the old 16 KiB limit,
+    // so this round trip could not have happened before it was raised.
+    assert!(expected.len() > 16 * 1024, "{} bytes", expected.len());
+    assert_eq!(
+        to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        expected
+    );
+
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+/// The decompression bound is the only thing that can reject this member: the gzip trailer is cut
+/// off, so a reader that does not stop at the limit runs into the mutilated stream and reports a
+/// gzip error instead. A batch that landed nothing must also not answer 2xx.
+#[tokio::test]
+async fn stops_reading_a_member_that_inflates_past_the_record_limit() {
+    let (state, data_dir) = test_state().await;
+    let source = test_source(&data_dir);
+    let app = api::router(state);
+    let mut bomb = gzip(&vec![b'{'; 1024 * 1024]);
+    bomb.truncate(bomb.len() - 8);
+
+    let response = app
+        .oneshot(batch_request(
+            &source,
+            "batch-bomb",
+            tar_of(&[("bomb.mjson", bomb)]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let json = json_body(response).await;
+    assert_eq!(json["accepted"], 0);
+    assert_eq!(json["rejected"], 1);
+    assert_eq!(
+        json["errors"][0],
+        "bomb.mjson: decompresses past the 262144 byte record limit"
+    );
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+/// A wholesale batch failure answers 422, so its error list is the only diagnosis the operator
+/// gets. Reporting an empty record as an oversized one sends them to the wrong knob.
+#[tokio::test]
+async fn names_an_empty_member_as_empty_rather_than_oversized() {
+    let (state, data_dir) = test_state().await;
+    let source = test_source(&data_dir);
+    let app = api::router(state);
+
+    let response = app
+        .oneshot(batch_request(
+            &source,
+            "batch-empty",
+            tar_of(&[("empty.mjson", gzip(b""))]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let json = json_body(response).await;
+    assert_eq!(json["rejected"], 1);
+    assert_eq!(json["errors"][0], "empty.mjson: record is empty");
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+/// `gzip -c a b > c`, and every block-gzip writer, produce a file of concatenated gzip streams.
+/// Decoding only the first stores a truncated record and indexes it as complete.
+#[tokio::test]
+async fn reads_every_gzip_stream_of_a_member() {
+    let (state, data_dir) = test_state().await;
+    let source = test_source(&data_dir);
+    let app = api::router(state);
+    let record = br#"{"type":"start_game","names":["a","b","c","d"]}
+{"type":"end_game"}"#;
+    let (head, tail) = record.split_at(record.len() / 2);
+    let member = [gzip(head), gzip(tail)].concat();
+
+    let response = app
+        .clone()
+        .oneshot(batch_request(
+            &source,
+            "batch-split-member",
+            tar_of(&[("split.mjson", member)]),
+        ))
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
-    let json: Value =
-        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(json["accepted"], 2);
-    assert_eq!(json["rejected"], 0);
+    let json = json_body(response).await;
+    assert_eq!(json["accepted"], 1, "{json}");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/records")
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Both events survived, so the second stream was not dropped.
+    assert_eq!(json_body(response).await["items"][0]["event_count"], 2);
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+/// The archive itself has the same shape of failure, with thousands of records behind it instead
+/// of one.
+#[tokio::test]
+async fn reads_every_gzip_stream_of_the_archive() {
+    let (state, data_dir) = test_state().await;
+    let source = test_source(&data_dir);
+    let app = api::router(state);
+    let archive = tar_of(&two_records());
+    let (head, tail) = archive.split_at(archive.len() / 2);
+
+    let response = app
+        .oneshot(batch_request(
+            &source,
+            "batch-split-archive",
+            [gzip(head), gzip(tail)].concat(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(json_body(response).await["accepted"], 2);
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+/// Failing to write the pack is this server losing records, not the caller sending bad ones, so
+/// the batch must fail loudly instead of listing the loss as rejected members inside a 202.
+#[tokio::test]
+async fn fails_the_batch_when_records_cannot_be_stored() {
+    let (state, data_dir) = test_state().await;
+    let source = test_source(&data_dir);
+    let app = api::router(state);
+    // No pack directory, so appending cannot open a pack file: an I/O failure without needing a
+    // full disk.
+    std::fs::remove_dir_all(data_dir.join("packs")).unwrap();
+
+    let response = app
+        .oneshot(batch_request(
+            &source,
+            "batch-broken-disk",
+            tar_of(&two_records()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        json_body(response).await["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("one.mjson:")
+    );
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 

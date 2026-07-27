@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -6,6 +7,8 @@ pub struct Metadata {
     pub players: Vec<String>,
     pub rule: Option<String>,
     pub event_count: u32,
+    /// From `majsoul.start_time`; absent for mjai logs that carry no majsoul header.
+    pub played_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -64,10 +67,21 @@ pub fn parse_metadata(payload: &[u8]) -> Result<Metadata, ParseError> {
         other => other.to_string(),
     });
 
+    // majsoul2mjai merges the source game's unix start_time into the start_game event itself,
+    // next to the names this function already reads; both fixtures under tests/fixtures have that
+    // shape. Read off that event rather than scanned over all of them, so the cost does not grow
+    // with the record and no other event can shadow the header.
+    let played_at = start
+        .get("majsoul")
+        .and_then(|majsoul| majsoul.get("start_time"))
+        .and_then(Value::as_i64)
+        .and_then(|seconds| DateTime::from_timestamp(seconds, 0));
+
     Ok(Metadata {
         players,
         rule,
         event_count: events.len().try_into().unwrap_or(u32::MAX),
+        played_at,
     })
 }
 
@@ -83,6 +97,30 @@ mod tests {
         assert_eq!(metadata.players, ["a", "b", "c", "d"]);
         assert_eq!(metadata.rule.as_deref(), Some("tonpu"));
         assert_eq!(metadata.event_count, 2);
+        assert_eq!(metadata.played_at, None);
+    }
+
+    #[test]
+    fn reads_played_at_from_the_majsoul_header() {
+        let raw = br#"{"majsoul":{"room":"throne","start_time":1784207242,"uuid":"260716-00000000"},"names":["a","b","c","d"],"type":"start_game"}
+{"type":"start_kyoku","bakaze":"E","kyoku":1}"#;
+        let metadata = parse_metadata(raw).unwrap();
+        assert_eq!(
+            metadata.played_at,
+            Some("2026-07-16T13:07:22Z".parse::<DateTime<Utc>>().unwrap())
+        );
+    }
+
+    #[test]
+    fn reads_played_at_off_the_start_game_event_wherever_it_sits() {
+        let raw = br#"{"type":"none"}
+{"majsoul":{"start_time":1784207242},"names":["a","b","c","d"],"type":"start_game"}"#;
+        let metadata = parse_metadata(raw).unwrap();
+        assert_eq!(
+            metadata.played_at,
+            Some("2026-07-16T13:07:22Z".parse::<DateTime<Utc>>().unwrap())
+        );
+        assert_eq!(metadata.players, ["a", "b", "c", "d"]);
     }
 
     #[test]

@@ -15,6 +15,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::parse();
+    if let Some(warning) = config.record_limit_warning() {
+        tracing::warn!("{warning}");
+    }
     let listen = config.listen.clone();
     let state = AppState::local(config).await?;
     state.watch_service.start_if_enabled().await?;
