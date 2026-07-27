@@ -153,8 +153,9 @@ pub async fn claim(
 /// upgrade path is an idempotent producer, which rskafka has no support for, or
 /// a periodic dedup pass over sha256.
 ///
-/// The batch is bounded by the caller so that one call is one produce request
-/// per partition: that keeps the window of that ambiguity to a single request.
+/// The caller bounds the batch, and `produce_batch` splits whatever it is given
+/// by its own wire bound, so the window of that ambiguity is one call rather
+/// than a whole import.
 pub async fn produce_claimed(
     catalog: &Catalog,
     kafka: &Kafka,
@@ -185,6 +186,32 @@ pub async fn produce_claimed(
                 }
             }
             Err(IngestError::Produce(error))
+        }
+    }
+}
+
+/// Releases claims for records that will never be produced.
+///
+/// Every way out of a batch import other than reaching the end has to run this,
+/// because the claim outlives the request that made it. A member left claimed
+/// but never produced is the invisible loss `produce_claimed` abandons a failed
+/// produce to avoid, only worse: the operator retries the same archive, the
+/// same scoped key hashes to the same row with the same content sha256, the
+/// member is reported as a duplicate inside a `202`, and the record sits in
+/// neither the topic nor the index until the claim is pruned thirty days later.
+/// Nothing reconciles the idempotency table against the topic, so there is no
+/// second chance to catch it.
+///
+/// A duplicate carries no message and its claim belongs to whichever request
+/// produced the record first; releasing that one would let a later retry
+/// re-produce a record that is already in the topic.
+pub async fn abandon_claimed(catalog: &Catalog, claimed: Vec<Claimed>) {
+    for record in claimed {
+        if record.message.is_none() {
+            continue;
+        }
+        if let Err(error) = catalog.abandon_claim(&record.key, record.id).await {
+            tracing::warn!(%error, record = %record.id, "could not release the idempotency claim");
         }
     }
 }

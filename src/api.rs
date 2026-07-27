@@ -573,99 +573,117 @@ async fn process_batch_archive(
         };
         let mut pending: Vec<Claimed> = Vec::new();
         let mut pending_bytes = 0usize;
-        for (index, entry) in entries.enumerate() {
-            if index >= state.config.max_batch_records {
-                return Err(ApiError::BadRequest(format!(
-                    "batch exceeds {} records",
-                    state.config.max_batch_records
-                )));
-            }
-            let mut entry = entry
-                .map_err(|error| ApiError::BadRequest(format!("invalid tar entry: {error}")))?;
-            if !entry.header().entry_type().is_file() {
-                continue;
-            }
-            let member_path = entry
-                .path()
-                .map_err(|error| ApiError::BadRequest(error.to_string()))?
-                .to_string_lossy()
-                .into_owned();
-            let size = entry.size() as usize;
-            // Stored size, which for a gzip member is the compressed one, so this only bounds the
-            // read; the record limit is enforced against the decompressed payload below.
-            if size == 0 || size > state.config.max_record_bytes {
-                response.rejected += 1;
-                push_batch_error(
-                    &mut response.errors,
-                    format!("{member_path}: invalid size {size}"),
-                );
-                continue;
-            }
-            let mut raw = Vec::with_capacity(size);
-            if let Err(error) = entry.read_to_end(&mut raw) {
-                response.rejected += 1;
-                push_batch_error(&mut response.errors, format!("{member_path}: {error}"));
-                continue;
-            }
-            // Detected by content, not by name: the collector's files are all named `.mjson` but
-            // are gzip on disk, and decompressing 3.2GB into ~34GB to build an archive is wasted
-            // work.
-            if raw.starts_with(&[0x1f, 0x8b]) {
-                match inflate_member(&raw, state.config.max_record_bytes) {
-                    Ok(inflated) => raw = inflated,
+        // Wrapped so that every exit from the walk — the record ceiling, a corrupt tar entry, an
+        // unreadable member path, a record this server could not keep, a failed flush — passes
+        // through one release of the claims still in hand. Returning straight out of the loop
+        // drops them, and a dropped claim is the one failure an import can neither report nor
+        // retry past: the record reached no topic and no index, and the retry that would resend it
+        // is told it is a duplicate.
+        let walked = async {
+            for (index, entry) in entries.enumerate() {
+                if index >= state.config.max_batch_records {
+                    return Err(ApiError::BadRequest(format!(
+                        "batch exceeds {} records",
+                        state.config.max_batch_records
+                    )));
+                }
+                let mut entry = entry
+                    .map_err(|error| ApiError::BadRequest(format!("invalid tar entry: {error}")))?;
+                if !entry.header().entry_type().is_file() {
+                    continue;
+                }
+                let member_path = entry
+                    .path()
+                    .map_err(|error| ApiError::BadRequest(error.to_string()))?
+                    .to_string_lossy()
+                    .into_owned();
+                let size = entry.size() as usize;
+                // Stored size, which for a gzip member is the compressed one, so this only bounds the
+                // read; the record limit is enforced against the decompressed payload below.
+                if size == 0 || size > state.config.max_record_bytes {
+                    response.rejected += 1;
+                    push_batch_error(
+                        &mut response.errors,
+                        format!("{member_path}: invalid size {size}"),
+                    );
+                    continue;
+                }
+                let mut raw = Vec::with_capacity(size);
+                if let Err(error) = entry.read_to_end(&mut raw) {
+                    response.rejected += 1;
+                    push_batch_error(&mut response.errors, format!("{member_path}: {error}"));
+                    continue;
+                }
+                // Detected by content, not by name: the collector's files are all named `.mjson` but
+                // are gzip on disk, and decompressing 3.2GB into ~34GB to build an archive is wasted
+                // work.
+                if raw.starts_with(&[0x1f, 0x8b]) {
+                    match inflate_member(&raw, state.config.max_record_bytes) {
+                        Ok(inflated) => raw = inflated,
+                        Err(error) => {
+                            response.rejected += 1;
+                            push_batch_error(
+                                &mut response.errors,
+                                format!("{member_path}: {error}"),
+                            );
+                            continue;
+                        }
+                    }
+                }
+                let item_key = format!("{batch_key}/{member_path}");
+                let member = match check_record_size(state, &raw) {
+                    Ok(()) => indexer::claim(
+                        &state.catalog,
+                        &state.kafka,
+                        source,
+                        &item_key,
+                        played_at,
+                        &raw,
+                    )
+                    .await
+                    .map_err(ApiError::from),
+                    Err(error) => Err(error),
+                };
+                let claimed = match member {
+                    Ok(claimed) => claimed,
+                    // Losing a record the caller handed over is not the member being bad. Counting it
+                    // as a rejection would bury a full disk — or a broker that will not take the
+                    // record — in the error list of a 202 and let a losing import look healthy.
+                    Err(ApiError::Internal(error)) => {
+                        return Err(ApiError::Internal(format!("{member_path}: {error}")));
+                    }
                     Err(error) => {
                         response.rejected += 1;
                         push_batch_error(&mut response.errors, format!("{member_path}: {error}"));
                         continue;
                     }
-                }
-            }
-            let item_key = format!("{batch_key}/{member_path}");
-            let member = match check_record_size(state, &raw) {
-                Ok(()) => indexer::claim(
-                    &state.catalog,
-                    &state.kafka,
-                    source,
-                    &item_key,
-                    played_at,
-                    &raw,
-                )
-                .await
-                .map_err(ApiError::from),
-                Err(error) => Err(error),
-            };
-            let claimed = match member {
-                Ok(claimed) => claimed,
-                // Losing a record the caller handed over is not the member being bad. Counting it
-                // as a rejection would bury a full disk — or a broker that will not take the
-                // record — in the error list of a 202 and let a losing import look healthy.
-                Err(ApiError::Internal(error)) => {
-                    return Err(ApiError::Internal(format!("{member_path}: {error}")));
-                }
-                Err(error) => {
-                    response.rejected += 1;
-                    push_batch_error(&mut response.errors, format!("{member_path}: {error}"));
+                };
+                if claimed.is_duplicate() {
+                    response.duplicates += 1;
                     continue;
                 }
-            };
-            if claimed.is_duplicate() {
-                response.duplicates += 1;
-                continue;
+                response.accepted += 1;
+                // Produced in size-bounded chunks rather than one request at the end: a 50,000 member
+                // import is gigabytes, and holding all of it to produce at once would trade the pack
+                // worker's memory bound for the API's. The record joins the chunk before the bound is
+                // tested rather than after, because a record still in hand while a flush is in flight
+                // holds a claim that nothing owns, and a failed flush would drop it un-released.
+                // Overshooting the bound by one record costs nothing: `Kafka::produce_batch` re-chunks
+                // by its own, so this accumulator only decides how much is resident at once, never
+                // what fits in a produce request.
+                pending_bytes += claimed.raw_len();
+                pending.push(claimed);
+                if pending_bytes >= MAX_PRODUCE_BATCH_BYTES {
+                    produce_batch_chunk(state, &mut pending, &mut pending_bytes).await?;
+                }
             }
-            response.accepted += 1;
-            // Produced in size-bounded chunks rather than one request at the end: a 50,000 member
-            // import is gigabytes, and holding all of it to produce at once would trade the pack
-            // worker's memory bound for the API's. Flushed before the record that would cross the
-            // bound rather than after it, which is the rule the producer chunks by, so one flush is
-            // exactly one produce request and a failed flush leaves the smallest possible set of
-            // claims to release.
-            if pending_bytes + claimed.raw_len() > MAX_PRODUCE_BATCH_BYTES {
-                produce_batch_chunk(state, &mut pending, &mut pending_bytes).await?;
-            }
-            pending_bytes += claimed.raw_len();
-            pending.push(claimed);
+            produce_batch_chunk(state, &mut pending, &mut pending_bytes).await
         }
-        produce_batch_chunk(state, &mut pending, &mut pending_bytes).await?;
+        .await;
+        if let Err(error) = walked {
+            indexer::abandon_claimed(&state.catalog, std::mem::take(&mut pending)).await;
+            return Err(error);
+        }
         Ok(response)
     }
     .await;
@@ -849,6 +867,12 @@ async fn write_export(
         for record in &page {
             writer.append(record, state).await?;
             written += 1;
+        }
+        // Per page rather than per record, and reported rather than propagated:
+        // a progress number the console could not read is not worth failing an
+        // export that is otherwise writing correctly.
+        if let Err(error) = state.catalog.record_job_progress(id, written).await {
+            tracing::warn!(job = %id, %error, "could not publish export progress");
         }
         match next {
             Some(next) => cursor = Some(next),

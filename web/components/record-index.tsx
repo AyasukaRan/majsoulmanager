@@ -9,7 +9,7 @@ import {
   type MjaiRecord,
   type RecordPage,
 } from "@/lib/mjai-api";
-import { formatDateTime } from "@/lib/utils";
+import { dayEnd, dayStart, formatDateTime } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -47,17 +47,15 @@ const EMPTY_FILTERS: Filters = {
 
 /**
  * A bare `<input type="date">` value is a calendar day, but the backend filters
- * on an instant, so the end of the range has to cover the whole day or the day
- * the operator picked would be excluded.
+ * on an instant. `dayStart`/`dayEnd` turn it into the operator's own day rather
+ * than UTC's, which is the day the table is already rendering timestamps in.
  */
 function searchUrl(filters: Filters, cursor: string | null) {
   return buildRecordSearch({
     source: filters.source.trim(),
     player: filters.player.trim(),
-    received_from: filters.received_from
-      ? `${filters.received_from}T00:00:00Z`
-      : "",
-    received_to: filters.received_to ? `${filters.received_to}T23:59:59Z` : "",
+    received_from: dayStart(filters.received_from),
+    received_to: dayEnd(filters.received_to),
     limit: PAGE_SIZE,
     cursor: cursor ?? "",
   });

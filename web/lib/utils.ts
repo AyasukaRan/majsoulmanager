@@ -23,6 +23,31 @@ export function formatDateTime(value: string | null) {
   return value ? dateTimeFormatter.format(new Date(value)) : "—"
 }
 
+/**
+ * The instants an `<input type="date">` day means to the operator reading the
+ * table, which is the operator's own day and not UTC's. Timestamps render in
+ * the browser's timezone, so pinning a day to `Z` shifts the whole window by
+ * that offset: in UTC+8, picking 2026-07-27 would select 08:00 that morning
+ * through 07:59 the next, silently dropping eight hours of rows the table had
+ * just shown under that date and pulling in eight it had not — and the export
+ * page stores the same bounds as a job's filter snapshot, so the archive
+ * inherits the shift.
+ *
+ * The end is the next local midnight, not 23:59:59, because the backend
+ * compares `received_at < to`; a second-precision end also excluded everything
+ * in the final second of the day.
+ */
+export function dayStart(day: string) {
+  return day ? new Date(`${day}T00:00:00`).toISOString() : ""
+}
+
+export function dayEnd(day: string) {
+  if (!day) return ""
+  const end = new Date(`${day}T00:00:00`)
+  end.setDate(end.getDate() + 1)
+  return end.toISOString()
+}
+
 const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB", "PB"]
 
 export function formatBytes(bytes: number) {

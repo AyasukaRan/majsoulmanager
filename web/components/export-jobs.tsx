@@ -10,7 +10,7 @@ import {
   type DownloadJobPage,
   type JobState,
 } from "@/lib/mjai-api";
-import { formatDateTime, selectClass } from "@/lib/utils";
+import { dayEnd, dayStart, formatDateTime, selectClass } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -108,12 +108,8 @@ export function ExportJobs() {
       const filter = Object.fromEntries(
         Object.entries({
           source: draft.source.trim(),
-          received_from: draft.received_from
-            ? `${draft.received_from}T00:00:00Z`
-            : "",
-          received_to: draft.received_to
-            ? `${draft.received_to}T23:59:59Z`
-            : "",
+          received_from: dayStart(draft.received_from),
+          received_to: dayEnd(draft.received_to),
         }).filter(([, value]) => value !== ""),
       );
       const job = await jsonRequest<DownloadJob>("/api/downloads", {

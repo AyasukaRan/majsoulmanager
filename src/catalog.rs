@@ -587,6 +587,22 @@ impl Catalog {
         Ok(())
     }
 
+    /// Publishes how far a running export has got. Without it `record_count`
+    /// stays at its default until the job finishes, so the console shows a job
+    /// that has been writing for hours as `导出中 / 0` — indistinguishable from
+    /// one that is wedged. One statement per page of a thousand records is
+    /// cheap enough that the alternative is only worth it if exports ever get
+    /// small enough for the count not to matter, at which point nobody is
+    /// watching the number anyway.
+    pub async fn record_job_progress(&self, id: Uuid, written: usize) -> Result<(), CatalogError> {
+        sqlx::query("UPDATE download_jobs SET record_count = $2 WHERE id = $1")
+            .bind(id)
+            .bind(written as i64)
+            .execute(&self.postgres)
+            .await?;
+        Ok(())
+    }
+
     pub async fn finish_job(
         &self,
         id: Uuid,

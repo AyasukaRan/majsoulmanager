@@ -199,10 +199,19 @@ impl Objects {
             return Ok(None);
         }
         let response = Self::success(response).await?;
-        // A HEAD carries no body, so Content-Length is the object size; a
-        // proxy that stripped it would otherwise read as "size zero".
+        // Read out of the header rather than through `Response::content_length`,
+        // which reports the length of the decoded body and not the header:
+        // hyper hard-codes a decoded length of zero for the response to any
+        // HEAD, since a HEAD carries no body by definition. Asking reqwest for
+        // it therefore answers `Some(0)` for every object that exists, which
+        // makes each post-upload size check fail against a pack that landed
+        // perfectly — the worker then discards, retries, and never indexes a
+        // single record while leaving one orphan object per attempt.
         response
-            .content_length()
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
             .ok_or_else(|| {
                 ObjectError::Malformed(format!("HEAD {key} answered without a Content-Length"))
             })
@@ -683,5 +692,44 @@ mod tests {
             parse_list_page(&numeric_entity),
             Err(ObjectError::Malformed(_))
         ));
+    }
+
+    /// The size of a HEAD's object cannot come from `Response::content_length`:
+    /// a HEAD carries no body, so the decoded length reqwest reports is always
+    /// zero and every object would confirm as empty. That reads as a truncated
+    /// upload at both call sites, and the pack worker's response to a truncated
+    /// upload is to discard and retry forever, so the whole pipeline indexes
+    /// nothing while the bucket fills with orphans. Nothing short of a real
+    /// response over a socket catches it — a hand-built `HeaderMap` would not,
+    /// because the bug is in how the body length is derived, not in the header.
+    #[tokio::test]
+    async fn head_reads_the_size_from_the_header_a_bodyless_response_carries() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for response in [
+                "HTTP/1.1 200 OK\r\nContent-Length: 268435456\r\n\r\n",
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 1024];
+                // One read is enough to know the request arrived; a HEAD has no
+                // body, so there is nothing after the headers to drain.
+                let read = socket.read(&mut request).await.unwrap();
+                assert!(read > 0, "the client opened a connection and sent nothing");
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.flush().await.unwrap();
+            }
+        });
+
+        let objects = Objects::new(&endpoint, "mjai-raw", "us-east-1", "key", "secret").unwrap();
+        assert_eq!(
+            objects.head("packs/2026/07/27/0-a.mjpack").await.unwrap(),
+            Some(268_435_456)
+        );
+        assert_eq!(objects.head("packs/missing.mjpack").await.unwrap(), None);
+        server.await.unwrap();
     }
 }
