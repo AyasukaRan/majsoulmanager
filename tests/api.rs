@@ -69,6 +69,42 @@ fn ingest_request(key: &str, body: &'static str) -> Request<Body> {
         .unwrap()
 }
 
+fn tar_of(members: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    let mut archive = tar::Builder::new(Vec::new());
+    for (name, raw) in members {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(raw.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, name, raw.as_slice())
+            .unwrap();
+    }
+    archive.into_inner().unwrap()
+}
+
+fn gzip(raw: &[u8]) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(raw).unwrap();
+    encoder.finish().unwrap()
+}
+
+fn batch_request(key: &str, body: Vec<u8>) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/api/v1/records/batch")
+        .header(header::AUTHORIZATION, "Bearer test-secret")
+        .header(header::CONTENT_TYPE, "application/x-tar")
+        .header("idempotency-key", key)
+        .header("x-mjai-source", "test-collector")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+async fn json_body(response: axum::response::Response) -> Value {
+    serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+}
+
 #[tokio::test]
 async fn ingests_and_reads_one_record_without_reading_a_whole_pack() {
     let (state, data_dir) = test_state();
@@ -276,61 +312,38 @@ async fn requires_email_verification_before_a_registered_user_can_log_in() {
 async fn ingests_a_tar_batch_as_independent_records() {
     let (state, data_dir) = test_state();
     let app = api::router(state);
-    let records = [
-        (
-            "one.mjson",
-            r#"{"type":"start_game","names":["a","b","c","d"]}"#,
-        ),
-        (
-            "two.mjson",
-            r#"{"type":"start_game","names":["e","f","g","h"]}"#,
-        ),
-    ];
-    let mut archive = tar::Builder::new(Vec::new());
-    for (name, raw) in records {
-        let mut header = tar::Header::new_gnu();
-        header.set_size(raw.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        archive
-            .append_data(&mut header, name, raw.as_bytes())
-            .unwrap();
-    }
-    let body = archive.into_inner().unwrap();
+    let body = tar_of(&two_records());
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/v1/records/batch")
-                .header(header::AUTHORIZATION, "Bearer test-secret")
-                .header(header::CONTENT_TYPE, "application/x-tar")
-                .header("idempotency-key", "batch-1")
-                .header("x-mjai-source", "test-collector")
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let response = app.oneshot(batch_request("batch-1", body)).await.unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
-    let json: Value =
-        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let json = json_body(response).await;
     assert_eq!(json["accepted"], 2);
     assert_eq!(json["rejected"], 0);
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 
-/// Two real majsoul2mjai records, gzip exactly as the collector left them on disk (48,677 and
-/// 25,630 bytes decompressed, both over the old 16 KiB record limit), plus a member that inflates
-/// past the limit to prove decompression is bounded.
+fn two_records() -> [(&'static str, Vec<u8>); 2] {
+    [
+        (
+            "one.mjson",
+            br#"{"type":"start_game","names":["a","b","c","d"]}"#.to_vec(),
+        ),
+        (
+            "two.mjson",
+            br#"{"type":"start_game","names":["e","f","g","h"]}"#.to_vec(),
+        ),
+    ]
+}
+
+/// Two real majsoul2mjai records, gzip exactly as the collector left them on disk (48,590 and
+/// 25,575 bytes decompressed, both over the old 16 KiB record limit), plus a member that inflates
+/// past the limit so a partially bad batch still answers 202.
 #[tokio::test]
 async fn ingests_gzip_tar_members_with_their_own_played_at() {
     let (state, data_dir) = test_state();
     let app = api::router(state);
     let throne_4p =
         include_bytes!("fixtures/260716-00000000-0000-4000-8000-000000000004.mjson").to_vec();
-    let mut bomb = GzEncoder::new(Vec::new(), Compression::default());
-    bomb.write_all(&vec![b'{'; 1024 * 1024]).unwrap();
     let members = [
         (
             "260716-00000000-0000-4000-8000-000000000004.mjson",
@@ -340,37 +353,16 @@ async fn ingests_gzip_tar_members_with_their_own_played_at() {
             "260716-00000000-0000-4000-8000-000000000003.mjson",
             include_bytes!("fixtures/260716-00000000-0000-4000-8000-000000000003.mjson").to_vec(),
         ),
-        ("oversize.mjson", bomb.finish().unwrap()),
+        ("oversize.mjson", gzip(&vec![b'{'; 1024 * 1024])),
     ];
-    let mut archive = tar::Builder::new(Vec::new());
-    for (name, raw) in &members {
-        let mut header = tar::Header::new_gnu();
-        header.set_size(raw.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        archive
-            .append_data(&mut header, name, raw.as_slice())
-            .unwrap();
-    }
 
     let response = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/v1/records/batch")
-                .header(header::AUTHORIZATION, "Bearer test-secret")
-                .header(header::CONTENT_TYPE, "application/x-tar")
-                .header("idempotency-key", "batch-real")
-                .header("x-mjai-source", "historical-import")
-                .body(Body::from(archive.into_inner().unwrap()))
-                .unwrap(),
-        )
+        .oneshot(batch_request("batch-real", tar_of(&members)))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
-    let json: Value =
-        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let json = json_body(response).await;
     assert_eq!(json["accepted"], 2);
     assert_eq!(json["rejected"], 1);
     assert!(json["errors"][0].as_str().unwrap().starts_with("oversize"));
@@ -389,8 +381,7 @@ async fn ingests_gzip_tar_members_with_their_own_played_at() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let page: Value =
-        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let page = json_body(response).await;
     assert_eq!(page["items"].as_array().unwrap().len(), 1);
     assert_eq!(page["items"][0]["played_at"], "2026-07-16T13:07:22Z");
     assert_eq!(page["items"][0]["players"].as_array().unwrap().len(), 4);
@@ -419,6 +410,114 @@ async fn ingests_gzip_tar_members_with_their_own_played_at() {
         expected
     );
 
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+/// The decompression bound is the only thing that can reject this member: the gzip trailer is cut
+/// off, so a reader that does not stop at the limit runs into the mutilated stream and reports a
+/// gzip error instead. A batch that landed nothing must also not answer 2xx.
+#[tokio::test]
+async fn stops_reading_a_member_that_inflates_past_the_record_limit() {
+    let (state, data_dir) = test_state();
+    let app = api::router(state);
+    let mut bomb = gzip(&vec![b'{'; 1024 * 1024]);
+    bomb.truncate(bomb.len() - 8);
+
+    let response = app
+        .oneshot(batch_request("batch-bomb", tar_of(&[("bomb.mjson", bomb)])))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let json = json_body(response).await;
+    assert_eq!(json["accepted"], 0);
+    assert_eq!(json["rejected"], 1);
+    assert_eq!(
+        json["errors"][0],
+        "bomb.mjson: decompresses past the 262144 byte record limit"
+    );
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+/// `gzip -c a b > c`, and every block-gzip writer, produce a file of concatenated gzip streams.
+/// Decoding only the first stores a truncated record and indexes it as complete.
+#[tokio::test]
+async fn reads_every_gzip_stream_of_a_member() {
+    let (state, data_dir) = test_state();
+    let app = api::router(state);
+    let record = br#"{"type":"start_game","names":["a","b","c","d"]}
+{"type":"end_game"}"#;
+    let (head, tail) = record.split_at(record.len() / 2);
+    let member = [gzip(head), gzip(tail)].concat();
+
+    let response = app
+        .clone()
+        .oneshot(batch_request(
+            "batch-split-member",
+            tar_of(&[("split.mjson", member)]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let json = json_body(response).await;
+    assert_eq!(json["accepted"], 1, "{json}");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/records")
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Both events survived, so the second stream was not dropped.
+    assert_eq!(json_body(response).await["items"][0]["event_count"], 2);
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+/// The archive itself has the same shape of failure, with thousands of records behind it instead
+/// of one.
+#[tokio::test]
+async fn reads_every_gzip_stream_of_the_archive() {
+    let (state, data_dir) = test_state();
+    let app = api::router(state);
+    let archive = tar_of(&two_records());
+    let (head, tail) = archive.split_at(archive.len() / 2);
+
+    let response = app
+        .oneshot(batch_request(
+            "batch-split-archive",
+            [gzip(head), gzip(tail)].concat(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(json_body(response).await["accepted"], 2);
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+/// Failing to write the pack is this server losing records, not the caller sending bad ones, so
+/// the batch must fail loudly instead of listing the loss as rejected members inside a 202.
+#[tokio::test]
+async fn fails_the_batch_when_records_cannot_be_stored() {
+    let (state, data_dir) = test_state();
+    let app = api::router(state);
+    // No pack directory, so appending cannot open a pack file: an I/O failure without needing a
+    // full disk.
+    std::fs::remove_dir_all(data_dir.join("packs")).unwrap();
+
+    let response = app
+        .oneshot(batch_request("batch-broken-disk", tar_of(&two_records())))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        json_body(response).await["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("one.mjson:")
+    );
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 

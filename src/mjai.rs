@@ -67,12 +67,14 @@ pub fn parse_metadata(payload: &[u8]) -> Result<Metadata, ParseError> {
         other => other.to_string(),
     });
 
-    // majsoul2mjai puts the source game's unix start_time in a `majsoul` object on the
-    // start_game line. Scanned over all events rather than read off events[0] because older
-    // dumps emit the header as its own line.
-    let played_at = events
-        .iter()
-        .find_map(|event| event.get("majsoul")?.get("start_time")?.as_i64())
+    // majsoul2mjai merges the source game's unix start_time into the start_game event itself,
+    // next to the names this function already reads; both fixtures under tests/fixtures have that
+    // shape. Read off that event rather than scanned over all of them, so the cost does not grow
+    // with the record and no other event can shadow the header.
+    let played_at = start
+        .get("majsoul")
+        .and_then(|majsoul| majsoul.get("start_time"))
+        .and_then(Value::as_i64)
         .and_then(|seconds| DateTime::from_timestamp(seconds, 0));
 
     Ok(Metadata {
@@ -107,6 +109,18 @@ mod tests {
             metadata.played_at,
             Some("2026-07-16T13:07:22Z".parse::<DateTime<Utc>>().unwrap())
         );
+    }
+
+    #[test]
+    fn reads_played_at_off_the_start_game_event_wherever_it_sits() {
+        let raw = br#"{"type":"none"}
+{"majsoul":{"start_time":1784207242},"names":["a","b","c","d"],"type":"start_game"}"#;
+        let metadata = parse_metadata(raw).unwrap();
+        assert_eq!(
+            metadata.played_at,
+            Some("2026-07-16T13:07:22Z".parse::<DateTime<Utc>>().unwrap())
+        );
+        assert_eq!(metadata.players, ["a", "b", "c", "d"]);
     }
 
     #[test]
