@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod clickhouse;
 pub mod config;
 pub mod gc;
+pub mod kafka;
 pub mod majsoul;
 pub mod managed_watch;
 pub mod mihomo;

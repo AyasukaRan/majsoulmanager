@@ -605,6 +605,14 @@ impl Catalog {
         Ok(rows.into_iter().map(|row| row.record_id).collect())
     }
 
+    /// The Kafka offset table lives in the same database, and the pack worker
+    /// commits into it on the same connection pool this already sizes and waits
+    /// for at boot. Handing out the pool keeps `src/kafka.rs` owning its own
+    /// statements rather than growing a second set of query methods here.
+    pub fn postgres(&self) -> &sqlx::PgPool {
+        &self.postgres
+    }
+
     pub async fn create_job(&self, request: &DownloadRequest) -> Result<DownloadJob, CatalogError> {
         let id = Uuid::new_v4();
         let created_at = Utc::now();
