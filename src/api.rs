@@ -9,7 +9,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path as AxumPath, Query, State},
     http::{
         HeaderMap, HeaderValue, Request, StatusCode,
-        header::{AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_TYPE},
+        header::{AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE},
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -24,6 +24,7 @@ use subtle::ConstantTimeEq;
 use tar::{Builder as TarBuilder, Header as TarHeader};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
+use tokio_util::io::ReaderStream;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
@@ -853,10 +854,21 @@ async fn download_file(
             "manifest.jsonl"
         }
     };
-    let data = tokio::fs::read(state.export_dir.join(format!("{id}.{extension}")))
+    // Streamed, not read: an export of the whole corpus is as large as the pack
+    // corpus itself, and buffering it would put that in the API's heap on top
+    // of the copy already on disk.
+    let file = tokio::fs::File::open(state.export_dir.join(format!("{id}.{extension}")))
         .await
         .map_err(|_| ApiError::NotFound)?;
-    let mut response = data.into_response();
+    // Kept from when the body was a Vec: a download without a total size is a
+    // progress bar that never fills.
+    let length = file.metadata().await.ok().map(|metadata| metadata.len());
+    let mut response = Body::from_stream(ReaderStream::new(file)).into_response();
+    if let Some(length) = length {
+        response
+            .headers_mut()
+            .insert(CONTENT_LENGTH, HeaderValue::from(length));
+    }
     response.headers_mut().insert(
         CONTENT_DISPOSITION,
         HeaderValue::from_str(&format!("attachment; filename=\"{id}.{extension}\""))
@@ -901,7 +913,10 @@ impl From<CatalogError> for ApiError {
         match error {
             CatalogError::Conflict | CatalogError::Pending => ApiError::Conflict(error.to_string()),
             CatalogError::WindowTooWide(_) => ApiError::BadRequest(error.to_string()),
-            CatalogError::Index(_) | CatalogError::Store(_) => {
+            // A `500` is what makes the collector back off, which is the point:
+            // the record is already packed, so the backlog needs ingest to stop
+            // long enough for the index to catch up, not a retry loop.
+            CatalogError::Backlogged(_) | CatalogError::Index(_) | CatalogError::Store(_) => {
                 ApiError::Internal(error.to_string())
             }
         }

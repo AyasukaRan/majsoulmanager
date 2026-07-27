@@ -1,4 +1,5 @@
 use std::{
+    cmp::Reverse,
     fmt,
     future::Future,
     str::FromStr,
@@ -35,6 +36,12 @@ const RECORD_COLUMNS: &str = "record_id, source, sha256, received_at, played_at,
 /// crash leaves behind. Both ends are safe: the pack file is written first, and
 /// the startup scan re-indexes anything the index is missing.
 const INSERT_BATCH_ROWS: usize = 1_000;
+
+/// A flush that fails leaves its rows buffered, so a ClickHouse outage under
+/// sustained ingest grows the buffer without limit. This caps it at a hundred
+/// batches — tens of megabytes — after which ingest is refused rather than the
+/// process being killed for the memory.
+const MAX_PENDING_ROWS: usize = 100 * INSERT_BATCH_ROWS;
 
 /// docs/architecture.md line 76 — a query either carries a time range or is
 /// bounded by a server-side maximum window.
@@ -147,6 +154,10 @@ pub enum CatalogError {
     Pending,
     #[error("received_at range must not exceed {0} days")]
     WindowTooWide(i64),
+    #[error(
+        "{0} records are waiting to be indexed; the packed records will be indexed at the next start"
+    )]
+    Backlogged(usize),
     #[error("record index is unavailable: {0}")]
     Index(#[from] ClickHouseError),
     #[error("idempotency store is unavailable: {0}")]
@@ -161,10 +172,15 @@ pub enum IdempotencyClaim {
 pub struct Catalog {
     index: ClickHouse,
     postgres: sqlx::PgPool,
-    /// Records packed and claimed but not yet in a ClickHouse part. Point reads
-    /// and idempotency replays answer from here so that a caller still reads
-    /// its own write inside the batching window.
+    /// Records packed and claimed but not yet in a ClickHouse part. Reads
+    /// answer from here so that a caller still reads its own write inside the
+    /// batching window. This lock is never held across a ClickHouse call: one
+    /// slow insert would otherwise block every read behind it.
     pending: Mutex<Vec<Record>>,
+    /// Held for the whole of a flush, so two concurrent flushes cannot send and
+    /// then discard the same rows. Separate from `pending` precisely because it
+    /// is the one that spans the network call.
+    flushing: Mutex<()>,
 }
 
 impl Catalog {
@@ -194,14 +210,27 @@ impl Catalog {
         // Concurrent `CREATE TABLE IF NOT EXISTS` is not actually safe in
         // PostgreSQL — it races on pg_type — and every API replica applies both
         // schemas on boot. One advisory lock, held for both stores, makes that
-        // a queue instead. It is released when the connection drops.
-        let mut migrator = postgres.acquire().await?;
-        sqlx::query("SELECT pg_advisory_lock($1)")
+        // a queue instead. It has to be the transaction-scoped variant:
+        // `pg_advisory_lock` is session-scoped, and dropping a pooled
+        // connection only returns it to the pool, so a session lock would
+        // outlive this function and block the next replica for the life of the
+        // process. A transaction releases it on commit and on rollback alike.
+        let mut migration = postgres.begin().await?;
+        tracing::info!("acquiring the schema migration lock");
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(MIGRATION_LOCK)
-            .execute(&mut *migrator)
+            .execute(&mut *migration)
             .await?;
         sqlx::raw_sql(POSTGRES_SCHEMA)
-            .execute(&mut *migrator)
+            .execute(&mut *migration)
+            .await?;
+        // Whether the skip index reaches the rows it was added for is decided
+        // before the DDL runs: `ADD INDEX` only affects parts written after it,
+        // so an installation that already has the table needs the existing
+        // parts materialised, and one that does not gets the index from the
+        // `CREATE` and nothing to rewrite.
+        let backfill_record_id_bloom = !index
+            .has_skip_index("mjai", "records", "record_id_bloom")
             .await?;
         // The ClickHouse HTTP interface takes one statement per request, so the
         // schema is split on `;`. Line comments come out first: a semicolon
@@ -218,12 +247,26 @@ impl Catalog {
         {
             index.execute(statement, &[], String::new()).await?;
         }
-        drop(migrator);
+        if backfill_record_id_bloom {
+            // Asynchronous by default: the mutation rewrites the index files of
+            // every existing part, and boot must not wait for it. Running it
+            // only on the boot that introduced the index keeps a table that is
+            // sized for 数亿 rows from being rewritten on every restart.
+            index
+                .execute(
+                    "ALTER TABLE mjai.records MATERIALIZE INDEX record_id_bloom",
+                    &[],
+                    String::new(),
+                )
+                .await?;
+        }
+        migration.commit().await?;
 
         let catalog = Self {
             index,
             postgres,
             pending: Mutex::new(Vec::new()),
+            flushing: Mutex::new(()),
         };
         catalog.prune().await?;
         Ok(catalog)
@@ -306,17 +349,51 @@ impl Catalog {
     }
 
     pub async fn insert(&self, record: Record) -> Result<(), CatalogError> {
-        let mut pending = self.pending.lock().await;
-        pending.push(record);
-        if pending.len() >= INSERT_BATCH_ROWS {
-            flush_pending(&self.index, &mut pending).await?;
+        let full = {
+            let mut pending = self.pending.lock().await;
+            if pending.len() >= MAX_PENDING_ROWS {
+                // The pack file was written before this call, so refusing here
+                // costs visibility until the next boot re-indexes the pack, not
+                // the record. Accepting without bound would trade that for an
+                // out-of-memory kill, which loses the whole buffer instead.
+                return Err(CatalogError::Backlogged(pending.len()));
+            }
+            pending.push(record);
+            pending.len() >= INSERT_BATCH_ROWS
+        };
+        if full {
+            self.flush().await?;
         }
         Ok(())
     }
 
+    /// Drains the buffer one batch at a time. A failed batch stays buffered and
+    /// the error propagates, so the caller sees a `500` and backs off; the next
+    /// flush retries from the front and a retry that lands twice converges
+    /// through ReplacingMergeTree.
     pub async fn flush(&self) -> Result<(), CatalogError> {
-        let mut pending = self.pending.lock().await;
-        Ok(flush_pending(&self.index, &mut pending).await?)
+        let _flushing = self.flushing.lock().await;
+        loop {
+            // Only ever a batch's worth is serialised, never the whole buffer:
+            // with ClickHouse down the backlog grows, and rebuilding all of it
+            // on every insert would make the work per insert grow with it.
+            let batch: Vec<String> = {
+                let pending = self.pending.lock().await;
+                pending
+                    .iter()
+                    .take(INSERT_BATCH_ROWS)
+                    .map(record_json)
+                    .collect()
+            };
+            if batch.is_empty() {
+                return Ok(());
+            }
+            let sent = batch.len();
+            self.index.insert(RECORDS_TABLE, batch.join("\n")).await?;
+            // Rows are only ever appended, and `flushing` admits one flush at a
+            // time, so the rows just sent are still the front of the buffer.
+            self.pending.lock().await.drain(..sent);
+        }
     }
 
     pub async fn get(&self, id: Uuid) -> Result<Option<Record>, CatalogError> {
@@ -355,9 +432,14 @@ impl Catalog {
         self.page(&filter.bounded()?, cursor, limit).await
     }
 
-    /// Export paging. Unlike `search` it carries no window: docs/architecture.md
-    /// line 88 wants an export streamed by keyset instead of materialising the
-    /// hit set, and a keyset walk stays bounded however many rows it visits.
+    /// Export paging. Unlike `search` it carries no window: the window in
+    /// docs/architecture.md line 76 is a rule about 索引与筛选, and the export
+    /// section that follows asks for the opposite — a keyset walk streamed into
+    /// the archive — because exporting the whole corpus is the feature. What
+    /// that section also asks for and this does not yet do is write the result
+    /// to RustFS and hand back a presigned URL; until the RustFS adapter lands,
+    /// a filterless export is a second copy of the corpus on the API's own
+    /// disk. That is the listed pre-launch gap, not a missing time filter.
     pub async fn scan(
         &self,
         filter: &RecordFilter,
@@ -373,7 +455,6 @@ impl Catalog {
         cursor: Option<Cursor>,
         limit: usize,
     ) -> Result<(Vec<Record>, Option<Cursor>), CatalogError> {
-        self.flush().await?;
         // FINAL collapses rows a replayed insert batch duplicated;
         // ReplacingMergeTree otherwise only dedups within a merged part.
         let mut sql = format!("SELECT {RECORD_COLUMNS} FROM {RECORDS_TABLE} FINAL WHERE 1");
@@ -414,11 +495,42 @@ impl Catalog {
             ));
             params.push(("cursor_id", cursor.record_id.to_string()));
         }
+        // `(received_at DESC, record_id DESC)` is not a prefix of the table's
+        // sorting key — `toDate(received_at)` and `source` come first — so
+        // ClickHouse cannot read the page already ordered and sorts the matched
+        // set instead. Kept anyway: the cursor is the pair docs/architecture.md
+        // line 76 mandates, and ordering by the full key would have to carry
+        // `source` in the cursor and break the token the console already holds.
+        // Measured on 641k rows shaped like the live corpus (41 packs, 180 days,
+        // 90 day window, limit 100): 8ms against 7ms for the sorting-key order.
+        // FINAL forces a sort either way, so the ordering is not what to fix
+        // first if that ever becomes the bottleneck.
         sql.push_str(" ORDER BY received_at DESC, record_id DESC LIMIT {limit:UInt32}");
         params.push(("limit", (limit + 1).to_string()));
 
         let rows: Vec<RecordRow> = self.index.query(&sql, &params).await?;
         let mut records: Vec<Record> = rows.into_iter().map(Record::from).collect();
+
+        // Buffered rows are merged in rather than flushed. Flushing here would
+        // make every read cut the batch down to whatever had arrived since the
+        // last one, which under a collector plus a polling console is close to
+        // a MergeTree part per record. Both sides are already the top `limit+1`
+        // of their own set under the same order, so sorting the concatenation
+        // and cutting it again yields exactly the page.
+        {
+            let pending = self.pending.lock().await;
+            records.extend(
+                pending
+                    .iter()
+                    .filter(|record| matches_page(record, filter, cursor))
+                    .cloned(),
+            );
+        }
+        records.sort_by_key(|record| Reverse((record.received_at, record.id)));
+        // A flush between the query and the snapshot can return a row twice.
+        records.dedup_by_key(|record| record.id);
+        records.truncate(limit + 1);
+
         let next_cursor = (records.len() > limit).then(|| {
             records.truncate(limit);
             let last = &records[limit - 1];
@@ -433,6 +545,15 @@ impl Catalog {
     /// Per-pack row counts, used by the startup scan to decide which packs are
     /// worth reading. `uniqExact` rather than `count()` so a replayed insert
     /// does not make a pack look complete.
+    ///
+    /// It is a full aggregate over two columns and it runs before the listener
+    /// binds. Measured on 641k rows shaped like the live corpus: 9ms, against
+    /// 12ms for the same query restricted to the pack keys found on disk, which
+    /// is slower because every indexed pack is still on local disk and the
+    /// filter only adds work to the same scan. Reconciliation is what costs at
+    /// scale, not this query — the header walk in `recovery` reads 24 bytes per
+    /// record — and the fix for both is to stop reconciling the whole corpus on
+    /// the boot path, not to narrow the `WHERE`.
     pub async fn indexed_counts(&self) -> Result<Vec<(String, u64)>, CatalogError> {
         #[derive(Deserialize)]
         struct PackCount {
@@ -553,23 +674,31 @@ impl Catalog {
     }
 }
 
-/// Rows stay in the buffer when the insert fails so the next flush retries
-/// them; a retry that lands twice converges through ReplacingMergeTree.
-async fn flush_pending(
-    index: &ClickHouse,
-    pending: &mut Vec<Record>,
-) -> Result<(), ClickHouseError> {
-    if pending.is_empty() {
-        return Ok(());
-    }
-    let rows = pending
-        .iter()
-        .map(record_json)
-        .collect::<Vec<_>>()
-        .join("\n");
-    index.insert(RECORDS_TABLE, rows).await?;
-    pending.clear();
-    Ok(())
+/// The buffer-side twin of the `WHERE` clause `page` builds. The `played_at`
+/// arms use `is_some_and` because the SQL comparisons are NULL, and therefore
+/// false, for a record with no `played_at`.
+fn matches_page(record: &Record, filter: &RecordFilter, cursor: Option<Cursor>) -> bool {
+    filter
+        .source
+        .as_ref()
+        .is_none_or(|source| *source == record.source)
+        && filter
+            .player
+            .as_ref()
+            .is_none_or(|player| record.players.contains(player))
+        && filter
+            .received_from
+            .is_none_or(|from| record.received_at >= from)
+        && filter.received_to.is_none_or(|to| record.received_at < to)
+        && filter
+            .played_from
+            .is_none_or(|from| record.played_at.is_some_and(|at| at >= from))
+        && filter
+            .played_to
+            .is_none_or(|to| record.played_at.is_some_and(|at| at < to))
+        && cursor.is_none_or(|cursor| {
+            (record.received_at, record.id) < (cursor.received_at, cursor.record_id)
+        })
 }
 
 fn record_json(record: &Record) -> String {
@@ -608,19 +737,22 @@ where
 {
     let mut backoff = Duration::from_millis(250);
     loop {
-        match attempt().await {
-            Ok(value) => return Ok(value),
-            Err(error) if Instant::now() + backoff < deadline => {
-                tracing::warn!(database = label, %error, "database is not ready yet, retrying");
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(5));
-            }
-            Err(error) => {
-                anyhow::bail!(
-                    "{label} was still unreachable when the startup wait ran out: {error}"
-                )
-            }
+        // Each attempt is bounded by the wait itself. A database that accepts
+        // the connection and then never answers fails no client-side check, so
+        // without this the deadline is only consulted between attempts and the
+        // process hangs on the first one instead of exiting to be restarted.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let error = match tokio::time::timeout(remaining, attempt()).await {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(error)) => error.to_string(),
+            Err(_) => format!("no answer within {remaining:?}"),
+        };
+        if Instant::now() + backoff >= deadline {
+            anyhow::bail!("{label} was still unreachable when the startup wait ran out: {error}");
         }
+        tracing::warn!(database = label, %error, "database is not ready yet, retrying");
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(5));
     }
 }
 

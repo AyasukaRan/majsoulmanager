@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
@@ -25,7 +27,14 @@ pub enum ClickHouseError {
 impl ClickHouse {
     pub fn new(url: &str, user: &str, password: &str) -> Result<Self, ClickHouseError> {
         Ok(Self {
-            http: reqwest::Client::builder().build()?,
+            // reqwest has no default timeout, so a ClickHouse that accepts the
+            // connection and never answers would hang the startup wait past its
+            // own deadline and stall every request behind it. The request
+            // timeout has to clear a full insert batch, not just a point read.
+            http: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(3))
+                .timeout(Duration::from_secs(30))
+                .build()?,
             url: url.trim_end_matches('/').to_owned(),
             user: user.to_owned(),
             password: password.to_owned(),
@@ -88,6 +97,34 @@ impl ClickHouse {
             .filter(|line| !line.trim().is_empty())
             .map(|line| serde_json::from_str(line).map_err(ClickHouseError::from))
             .collect()
+    }
+
+    /// Whether a skip index is already declared on a table. `ADD INDEX` is
+    /// idempotent but silent, so this is the only way to tell an installation
+    /// that needs its existing parts materialised from one that does not.
+    pub async fn has_skip_index(
+        &self,
+        database: &str,
+        table: &str,
+        name: &str,
+    ) -> Result<bool, ClickHouseError> {
+        #[derive(serde::Deserialize)]
+        struct Declared {
+            declared: u8,
+        }
+        let rows: Vec<Declared> = self
+            .query(
+                "SELECT count() > 0 AS declared FROM system.data_skipping_indices \
+                 WHERE database = {database:String} AND table = {table:String} \
+                 AND name = {name:String}",
+                &[
+                    ("database", database.to_owned()),
+                    ("table", table.to_owned()),
+                    ("name", name.to_owned()),
+                ],
+            )
+            .await?;
+        Ok(rows.first().is_some_and(|row| row.declared == 1))
     }
 
     /// `rows` is newline-delimited JSONEachRow. One request per batch: every

@@ -466,6 +466,197 @@ async fn re_indexes_packs_the_index_never_saw() {
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 
+/// The migration lock used to be session scoped, and dropping the sqlx
+/// connection that held it only returned it to the pool. The lock therefore
+/// outlived `connect`, so the second replica to boot blocked until the first
+/// process exited.
+#[tokio::test]
+async fn a_second_boot_is_not_blocked_by_the_first_migration_lock() {
+    let data_dir = test_data_dir();
+    let first = Catalog::connect(&test_config(&data_dir, None))
+        .await
+        .unwrap();
+    let second = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        Catalog::connect(&test_config(&data_dir, None)),
+    )
+    .await
+    .expect("the second boot blocked on the migration advisory lock");
+    // Both are live at once, which is the replica case: neither may be holding
+    // anything that stops the other from working.
+    second.unwrap().flush().await.unwrap();
+    first.flush().await.unwrap();
+}
+
+/// A ClickHouse that accepts the connection and never answers fails no
+/// client-side check, so startup used to hang on the first probe rather than
+/// giving up at MJAI_DATABASE_WAIT_SECS and letting the restart policy make the
+/// outage visible.
+#[tokio::test]
+async fn a_clickhouse_that_never_answers_gives_up_at_the_startup_deadline() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let sink = tokio::spawn(async move {
+        let mut accepted = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            accepted.push(stream);
+        }
+    });
+
+    let data_dir = test_data_dir();
+    let mut config = test_config(&data_dir, None);
+    config.clickhouse_url = format!("http://{address}");
+    config.database_wait_secs = 5;
+    let started = std::time::Instant::now();
+    // Bounded here as well: without the fix this never returns, and a hung test
+    // costs the whole CI job rather than one red line.
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(45),
+        Catalog::connect(&config),
+    )
+    .await
+    .expect("startup never gave up on a ClickHouse that accepts and never answers");
+    assert!(
+        outcome.is_err(),
+        "a black hole was accepted as a ready index"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "startup overran its own wait by {:?}",
+        started.elapsed()
+    );
+    sink.abort();
+}
+
+/// Reads used to flush the insert buffer so that they could see recent writes,
+/// which meant any read traffic cut the batch down to whatever had arrived
+/// since the last read — a MergeTree part per record under a polling console.
+#[tokio::test]
+async fn a_read_sees_a_buffered_record_without_flushing_the_batch() {
+    let (state, data_dir) = test_state().await;
+    let source = test_source(&data_dir);
+    let config = test_config(&data_dir, None);
+    let app = api::router(state.clone());
+    let raw = r#"{"type":"start_game","names":["a","b","c","d"]}"#;
+    let response = app
+        .clone()
+        .oneshot(ingest_request(&source, "buffered-1", raw))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/records?source={source}"))
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        page["items"].as_array().unwrap().len(),
+        1,
+        "a read stopped seeing its own write"
+    );
+
+    assert_eq!(
+        indexed_rows(&config, &source).await,
+        0,
+        "the read flushed the batch instead of merging the buffer"
+    );
+    state.catalog.flush().await.unwrap();
+    assert_eq!(indexed_rows(&config, &source).await, 1);
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+/// A flush now sends a fixed batch at a time and, so that reads are not stuck
+/// behind it, releases the buffer lock across the insert. That is exactly the
+/// window in which another writer appends, so the flush may only retire the
+/// rows it actually sent. Concurrent writers are the point of the test: a
+/// single-threaded run cannot tell a correct flush from one that clears the
+/// whole buffer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flush_only_retires_the_rows_it_sent() {
+    let data_dir = test_data_dir();
+    let config = test_config(&data_dir, None);
+    let source = test_source(&data_dir);
+    let catalog = Arc::new(Catalog::connect(&config).await.unwrap());
+    let writers = 8u32;
+    let each = 500u32;
+    let mut handles = Vec::new();
+    for writer in 0..writers {
+        let catalog = Arc::clone(&catalog);
+        let source = source.clone();
+        handles.push(tokio::spawn(async move {
+            for index in 0..each {
+                catalog
+                    .insert(sample_record(&source, writer * each + index))
+                    .await
+                    .unwrap();
+            }
+        }));
+    }
+    for handle in handles {
+        handle.await.unwrap();
+    }
+    catalog.flush().await.unwrap();
+    assert_eq!(
+        indexed_rows(&config, &source).await,
+        u64::from(writers * each),
+        "a flush discarded rows that were appended while it was in flight"
+    );
+}
+
+fn sample_record(source: &str, index: u32) -> mjai_management::catalog::Record {
+    mjai_management::catalog::Record {
+        id: Uuid::new_v4(),
+        source: source.to_owned(),
+        sha256: "0".repeat(64),
+        received_at: chrono::Utc::now(),
+        played_at: None,
+        players: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+        rule: None,
+        event_count: index,
+        storage: mjai_management::pack::PackLocation {
+            pack_key: "packs/batch.mjpack".into(),
+            offset: u64::from(index),
+            compressed_size: 1,
+            raw_size: 1,
+            codec: "zstd",
+        },
+    }
+}
+
+/// Distinct rows in the index for one source, straight from ClickHouse: what a
+/// test cannot ask the catalogue, because the catalogue answers from its
+/// buffer as well.
+async fn indexed_rows(config: &Config, source: &str) -> u64 {
+    #[derive(serde::Deserialize)]
+    struct Rows {
+        rows: u64,
+    }
+    let index = mjai_management::clickhouse::ClickHouse::new(
+        &config.clickhouse_url,
+        &config.clickhouse_user,
+        &config.clickhouse_password,
+    )
+    .unwrap();
+    let rows: Vec<Rows> = index
+        .query(
+            "SELECT uniqExact(record_id) AS rows FROM mjai.records \
+             WHERE source = {source:String}",
+            &[("source", source.to_owned())],
+        )
+        .await
+        .unwrap();
+    rows.first().map(|row| row.rows).unwrap_or_default()
+}
+
 #[tokio::test]
 async fn pages_records_by_keyset_without_repeating_or_dropping_one() {
     let (state, data_dir) = test_state().await;

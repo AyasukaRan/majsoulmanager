@@ -31,6 +31,11 @@ SETTINGS index_granularity = 8192;
 
 -- The API applies this file at startup, so the CREATE above is a no-op wherever
 -- the table already exists; the ALTER is what reaches those installations.
+-- Declaring the index is only half of it: ClickHouse writes a skip index into
+-- parts created after the ALTER and leaves existing parts scanning. The
+-- matching MATERIALIZE INDEX is issued by Catalog::connect rather than living
+-- here, because it must run once — on the boot that introduces the index — and
+-- not on every restart, and only the application can tell those apart.
 ALTER TABLE mjai.records
     ADD INDEX IF NOT EXISTS record_id_bloom record_id TYPE bloom_filter(0.01) GRANULARITY 4;
 
