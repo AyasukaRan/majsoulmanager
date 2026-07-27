@@ -24,7 +24,7 @@ use crate::{
         modes::{mode_metadata, room_modes, uuid_year},
         proto::{FieldIterator, extract_string, extract_varint},
         rpc::{
-            FETCH_GAME_LIVE_LIST_METHOD, FETCH_GAME_RECORD_METHOD, MajsoulRpc,
+            FETCH_GAME_LIVE_LIST_METHOD, FETCH_GAME_RECORD_METHOD, MajsoulRpc, ServerError,
             build_fetch_game_live_list_request, build_fetch_game_record_request,
             ensure_success_response,
         },
@@ -39,6 +39,9 @@ use crate::{
 
 const FILTER_ID_OFFSET: i32 = 200;
 const SETTLE_SECS: u64 = 120;
+// How long a finished game may keep failing to fetch before it is dropped from
+// the pending queue.
+const GIVE_UP_SECS: u64 = 3 * 3600;
 const RECONNECT_DELAY_SECS: u64 = 5;
 // Login client version numbers, both captured from a real web client.
 //
@@ -160,6 +163,9 @@ pub(crate) async fn run(
     let state_path = dependencies
         .data_dir
         .join(format!("watch/state-{}.json", instance.id));
+    let discovery_dir = dependencies
+        .data_dir
+        .join(format!("watch/discovered/{}", instance.id));
     // Shared: the gateway, package version and version floor are properties of
     // the Majsoul deployment, not of the account, so instances benefit from
     // each other's lookups.
@@ -217,7 +223,9 @@ pub(crate) async fn run(
                 if let Err(error) = watch_session(
                     &config,
                     &dependencies,
+                    &source,
                     &modes,
+                    &discovery_dir,
                     &client_version,
                     &state_path,
                     &mut tracked,
@@ -695,7 +703,9 @@ async fn connect(
 async fn watch_session(
     config: &WatchServiceConfig,
     dependencies: &ManagedWatchDependencies,
+    source: &str,
     modes: &[i32],
+    discovery_dir: &Path,
     client_version: &str,
     state_path: &Path,
     tracked: &mut HashMap<String, LiveGame>,
@@ -718,6 +728,14 @@ async fn watch_session(
                 dependencies
                     .registry
                     .apply(event(&game, WatchEventKind::Live, None, None))?;
+                // A uuid in the live list is a game that exists; the paipu just
+                // is not written yet. Record it the moment it is seen, before
+                // any fetching, so the fact survives whatever happens to the
+                // working queue afterwards — including this process dying mid
+                // round, or the entry being dropped as unfetchable.
+                if !tracked.contains_key(&game.uuid) {
+                    append_discovered(discovery_dir, &game);
+                }
                 live_now.insert(game.uuid.clone(), game);
             }
             tokio::time::sleep(Duration::from_millis(config.request_delay_ms)).await;
@@ -761,7 +779,42 @@ async fn watch_session(
                             Some(error.to_string()),
                             None,
                         ))?;
-                        return Err(error);
+                        // A business error is about this one record: the socket
+                        // answered, so tearing the session down neither fixes it
+                        // nor lets the other pending games through — the record
+                        // would just fail again after every reconnect, forever.
+                        // Only a stale session or a transport failure is worth
+                        // reconnecting for.
+                        let server = error.downcast_ref::<ServerError>().copied();
+                        let Some(server) = server.filter(|code| !code.is_session_stale()) else {
+                            return Err(error);
+                        };
+                        // The paipu for a game can legitimately lag behind its
+                        // disappearance from the live list, but not for hours;
+                        // past that it is never coming and the entry would
+                        // otherwise be retried every poll for the life of the
+                        // process. Dropping it loses no information: the uuid
+                        // was written to the discovery log when it was first
+                        // seen live.
+                        if game
+                            .queued_at
+                            .is_some_and(|queued| now.saturating_sub(queued) > GIVE_UP_SECS)
+                        {
+                            pending.remove(&game.uuid);
+                            persist_state(state_path, tracked.values(), pending.values())?;
+                            dependencies.logs.append(
+                                WatchLogLevel::Warn,
+                                source,
+                                format!(
+                                    "放弃对局 {} (服务端错误 {} 持续超过 {} 分钟)",
+                                    game.uuid,
+                                    server.code,
+                                    GIVE_UP_SECS / 60
+                                ),
+                            );
+                        }
+                        tokio::time::sleep(Duration::from_millis(config.request_delay_ms)).await;
+                        continue;
                     }
                 };
             dependencies
@@ -954,6 +1007,36 @@ fn load_first_account(secret_ref: &str) -> Result<(String, String)> {
     anyhow::bail!("account secret contains no usable account")
 }
 
+/// Append-only record of every game uuid this collector has ever seen live.
+///
+/// The state file is a working queue — entries leave it once fetched or given
+/// up on — so it is not a record of what existed. This is: one JSON object per
+/// line, appended the moment a uuid appears in the live list, rotated by UTC
+/// day so a long-running collector does not accumulate one enormous file.
+/// Failures are logged and swallowed: losing the audit trail must never stop
+/// collection.
+fn append_discovered(discovery_dir: &Path, game: &LiveGame) {
+    let entry = serde_json::json!({
+        "uuid": game.uuid,
+        "mode_id": game.mode_id,
+        "start_time": game.start_time,
+        "discovered_at": Utc::now().to_rfc3339(),
+    });
+    let path = discovery_dir.join(format!("{}.jsonl", Utc::now().format("%Y-%m-%d")));
+    let appended = std::fs::create_dir_all(discovery_dir).and_then(|()| {
+        use std::io::Write as _;
+        // O_APPEND keeps concurrent writers from interleaving a short line.
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        writeln!(file, "{entry}")
+    });
+    if let Err(error) = appended {
+        warn!(error = %error, uuid = %game.uuid, "failed to record discovered game uuid");
+    }
+}
+
 fn load_state(path: &Path) -> Result<(Vec<LiveGame>, Vec<LiveGame>)> {
     #[derive(Deserialize)]
     struct State {
@@ -1005,6 +1088,62 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mirrors the decision `watch_session` makes on a failed record fetch.
+    fn reconnects_on(error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<ServerError>()
+            .copied()
+            .filter(|code| !code.is_session_stale())
+            .is_none()
+    }
+
+    #[test]
+    fn only_a_stale_session_or_transport_failure_reconnects() {
+        // 1203 (record not available) is about one game. Reconnecting neither
+        // fixes it nor lets the rest of the queue through, so the session must
+        // survive it.
+        let business = ensure_success_response(&[0x08, 0xb3, 0x09], "fetchGameRecord").unwrap_err();
+        assert!(!reconnects_on(&business), "1203 must not kill the session");
+
+        // 1201 is ERR_TOKEN_NOT_EXIST: a fresh login is exactly the cure.
+        let stale = ensure_success_response(&[0x08, 0xb1, 0x09], "fetchGameRecord").unwrap_err();
+        assert!(reconnects_on(&stale), "a stale session must reconnect");
+
+        // Anything that is not a server answer at all is a transport failure.
+        assert!(reconnects_on(&anyhow::Error::msg("connection reset")));
+    }
+
+    #[test]
+    fn discovery_log_appends_every_uuid_and_survives_the_working_queue() {
+        let dir = std::env::temp_dir().join(format!("mjai-disc-{}", Uuid::new_v4().simple()));
+        let game = |uuid: &str| LiveGame {
+            uuid: uuid.into(),
+            mode_id: 12,
+            start_time: 1_700_000_000,
+            queued_at: None,
+        };
+        append_discovered(&dir, &game("260727-aaaa"));
+        append_discovered(&dir, &game("260727-bbbb"));
+
+        let file = std::fs::read_dir(&dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&file)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "each discovery is its own line");
+        assert_eq!(lines[0]["uuid"], "260727-aaaa");
+        assert_eq!(lines[1]["uuid"], "260727-bbbb");
+        assert_eq!(lines[0]["mode_id"], 12);
+        assert!(lines[0]["discovered_at"].is_string());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn version_round_trips_and_carries_patch_overflow() {
