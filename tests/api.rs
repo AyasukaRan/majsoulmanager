@@ -914,6 +914,48 @@ async fn a_sub_millisecond_bound_answers_the_same_before_and_after_a_flush() {
     );
 }
 
+/// The mirror of the `from` case, and the one that loses data: a record stored at the bottom of its
+/// millisecond is genuinely earlier than an exclusive `to` later in the same millisecond, so
+/// flooring that bound too would exclude it from a range it belongs to.
+#[tokio::test]
+async fn an_exclusive_sub_millisecond_upper_bound_keeps_the_record_it_covers() {
+    let data_dir = test_data_dir();
+    let config = test_config(&data_dir, None);
+    let source = test_source(&data_dir);
+    let catalog = Catalog::connect(&config).await.unwrap();
+    let millisecond = Utc::now().trunc_subsecs(3) - TimeDelta::seconds(1);
+    let mut record = sample_record(&source, 401);
+    record.received_at = millisecond + TimeDelta::microseconds(200);
+    catalog.insert(record).await.unwrap();
+
+    let filter = RecordFilter {
+        source: Some(source.clone()),
+        received_to: Some(millisecond + TimeDelta::microseconds(400)),
+        ..RecordFilter::default()
+    };
+    let (before, _) = catalog.search(&filter, None, 10).await.unwrap();
+    catalog.flush().await.unwrap();
+    let (after, _) = catalog.search(&filter, None, 10).await.unwrap();
+    assert_eq!(
+        after.len(),
+        1,
+        "an exclusive upper bound dropped a record that arrived before it"
+    );
+    assert_eq!(before.len(), after.len());
+
+    // The bound still excludes: a record in the NEXT millisecond is out of range.
+    let mut later = sample_record(&source, 402);
+    later.received_at = millisecond + TimeDelta::milliseconds(1);
+    catalog.insert(later).await.unwrap();
+    catalog.flush().await.unwrap();
+    let (page, _) = catalog.search(&filter, None, 10).await.unwrap();
+    assert_eq!(
+        page.len(),
+        1,
+        "rounding the bound outwards pulled in a later millisecond"
+    );
+}
+
 #[tokio::test]
 async fn rejects_a_reused_idempotency_key_with_different_content() {
     let (state, data_dir) = test_state().await;

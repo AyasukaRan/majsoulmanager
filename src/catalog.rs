@@ -503,7 +503,17 @@ impl Catalog {
                 sql.push_str(&format!(
                     " AND {column} {comparison} fromUnixTimestamp64Milli({{{name}:Int64}})"
                 ));
-                params.push((name, value.timestamp_millis().to_string()));
+                // Records are stored truncated to the millisecond, so a bound
+                // carrying finer precision has to round outwards or it excludes
+                // the very millisecond it falls inside: an inclusive `from`
+                // floors onto that millisecond, an exclusive `to` has to reach
+                // past it. Flooring both would drop every record that arrived
+                // earlier in the same millisecond as an exclusive upper bound.
+                let millis = match comparison {
+                    "<" => ceil_millis(value),
+                    _ => value.timestamp_millis(),
+                };
+                params.push((name, millis.to_string()));
             }
         }
         if let Some(cursor) = cursor {
@@ -728,6 +738,17 @@ where
         tracing::warn!(database = label, %error, "database is not ready yet, retrying");
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(5));
+    }
+}
+
+/// Smallest whole millisecond at or after `value`, for an exclusive upper bound
+/// compared against millisecond-truncated rows.
+fn ceil_millis(value: DateTime<Utc>) -> i64 {
+    let millis = value.timestamp_millis();
+    if value.timestamp_subsec_nanos() % 1_000_000 == 0 {
+        millis
+    } else {
+        millis + 1
     }
 }
 
