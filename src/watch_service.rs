@@ -1116,7 +1116,12 @@ impl WatchSupervisor {
                 }
                 Err(error) => {
                     runtime.phase = ServicePhase::Failed;
-                    runtime.last_error = Some(format!("[{id}] {error:#}"));
+                    // First failure wins: with several collectors down, the one
+                    // that broke first is the one worth reporting, and a later
+                    // failure must not overwrite it.
+                    runtime
+                        .last_error
+                        .get_or_insert_with(|| format!("[{id}] {error:#}"));
                     drop(runtime);
                     self.logs.append(
                         WatchLogLevel::Error,
