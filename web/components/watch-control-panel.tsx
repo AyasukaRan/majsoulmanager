@@ -93,6 +93,9 @@ export function WatchControlPanel() {
   const [moduleArtifact, setModuleArtifact] = useState<File | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  // Ids the backend already knows. Renaming one would orphan its state file
+  // and drop the games it still has to fetch, so those inputs are locked.
+  const [savedIds, setSavedIds] = useState<string[]>([]);
 
   const updateInstance = useCallback(
     (index: number, patch: Partial<WatchInstance>) =>
@@ -117,6 +120,7 @@ export function WatchControlPanel() {
         jsonRequest<MihomoStatus>("/api/watch/proxy"),
       ]);
       setConfig(nextConfig);
+      setSavedIds(nextConfig.instances.map((instance) => instance.id));
       setModules(nextModules);
       setProxy(nextProxy);
     } catch (error) {
@@ -148,6 +152,7 @@ export function WatchControlPanel() {
         body: JSON.stringify(config),
       });
       setConfig(saved);
+      setSavedIds(saved.instances.map((instance) => instance.id));
       setMessage(`配置 r${saved.revision} 已保存并应用`);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "保存失败");
@@ -437,15 +442,16 @@ export function WatchControlPanel() {
                     实例 ID
                     <Input
                       value={instance.id}
+                      readOnly={savedIds.includes(instance.id)}
                       onChange={(event) =>
                         updateInstance(index, { id: event.target.value })
                       }
                       placeholder="four-player"
                     />
                     <span className="block font-normal text-muted-foreground">
-                      只能用字母、数字、<code>.</code>
-                      <code>_</code>
-                      <code>-</code>；改名会丢弃该实例已记录的待抓取对局
+                      {savedIds.includes(instance.id)
+                        ? "保存后不可改名，改名会丢弃该实例待抓取的对局"
+                        : "只能用字母、数字和 . _ -"}
                     </span>
                   </label>
                   <label className="space-y-1.5 text-xs font-medium">

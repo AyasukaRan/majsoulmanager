@@ -990,6 +990,17 @@ impl WatchSupervisor {
                 supervisor.run_instance(generation, config, instance).await;
             }));
         }
+        if !tasks.is_empty() {
+            // Every field here describes the generation, not one collector, so
+            // it is written once instead of racily by each spawned task.
+            let mut runtime = self.runtime.write();
+            runtime.phase = ServicePhase::Running;
+            runtime.active_revision = Some(config.revision);
+            runtime.login_module = Some(config.login_module.clone());
+            runtime.pb_fetch_module = Some(config.pb_fetch_module.clone());
+            runtime.started_at = Some(Utc::now());
+            runtime.updated_at = Utc::now();
+        }
         if tasks.is_empty() {
             // Nothing will ever move the phase off Starting, so settle it here.
             let mut runtime = self.runtime.write();
@@ -1061,22 +1072,8 @@ impl WatchSupervisor {
         config: WatchServiceConfig,
         instance: WatchInstance,
     ) {
-        {
-            let mut runtime = self.runtime.write();
-            // A sibling that already failed keeps the service marked Failed;
-            // start() resets the phase for each new generation.
-            if runtime.phase != ServicePhase::Failed {
-                runtime.phase = ServicePhase::Running;
-            }
-            runtime.active_revision = Some(config.revision);
-            runtime.login_module = Some(config.login_module.clone());
-            runtime.pb_fetch_module = Some(config.pb_fetch_module.clone());
-            runtime.started_at = Some(Utc::now());
-            runtime.updated_at = Utc::now();
-            // last_error is deliberately not cleared here: start() already
-            // cleared it for this generation, and clearing it per instance
-            // lets a slow-starting collector erase a sibling's failure.
-        }
+        // The runtime status describes the generation and is set by start();
+        // an instance only ever reports its own failure into it.
         let id = instance.id.clone();
         self.logs.append(
             WatchLogLevel::Info,
