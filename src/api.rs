@@ -860,10 +860,16 @@ async fn download_file(
     let file = tokio::fs::File::open(state.export_dir.join(format!("{id}.{extension}")))
         .await
         .map_err(|_| ApiError::NotFound)?;
-    // Kept from when the body was a Vec: a download without a total size is a
-    // progress bar that never fills.
+    // Both headers are the streaming body's replacement for what `Vec<u8>` used
+    // to give for free: axum's `IntoResponse` for bytes sets the content type
+    // and the length, its `Body` impl sets neither, and a download without a
+    // total size is a progress bar that never fills.
     let length = file.metadata().await.ok().map(|metadata| metadata.len());
     let mut response = Body::from_stream(ReaderStream::new(file)).into_response();
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
     if let Some(length) = length {
         response
             .headers_mut()

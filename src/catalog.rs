@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
+use chrono::{DateTime, NaiveDateTime, SubsecRound, TimeDelta, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use sqlx::{Row, postgres::PgPoolOptions};
 use thiserror::Error;
@@ -348,7 +348,18 @@ impl Catalog {
         Ok(())
     }
 
-    pub async fn insert(&self, record: Record) -> Result<(), CatalogError> {
+    pub async fn insert(&self, mut record: Record) -> Result<(), CatalogError> {
+        // Milliseconds are the one resolution the buffer, the index and the
+        // cursor can all agree on: the columns are DateTime64(3) and a cursor
+        // token is epoch millis. A buffered row kept at `Utc::now()`'s
+        // nanosecond precision hands back a cursor that truncates below it, so
+        // every row in between is skipped on the next page as well as this one,
+        // and it sorts away from its own flushed copy instead of next to it
+        // where `dedup_by_key` can see the pair. Every producer of a `Record`
+        // reaches the buffer through here, so this is the only place it needs
+        // doing.
+        record.received_at = record.received_at.trunc_subsecs(3);
+        record.played_at = record.played_at.map(|at| at.trunc_subsecs(3));
         let full = {
             let mut pending = self.pending.lock().await;
             if pending.len() >= MAX_PENDING_ROWS {

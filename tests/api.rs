@@ -5,11 +5,12 @@ use axum::{
     http::{Request, StatusCode, header},
     routing::post,
 };
+use chrono::{SubsecRound, TimeDelta, Utc};
 use flate2::read::GzDecoder;
 use mjai_management::auth::{
     AuthError, AuthSettings, LoginRequest, RegisterRequest, UserRole, VerifyEmailRequest,
 };
-use mjai_management::catalog::Catalog;
+use mjai_management::catalog::{Catalog, Cursor, RecordFilter};
 use mjai_management::pack::PackStore;
 use mjai_management::watch::{WatchEvent, WatchEventKind};
 use mjai_management::{AppState, api, config::Config, recovery};
@@ -56,6 +57,10 @@ fn env_or(key: &str, fallback: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| fallback.to_owned())
 }
 
+/// Only a unique name, not a directory: `AppState::local` is what creates it,
+/// so a test that builds a bare `Catalog` — which touches no filesystem — has
+/// nothing to remove at the end and an unconditional `remove_dir_all` there
+/// would fail on a path that was never created.
 fn test_data_dir() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("mjai-api-test-{}", Uuid::new_v4()))
 }
@@ -423,6 +428,14 @@ async fn creates_and_downloads_a_filtered_archive() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    // A streamed body carries no content type of its own, so switching away
+    // from `Vec<u8>` silently dropped this one.
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE),
+        Some(&header::HeaderValue::from_static(
+            "application/octet-stream"
+        ))
+    );
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let decoder = GzDecoder::new(bytes.as_ref());
     let mut archive = tar::Archive::new(decoder);
@@ -709,6 +722,88 @@ async fn pages_records_by_keyset_without_repeating_or_dropping_one() {
     assert_eq!(seen.len(), 3);
     assert!(cursor.is_none(), "the last page still offered a cursor");
     std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+/// Two records 400us and 900us into the same millisecond, paged one at a time.
+/// The buffer used to hold `Utc::now()` at nanosecond precision while the index
+/// stores DateTime64(3) and a cursor token carries epoch millis, so a page
+/// ending mid-millisecond handed back a cursor that truncated below its own
+/// last row and the next page skipped everything in between. A tar batch import
+/// puts several records in one millisecond as a matter of course.
+#[tokio::test]
+async fn pages_two_records_that_share_one_millisecond() {
+    let data_dir = test_data_dir();
+    let config = test_config(&data_dir, None);
+    let source = test_source(&data_dir);
+    let catalog = Catalog::connect(&config).await.unwrap();
+    // A second back so the records stay inside the window `search` bounds to
+    // `now`, which is read after they are written.
+    let millisecond = Utc::now().trunc_subsecs(3) - TimeDelta::seconds(1);
+    for micros in [400i64, 900] {
+        let mut record = sample_record(&source, micros as u32);
+        record.received_at = millisecond + TimeDelta::microseconds(micros);
+        catalog.insert(record).await.unwrap();
+    }
+
+    let filter = RecordFilter {
+        source: Some(source),
+        ..RecordFilter::default()
+    };
+    let mut seen = Vec::new();
+    let mut cursor = None;
+    for _ in 0..3 {
+        let (page, next) = catalog.search(&filter, cursor, 1).await.unwrap();
+        seen.extend(page.into_iter().map(|record| record.id));
+        // Through the token, because the token is all a client ever holds and
+        // the token is where the resolution used to be lost.
+        cursor = next.map(|next| next.to_string().parse::<Cursor>().unwrap());
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    seen.sort();
+    seen.dedup();
+    assert_eq!(
+        seen.len(),
+        2,
+        "keyset paging dropped a record sharing a millisecond with another"
+    );
+}
+
+/// The same mismatch defeated the `dedup_by_key` that covers a flush landing
+/// between the ClickHouse query and the buffer snapshot: the flushed copy of a
+/// record was truncated to its millisecond and the buffered copy was not, so a
+/// third record could sort between the two copies, and non-adjacent duplicates
+/// are exactly what `dedup_by_key` cannot remove.
+#[tokio::test]
+async fn a_record_in_both_the_index_and_the_buffer_is_returned_once() {
+    let data_dir = test_data_dir();
+    let config = test_config(&data_dir, None);
+    let source = test_source(&data_dir);
+    let catalog = Catalog::connect(&config).await.unwrap();
+    let millisecond = Utc::now().trunc_subsecs(3) - TimeDelta::seconds(1);
+    let mut duplicated = sample_record(&source, 900);
+    duplicated.received_at = millisecond + TimeDelta::microseconds(900);
+    catalog.insert(duplicated.clone()).await.unwrap();
+    catalog.flush().await.unwrap();
+    // The state that race leaves behind: the index holds the record, the buffer
+    // holds it again, and a third record is dated between the two copies.
+    catalog.insert(duplicated).await.unwrap();
+    let mut between = sample_record(&source, 400);
+    between.received_at = millisecond + TimeDelta::microseconds(400);
+    catalog.insert(between).await.unwrap();
+
+    let filter = RecordFilter {
+        source: Some(source),
+        ..RecordFilter::default()
+    };
+    let (page, _) = catalog.search(&filter, None, 10).await.unwrap();
+    let mut ids: Vec<_> = page.iter().map(|record| record.id).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 2, "a page lost a record");
+    assert_eq!(page.len(), ids.len(), "a page returned one record twice");
 }
 
 #[tokio::test]
