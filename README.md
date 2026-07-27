@@ -19,17 +19,24 @@
 - PostgreSQL 保存采集幂等状态和下载任务，Kafka/Redpanda 解耦索引与导出工作负载。
 - 管理台提供用户登录、管理员用户管理和公开注册开关；公开注册用户必须在 24 小时内完成邮箱验证。
 
-默认本地后端用于零依赖开发和接口测试；生产环境使用 `.env.example` 中的基础设施配置。规模设计、单条读取原理和上线清单见 [docs/architecture.md](docs/architecture.md)。
+记录索引持久化在 ClickHouse，幂等与下载任务在 PostgreSQL，两套 schema 由 API 启动时幂等应用；
+启动时还会扫描 pack 目录，把索引里缺失的记录补回来。规模设计、单条读取原理和上线清单见
+[docs/architecture.md](docs/architecture.md)。
 
 ## 快速启动
 
-要求 Rust 1.85+。
+要求 Rust 1.85+，以及可连通的 PostgreSQL 与 ClickHouse（数据库不可用时 API 会拒绝启动，
+而不是提供一个空索引）。
 
 ```bash
 cp .env.example .env
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres clickhouse
 make install
 make dev
 ```
+
+`cargo test` 同样直接跑真实 SQL，需要上面两个容器在 `127.0.0.1` 上可达；
+CI 用 GitHub Actions 的 service container 提供。
 
 测试接口：
 
@@ -42,7 +49,8 @@ curl -X POST http://localhost:8000/api/v1/records \
   --data-binary @game.mjai
 ```
 
-本地模式响应 `202 Accepted` 时已经写入 pack 并建立内存索引；生产模式将在 Kafka 确认持久化后返回，并由 worker 异步建索引。
+响应 `202 Accepted` 时记录已写入 pack 并取得幂等占用，索引行随批次刷入 ClickHouse；
+进程在刷入前退出的记录会在下次启动的 pack 扫描中补建索引。生产模式将在 Kafka 确认持久化后返回。
 
 批量上传（归档内每个文件独立校验和去重）：
 

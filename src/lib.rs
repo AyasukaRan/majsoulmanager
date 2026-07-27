@@ -1,12 +1,14 @@
 pub mod api;
 pub mod auth;
 pub mod catalog;
+pub mod clickhouse;
 pub mod config;
 pub mod majsoul;
 pub mod managed_watch;
 pub mod mihomo;
 pub mod mjai;
 pub mod pack;
+pub mod recovery;
 pub mod watch;
 pub mod watch_log;
 pub mod watch_service;
@@ -36,13 +38,19 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn local(config: Config) -> anyhow::Result<Self> {
+    pub async fn local(config: Config) -> anyhow::Result<Self> {
         let data_dir = config.data_dir.clone();
         let pack_dir = data_dir.join("packs");
         let export_dir = data_dir.join("exports");
         std::fs::create_dir_all(&export_dir)?;
         let packs = Arc::new(PackStore::new(pack_dir, config.pack_target_bytes)?);
-        let catalog = Arc::new(Catalog::default());
+        let catalog = Arc::new(Catalog::connect(&config).await?);
+        // Before anything is served: an index missing rows would let the API
+        // report a record as absent while its bytes sit in a pack.
+        let recovered = recovery::recover(&catalog, &packs).await?;
+        if recovered > 0 {
+            tracing::info!(recovered, "re-indexed pack entries missing from the index");
+        }
         let auth = Arc::new(AuthStore::new(
             &data_dir,
             &config.admin_email,

@@ -44,6 +44,35 @@ pub struct Config {
     )]
     pub pack_target_bytes: u64,
 
+    /// Defaults address the Compose service names; nothing publishes a host
+    /// port, so the databases are only reachable from inside the network.
+    #[arg(
+        long,
+        env = "MJAI_POSTGRES_DSN",
+        default_value = "postgres://mjai:mjai@postgres:5432/mjai"
+    )]
+    pub postgres_dsn: String,
+
+    #[arg(
+        long,
+        env = "MJAI_CLICKHOUSE_URL",
+        default_value = "http://clickhouse:8123"
+    )]
+    pub clickhouse_url: String,
+
+    #[arg(long, env = "MJAI_CLICKHOUSE_USER", default_value = "mjai")]
+    pub clickhouse_user: String,
+
+    #[arg(long, env = "MJAI_CLICKHOUSE_PASSWORD", default_value = "mjai")]
+    pub clickhouse_password: String,
+
+    /// The API container starts alongside its databases, so a connection
+    /// refused during this window is expected rather than fatal. Past it the
+    /// process exits: an API serving an empty index looks exactly like data
+    /// loss, and a crash loop is the only failure mode that is visible.
+    #[arg(long, env = "MJAI_DATABASE_WAIT_SECS", default_value_t = 120)]
+    pub database_wait_secs: u64,
+
     #[arg(
         long,
         env = "MJAI_MIHOMO_CONTROLLER_URL",

@@ -5,6 +5,10 @@ WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+# The binary applies both schemas itself, so they are `include_str!`d into it:
+# the initdb mounts only run when a data volume is first created and cannot
+# reach an existing deployment.
+COPY migrations ./migrations
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim AS runtime

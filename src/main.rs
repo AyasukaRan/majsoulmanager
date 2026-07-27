@@ -19,13 +19,19 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("{warning}");
     }
     let listen = config.listen.clone();
-    let state = AppState::local(config)?;
+    let state = AppState::local(config).await?;
     state.watch_service.start_if_enabled().await?;
     let listener = TcpListener::bind(&listen).await?;
     tracing::info!(%listen, "mjai management API listening");
-    axum::serve(listener, api::router(state))
+    axum::serve(listener, api::router(state.clone()))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    // The startup pack scan would re-index whatever is still buffered, but only
+    // under `source = recovered`, because the pack bytes do not carry the
+    // original source. Flushing on a planned shutdown keeps it.
+    if let Err(error) = state.catalog.flush().await {
+        tracing::error!(%error, "could not flush the record index on shutdown");
+    }
     Ok(())
 }
 

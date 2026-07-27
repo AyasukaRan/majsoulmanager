@@ -821,8 +821,11 @@ async fn watch_session(
                 .registry
                 .apply(event(&game, WatchEventKind::Converting, None, None))?;
             let metadata = metadata_for(&game)?;
-            match convert_record_bytes(&raw, Some(&metadata))
-                .and_then(|(_, compressed)| ingest(&game.uuid, &compressed, dependencies))
+            match async {
+                let (_, compressed) = convert_record_bytes(&raw, Some(&metadata))?;
+                ingest(&game.uuid, &compressed, dependencies).await
+            }
+            .await
             {
                 Ok(record_id) => {
                     dependencies.registry.apply(event(
@@ -852,7 +855,7 @@ async fn watch_session(
     }
 }
 
-fn ingest(
+async fn ingest(
     game_uuid: &str,
     compressed: &[u8],
     dependencies: &ManagedWatchDependencies,
@@ -864,31 +867,46 @@ fn ingest(
     let sha256 = hex::encode(Sha256::digest(&raw));
     let id = Uuid::new_v4();
     let idempotency_key = format!("majsoul-watch\0{game_uuid}");
-    match dependencies.catalog.claim(&idempotency_key, id, &sha256)? {
+    match dependencies
+        .catalog
+        .claim(&idempotency_key, id, &sha256)
+        .await?
+    {
         IdempotencyClaim::Existing(record) => Ok(record.id),
         IdempotencyClaim::New => {
             let location = match dependencies.packs.append(id, &raw) {
                 Ok(location) => location,
                 Err(error) => {
-                    dependencies.catalog.abandon_claim(&idempotency_key, id);
+                    // Keep the pack failure as the reported cause; a leaked
+                    // claim only delays a retry of this one game uuid.
+                    if let Err(claim) = dependencies
+                        .catalog
+                        .abandon_claim(&idempotency_key, id)
+                        .await
+                    {
+                        tracing::warn!(%claim, "could not release the idempotency claim");
+                    }
                     return Err(error.into());
                 }
             };
-            dependencies.catalog.insert(Record {
-                id,
-                source: "majsoul-watch".into(),
-                sha256,
-                received_at: Utc::now(),
-                played_at: game_uuid
-                    .get(0..6)
-                    .and_then(|value| chrono::NaiveDate::parse_from_str(value, "%y%m%d").ok())
-                    .and_then(|date| date.and_hms_opt(0, 0, 0))
-                    .map(|date| Utc.from_utc_datetime(&date)),
-                players: metadata.players,
-                rule: metadata.rule,
-                event_count: metadata.event_count,
-                storage: location,
-            });
+            dependencies
+                .catalog
+                .insert(Record {
+                    id,
+                    source: "majsoul-watch".into(),
+                    sha256,
+                    received_at: Utc::now(),
+                    played_at: game_uuid
+                        .get(0..6)
+                        .and_then(|value| chrono::NaiveDate::parse_from_str(value, "%y%m%d").ok())
+                        .and_then(|date| date.and_hms_opt(0, 0, 0))
+                        .map(|date| Utc.from_utc_datetime(&date)),
+                    players: metadata.players,
+                    rule: metadata.rule,
+                    event_count: metadata.event_count,
+                    storage: location,
+                })
+                .await?;
             Ok(id)
         }
     }
