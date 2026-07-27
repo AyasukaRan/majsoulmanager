@@ -406,7 +406,13 @@ fn ingest_one(
     played_at: Option<DateTime<Utc>>,
     body: &[u8],
 ) -> Result<IngestResponse, ApiError> {
-    if body.is_empty() || body.len() > state.config.max_record_bytes {
+    // Reported separately from the size limit: a batch that stores nothing now
+    // answers 422, so this error string becomes the operator's whole diagnosis,
+    // and calling an empty record oversized points them at the wrong knob.
+    if body.is_empty() {
+        return Err(ApiError::BadRequest("record is empty".into()));
+    }
+    if body.len() > state.config.max_record_bytes {
         return Err(ApiError::PayloadTooLarge(state.config.max_record_bytes));
     }
     let metadata =

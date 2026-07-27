@@ -438,6 +438,27 @@ async fn stops_reading_a_member_that_inflates_past_the_record_limit() {
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 
+/// A wholesale batch failure answers 422, so its error list is the only diagnosis the operator
+/// gets. Reporting an empty record as an oversized one sends them to the wrong knob.
+#[tokio::test]
+async fn names_an_empty_member_as_empty_rather_than_oversized() {
+    let (state, data_dir) = test_state();
+    let app = api::router(state);
+
+    let response = app
+        .oneshot(batch_request(
+            "batch-empty",
+            tar_of(&[("empty.mjson", gzip(b""))]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let json = json_body(response).await;
+    assert_eq!(json["rejected"], 1);
+    assert_eq!(json["errors"][0], "empty.mjson: record is empty");
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
 /// `gzip -c a b > c`, and every block-gzip writer, produce a file of concatenated gzip streams.
 /// Decoding only the first stores a truncated record and indexes it as complete.
 #[tokio::test]
