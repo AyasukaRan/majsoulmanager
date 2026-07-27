@@ -98,6 +98,18 @@ ClickHouse 是记录级索引的事实来源，表定义见 `migrations/clickhou
 - `.mjpack` header 包含 UUID 和长度，可以离线扫描 RustFS 重建 ClickHouse 索引。
 - SHA-256 用于端到端完整性，不把对象 ETag 当内容哈希。
 
+重放能收敛的前提是排序键在重放前后逐列相同。`received_at` 因此取 Kafka 消息自带的时间戳——由生产者在采集入口打上——而不是消费者的 `Utc::now()`：它同时是分区键和 `ORDER BY` 的第一列，重放时若按当时的时钟重新生成，`ReplacingMergeTree` 会认为那是另一行，于是同一条记录在索引里留下两份而不是收敛成一份。`record_id` 同理，由 API 在占位时分配、存进 PostgreSQL、作为 Kafka message key 一路带下来。`pack_key` 和 `pack_offset` 不在排序键里，允许重放前后不同，旧的那个 pack 变成 orphan 由 GC 回收。
+
+## 运行时依赖与参数
+
+| 事项 | 位置 | 说明 |
+|---|---|---|
+| 消费位点 | PostgreSQL `kafka_offsets` | rskafka 没有 consumer group，位点必须自己存；放在 PostgreSQL 是因为事务性状态本来就在那里。代价是每个 partition 只能有一个消费者，多副本会互相覆盖位点。 |
+| topic 保留 | `deploy/redpanda/bootstrap.yml` | `retention_bytes` / `log_retention_ms` 是 cluster property，写在容器命令行的 `--set` 会被 broker 忽略（只在 redpanda.yaml 留一行日志）。bootstrap 文件只在数据卷为空的首次启动读取，之后改用 `rpk cluster config set`。按 641,475 局历史导入、单条 p50 53,668 字节估算约 34.4GB，配 40GiB 上限。 |
+| 积压上限 | `MJAI_KAFKA_MAX_LAG`（默认 50000） | 后台每 5 秒采样一次 high watermark 与已提交位点之差；超过上限时采集入口直接拒绝，单条和批量都以 `500` 结束——记录没丢，但采集器必须退避到 worker 把 topic 消费下去为止。这样 topic 不会涨过保留上限、把已经回过 `202` 的记录悄悄丢掉。采样有滞后，因此是软上限；设成 `0` 等于关闭采集而不必停进程。 |
+| pack 封包 | `MJAI_PACK_TARGET_BYTES` / `MJAI_PACK_MAX_AGE_SECS` | 尺寸或年龄先到者封包。只看尺寸的话，低峰期的记录要等攒满 256MB 才可查，按当前采集速率是数周。 |
+| orphan 回收 | `MJAI_GC_GRACE_SECS`（默认 24 小时） | 比宽限期年轻的对象一律不删：上传已完成、索引还在路上的 pack，和写入者中途死掉留下的 pack，从外面看完全一样。清单查询失败或返回空时整轮放弃删除——空清单和“索引正常但没数据”同样无法区分，按空清单处理会删光语料。 |
+
 ## 容量估算
 
 先用真实样本测量，不用“10KB 上限”直接采购。若平均原文为 5KB：
@@ -112,7 +124,9 @@ ClickHouse 是记录级索引的事实来源，表定义见 `migrations/clickhou
 ## 上线前缺口
 
 - tar.zst 解码（tar 与 tar.gz 已支持）。
-- packer/indexer 与 exporter worker 二进制：目前是 API 进程内的任务，多副本部署会重复消费同一批 partition。
+- packer/indexer 与 exporter worker 二进制：目前是 API 进程内的任务（每 partition 一个）。位点在 PostgreSQL 且没有任何 rebalance，多副本会从同一行位点各消费一遍、互相覆盖，因此现阶段 API 只能单副本。
+- Redpanda 单节点单 partition、无副本：broker 数据卷损坏等于丢掉尚未打包的那一段记录；上线前至少要给这个卷单独的可靠存储或备份。
+- 历史 pack 上传对象存储后本地副本保留，容量按两份算。确认对象存储读取无误之前不删，删除动作留给人工。
 - JWT/RBAC、租户隔离、审计日志和限流。
 - OpenTelemetry 指标、追踪、DLQ 与重放（orphan GC 已实现）。
 - 真实数据压测、备份恢复演练和 schema 演进策略。

@@ -254,10 +254,11 @@ impl Kafka {
         // Retention, `retention.ms`, `retention.bytes` and `max.message.bytes`
         // cannot be set from here at all: rskafka hardcodes an empty config
         // list on CreateTopics and implements no AlterConfigs, so there is no
-        // client-side knob to look for. They are cluster properties passed to
-        // the broker on its command line in docker-compose.yml, under the
-        // `redpanda` service's `command:` list as `--set` arguments — that is
-        // where to change them, not here.
+        // client-side knob to look for. They are Redpanda cluster properties,
+        // and the command line cannot carry those either — `--set` puts them in
+        // redpanda.yaml, where the broker ignores them. They live in
+        // deploy/redpanda/bootstrap.yml, which is read on a first boot against
+        // an empty data volume, and `rpk cluster config set` after that.
         let controller = client.controller_client()?;
         match bounded(
             CONTROL_TIMEOUT,

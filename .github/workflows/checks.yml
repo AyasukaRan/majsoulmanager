@@ -12,36 +12,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
-    # tests/api.rs drives the real record index and idempotency store; without
-    # these the SQL would only ever be checked by hand.
-    services:
-      postgres:
-        image: postgres:17-alpine
-        env:
-          POSTGRES_USER: mjai
-          POSTGRES_PASSWORD: mjai
-          POSTGRES_DB: mjai
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U mjai"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 20
-
-      clickhouse:
-        image: clickhouse/clickhouse-server:25.3-alpine
-        env:
-          CLICKHOUSE_USER: mjai
-          CLICKHOUSE_PASSWORD: mjai
-        ports:
-          - 8123:8123
-        options: >-
-          --health-cmd "wget --spider -q http://127.0.0.1:8123/ping"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 20
-
+    # No `services:` block. tests/api.rs needs four containers now, and three of
+    # them — the schema mounts, the Redpanda command line, the bucket sidecar —
+    # are already described in the repository's own Compose files. A service
+    # container block would be a second copy of image tags, ports, credentials
+    # and flags that nobody updates when Compose changes, so CI starts the same
+    # stack a developer starts, through the same Makefile target.
     env:
       MJAI_POSTGRES_DSN: postgres://mjai:mjai@127.0.0.1:5432/mjai
       MJAI_CLICKHOUSE_URL: http://127.0.0.1:8123
@@ -49,42 +25,16 @@ jobs:
       MJAI_CLICKHOUSE_PASSWORD: mjai
       MJAI_KAFKA_BOOTSTRAP_SERVERS: 127.0.0.1:9092
       MJAI_S3_ENDPOINT_URL: http://127.0.0.1:9000
-      AWS_ACCESS_KEY_ID: rustfsadmin
-      AWS_SECRET_ACCESS_KEY: rustfsadmin
-      AWS_DEFAULT_REGION: us-east-1
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
-      # Not service containers: neither image runs as a broker or an object
-      # store on its default command, and a service container cannot override
-      # one. Ingest produces to Redpanda before it answers, and the pack worker
-      # uploads to RustFS before it indexes, so the suite needs both.
-      - name: Start Redpanda and RustFS
-        run: |
-          docker run -d --name redpanda -p 9092:9092 redpandadata/redpanda:v25.1.3 \
-            redpanda start --overprovisioned --smp=1 --memory=1G --reserve-memory=0M \
-            --node-id=0 --kafka-addr=external://0.0.0.0:9092 \
-            --advertise-kafka-addr=external://127.0.0.1:9092
-          docker run -d --name rustfs -p 9000:9000 \
-            -e RUSTFS_ACCESS_KEY=rustfsadmin -e RUSTFS_SECRET_KEY=rustfsadmin \
-            rustfs/rustfs:latest /data
-          # A broker that is up but has not elected a leader fails
-          # `partition_client`, and a bucket that does not exist fails every
-          # upload, so both are waited for rather than assumed.
-          for _ in $(seq 60); do
-            docker exec redpanda rpk cluster health | grep -q 'Healthy:.*true' && break
-            sleep 2
-          done
-          for _ in $(seq 60); do
-            aws --endpoint-url http://127.0.0.1:9000 s3api create-bucket \
-              --bucket mjai-raw >/dev/null 2>&1 && break
-            aws --endpoint-url http://127.0.0.1:9000 s3api head-bucket \
-              --bucket mjai-raw >/dev/null 2>&1 && break
-            sleep 2
-          done
-          aws --endpoint-url http://127.0.0.1:9000 s3api head-bucket --bucket mjai-raw
+      # The target waits for every health check and for the bucket, so nothing
+      # here has to poll: a half-started broker or a missing bucket fails this
+      # step rather than one arbitrary test.
+      - name: Start the test infrastructure
+        run: make test-infra
 
       - name: Install Rust 1.95
         run: |
@@ -92,7 +42,7 @@ jobs:
           rustup default 1.95.0
 
       - name: Cache Cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -121,10 +71,10 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22.13.0
           cache: npm
