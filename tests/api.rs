@@ -541,11 +541,13 @@ async fn a_clickhouse_that_never_answers_gives_up_at_the_startup_deadline() {
     sink.abort();
 }
 
-/// Reads used to flush the insert buffer so that they could see recent writes,
-/// which meant any read traffic cut the batch down to whatever had arrived
-/// since the last read — a MergeTree part per record under a polling console.
+/// Writes batch until something reads, and a read then sees its own write. A
+/// read gets there by flushing the buffer rather than merging it into the page:
+/// the merge had to reproduce ClickHouse's ordering and filtering in Rust, and
+/// twice did not. What batching is worth is asserted first — an insert on its
+/// own must not reach the index.
 #[tokio::test]
-async fn a_read_sees_a_buffered_record_without_flushing_the_batch() {
+async fn a_read_flushes_the_buffer_and_sees_its_own_write() {
     let (state, data_dir) = test_state().await;
     let source = test_source(&data_dir);
     let config = test_config(&data_dir, None);
@@ -557,6 +559,11 @@ async fn a_read_sees_a_buffered_record_without_flushing_the_batch() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        indexed_rows(&config, &source).await,
+        0,
+        "an insert reached the index before the batch was full"
+    );
 
     let response = app
         .oneshot(
@@ -579,11 +586,9 @@ async fn a_read_sees_a_buffered_record_without_flushing_the_batch() {
 
     assert_eq!(
         indexed_rows(&config, &source).await,
-        0,
-        "the read flushed the batch instead of merging the buffer"
+        1,
+        "the read answered from somewhere other than the index it flushed into"
     );
-    state.catalog.flush().await.unwrap();
-    assert_eq!(indexed_rows(&config, &source).await, 1);
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 
@@ -771,11 +776,10 @@ async fn pages_two_records_that_share_one_millisecond() {
     );
 }
 
-/// The same mismatch defeated the `dedup_by_key` that covers a flush landing
-/// between the ClickHouse query and the buffer snapshot: the flushed copy of a
-/// record was truncated to its millisecond and the buffered copy was not, so a
-/// third record could sort between the two copies, and non-adjacent duplicates
-/// are exactly what `dedup_by_key` cannot remove.
+/// A retried flush sends rows the index already holds, so the same record can
+/// reach ClickHouse twice. Collapsing that pair is `FINAL`'s job and nothing
+/// else's now that reads flush rather than merge — which only works while the
+/// two copies land on the same sorting key, and `received_at` is part of it.
 #[tokio::test]
 async fn a_record_in_both_the_index_and_the_buffer_is_returned_once() {
     let data_dir = test_data_dir();
@@ -804,6 +808,110 @@ async fn a_record_in_both_the_index_and_the_buffer_is_returned_once() {
     ids.dedup();
     assert_eq!(ids.len(), 2, "a page lost a record");
     assert_eq!(page.len(), ids.len(), "a page returned one record twice");
+}
+
+/// Three ids whose ClickHouse order is the exact reverse of their `Uuid: Ord`
+/// order: ClickHouse compares a UUID as (low 64 bits, high 64 bits) while Rust
+/// compares the sixteen bytes big-endian. A random 32 bit prefix, shared by both
+/// halves so it cancels out of either comparison, keeps each run's ids distinct
+/// in the durable index.
+fn ids_that_sort_opposite_ways() -> [Uuid; 3] {
+    let tag = Uuid::new_v4().as_u64_pair().0 & 0xffff_ffff_0000_0000;
+    [0u64, 1, 2].map(|nth| Uuid::from_u64_pair(tag | nth, tag | (2 - nth)))
+}
+
+/// The page order is `(received_at DESC, record_id DESC)`, so a timestamp tie
+/// leaves the whole page order resting on the collation of `record_id` — and
+/// Rust and ClickHouse do not agree on it. Reads used to sort ClickHouse's
+/// answer again in Rust and take the cursor from that second order, so the next
+/// page's SQL comparison, made in ClickHouse's order, excluded rows the client
+/// had never been handed. Millisecond truncation made ties ordinary rather than
+/// exotic: a tar batch import puts several records in one millisecond.
+#[tokio::test]
+async fn pages_a_timestamp_tie_that_lives_in_the_index() {
+    let data_dir = test_data_dir();
+    let config = test_config(&data_dir, None);
+    let source = test_source(&data_dir);
+    let catalog = Catalog::connect(&config).await.unwrap();
+    let ids = ids_that_sort_opposite_ways();
+    assert!(
+        ids[0] < ids[1] && ids[1] < ids[2],
+        "the ids no longer straddle the two collations, so this test proves nothing"
+    );
+    // A second back so the records stay inside the window `search` bounds to
+    // `now`, which is read after they are written.
+    let millisecond = Utc::now().trunc_subsecs(3) - TimeDelta::seconds(1);
+    for (index, id) in ids.iter().enumerate() {
+        let mut record = sample_record(&source, index as u32);
+        record.id = *id;
+        record.received_at = millisecond;
+        catalog.insert(record).await.unwrap();
+    }
+    // The rows have to be in ClickHouse, not the buffer: the buffer never sees
+    // the SQL `ORDER BY` or the SQL cursor comparison that lost them.
+    catalog.flush().await.unwrap();
+    assert_eq!(indexed_rows(&config, &source).await, 3);
+
+    let filter = RecordFilter {
+        source: Some(source),
+        ..RecordFilter::default()
+    };
+    let mut seen = Vec::new();
+    let mut cursor = None;
+    for _ in 0..4 {
+        let (page, next) = catalog.search(&filter, cursor, 1).await.unwrap();
+        seen.extend(page.into_iter().map(|record| record.id));
+        // Through the token, because a token is all a client ever holds.
+        cursor = next.map(|next| next.to_string().parse::<Cursor>().unwrap());
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    assert_eq!(
+        seen.len(),
+        3,
+        "keyset paging over a timestamp tie in the index returned {seen:?}"
+    );
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len(), 3, "a page repeated a record");
+}
+
+/// `page` sends every bound over the wire floored to milliseconds, because that
+/// is the resolution the column has. The buffer used to be compared against the
+/// same bound at full precision, so a `received_from` inside the millisecond a
+/// record was truncated to answered nothing before a flush and one record after
+/// it. `RecordQuery` parses RFC 3339, which admits sub-millisecond bounds.
+#[tokio::test]
+async fn a_sub_millisecond_bound_answers_the_same_before_and_after_a_flush() {
+    let data_dir = test_data_dir();
+    let config = test_config(&data_dir, None);
+    let source = test_source(&data_dir);
+    let catalog = Catalog::connect(&config).await.unwrap();
+    let millisecond = Utc::now().trunc_subsecs(3) - TimeDelta::seconds(1);
+    let bound = millisecond + TimeDelta::microseconds(400);
+    let mut record = sample_record(&source, 400);
+    record.received_at = bound;
+    catalog.insert(record).await.unwrap();
+
+    let filter = RecordFilter {
+        source: Some(source),
+        received_from: Some(bound),
+        ..RecordFilter::default()
+    };
+    let (before, _) = catalog.search(&filter, None, 10).await.unwrap();
+    catalog.flush().await.unwrap();
+    let (after, _) = catalog.search(&filter, None, 10).await.unwrap();
+    // One, not zero: the record is stored at the bottom of its millisecond, so
+    // flooring an inclusive `from` bound to the same millisecond is the only
+    // answer that does not drop it.
+    assert_eq!(after.len(), 1, "a floored bound dropped its own record");
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "a sub-millisecond bound answered differently before and after a flush"
+    );
 }
 
 #[tokio::test]

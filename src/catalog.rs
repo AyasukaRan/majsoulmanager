@@ -1,5 +1,4 @@
 use std::{
-    cmp::Reverse,
     fmt,
     future::Future,
     str::FromStr,
@@ -172,10 +171,11 @@ pub enum IdempotencyClaim {
 pub struct Catalog {
     index: ClickHouse,
     postgres: sqlx::PgPool,
-    /// Records packed and claimed but not yet in a ClickHouse part. Reads
-    /// answer from here so that a caller still reads its own write inside the
-    /// batching window. This lock is never held across a ClickHouse call: one
-    /// slow insert would otherwise block every read behind it.
+    /// Records packed and claimed but not yet in a ClickHouse part. `get` reads
+    /// it directly — an id match needs no ordering and no filter, so it cannot
+    /// disagree with the index — while `page` flushes it and reads only the
+    /// index. This lock is never held across a ClickHouse call: one slow insert
+    /// would otherwise block every read behind it.
     pending: Mutex<Vec<Record>>,
     /// Held for the whole of a flush, so two concurrent flushes cannot send and
     /// then discard the same rows. Separate from `pending` precisely because it
@@ -349,15 +349,13 @@ impl Catalog {
     }
 
     pub async fn insert(&self, mut record: Record) -> Result<(), CatalogError> {
-        // Milliseconds are the one resolution the buffer, the index and the
-        // cursor can all agree on: the columns are DateTime64(3) and a cursor
-        // token is epoch millis. A buffered row kept at `Utc::now()`'s
-        // nanosecond precision hands back a cursor that truncates below it, so
-        // every row in between is skipped on the next page as well as this one,
-        // and it sorts away from its own flushed copy instead of next to it
-        // where `dedup_by_key` can see the pair. Every producer of a `Record`
-        // reaches the buffer through here, so this is the only place it needs
-        // doing.
+        // Milliseconds are the resolution the index and the cursor both have:
+        // the columns are DateTime64(3) and a cursor token is epoch millis.
+        // Truncating on the way in means a record `get` answers out of the
+        // buffer carries the timestamp the index will hand back once it is
+        // flushed, so a caller reading twice either side of a flush does not see
+        // it move. Every producer of a `Record` reaches the buffer through here,
+        // so this is the only place it needs doing.
         record.received_at = record.received_at.trunc_subsecs(3);
         record.played_at = record.played_at.map(|at| at.trunc_subsecs(3));
         let full = {
@@ -466,6 +464,19 @@ impl Catalog {
         cursor: Option<Cursor>,
         limit: usize,
     ) -> Result<(Vec<Record>, Option<Cursor>), CatalogError> {
+        // A page is ordered by `(received_at DESC, record_id DESC)`, so a
+        // timestamp tie rests the whole order on the collation of `record_id` —
+        // and ClickHouse compares a UUID as (low 64 bits, high 64 bits) while
+        // `Uuid: Ord` compares the sixteen bytes big-endian. Merging the buffer
+        // in Rust therefore needs Rust to reproduce ClickHouse's collation for
+        // every column the cursor touches, and the buffer-side filter to
+        // reproduce every `WHERE` clause built below. Two attempts at that lost
+        // records; flushing first leaves one sort, one filter and one collation,
+        // all of them ClickHouse's, with nothing to reconcile. It costs one
+        // insert round-trip on the first read after a write, and nothing at all
+        // on a read that follows one — an empty flush never leaves the process.
+        self.flush().await?;
+
         // FINAL collapses rows a replayed insert batch duplicated;
         // ReplacingMergeTree otherwise only dedups within a merged part.
         let mut sql = format!("SELECT {RECORD_COLUMNS} FROM {RECORDS_TABLE} FINAL WHERE 1");
@@ -521,26 +532,6 @@ impl Catalog {
 
         let rows: Vec<RecordRow> = self.index.query(&sql, &params).await?;
         let mut records: Vec<Record> = rows.into_iter().map(Record::from).collect();
-
-        // Buffered rows are merged in rather than flushed. Flushing here would
-        // make every read cut the batch down to whatever had arrived since the
-        // last one, which under a collector plus a polling console is close to
-        // a MergeTree part per record. Both sides are already the top `limit+1`
-        // of their own set under the same order, so sorting the concatenation
-        // and cutting it again yields exactly the page.
-        {
-            let pending = self.pending.lock().await;
-            records.extend(
-                pending
-                    .iter()
-                    .filter(|record| matches_page(record, filter, cursor))
-                    .cloned(),
-            );
-        }
-        records.sort_by_key(|record| Reverse((record.received_at, record.id)));
-        // A flush between the query and the snapshot can return a row twice.
-        records.dedup_by_key(|record| record.id);
-        records.truncate(limit + 1);
 
         let next_cursor = (records.len() > limit).then(|| {
             records.truncate(limit);
@@ -683,33 +674,6 @@ impl Catalog {
             error: row.try_get("error")?,
         }))
     }
-}
-
-/// The buffer-side twin of the `WHERE` clause `page` builds. The `played_at`
-/// arms use `is_some_and` because the SQL comparisons are NULL, and therefore
-/// false, for a record with no `played_at`.
-fn matches_page(record: &Record, filter: &RecordFilter, cursor: Option<Cursor>) -> bool {
-    filter
-        .source
-        .as_ref()
-        .is_none_or(|source| *source == record.source)
-        && filter
-            .player
-            .as_ref()
-            .is_none_or(|player| record.players.contains(player))
-        && filter
-            .received_from
-            .is_none_or(|from| record.received_at >= from)
-        && filter.received_to.is_none_or(|to| record.received_at < to)
-        && filter
-            .played_from
-            .is_none_or(|from| record.played_at.is_some_and(|at| at >= from))
-        && filter
-            .played_to
-            .is_none_or(|to| record.played_at.is_some_and(|at| at < to))
-        && cursor.is_none_or(|cursor| {
-            (record.received_at, record.id) < (cursor.received_at, cursor.record_id)
-        })
 }
 
 fn record_json(record: &Record) -> String {
