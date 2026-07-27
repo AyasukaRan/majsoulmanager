@@ -163,6 +163,9 @@ pub(crate) async fn run(
     let state_path = dependencies
         .data_dir
         .join(format!("watch/state-{}.json", instance.id));
+    let discovery_dir = dependencies
+        .data_dir
+        .join(format!("watch/discovered/{}", instance.id));
     // Shared: the gateway, package version and version floor are properties of
     // the Majsoul deployment, not of the account, so instances benefit from
     // each other's lookups.
@@ -222,6 +225,7 @@ pub(crate) async fn run(
                     &dependencies,
                     &source,
                     &modes,
+                    &discovery_dir,
                     &client_version,
                     &state_path,
                     &mut tracked,
@@ -701,6 +705,7 @@ async fn watch_session(
     dependencies: &ManagedWatchDependencies,
     source: &str,
     modes: &[i32],
+    discovery_dir: &Path,
     client_version: &str,
     state_path: &Path,
     tracked: &mut HashMap<String, LiveGame>,
@@ -723,6 +728,14 @@ async fn watch_session(
                 dependencies
                     .registry
                     .apply(event(&game, WatchEventKind::Live, None, None))?;
+                // A uuid in the live list is a game that exists; the paipu just
+                // is not written yet. Record it the moment it is seen, before
+                // any fetching, so the fact survives whatever happens to the
+                // working queue afterwards — including this process dying mid
+                // round, or the entry being dropped as unfetchable.
+                if !tracked.contains_key(&game.uuid) {
+                    append_discovered(discovery_dir, &game);
+                }
                 live_now.insert(game.uuid.clone(), game);
             }
             tokio::time::sleep(Duration::from_millis(config.request_delay_ms)).await;
@@ -780,7 +793,9 @@ async fn watch_session(
                         // disappearance from the live list, but not for hours;
                         // past that it is never coming and the entry would
                         // otherwise be retried every poll for the life of the
-                        // process.
+                        // process. Dropping it loses no information: the uuid
+                        // was written to the discovery log when it was first
+                        // seen live.
                         if game
                             .queued_at
                             .is_some_and(|queued| now.saturating_sub(queued) > GIVE_UP_SECS)
@@ -992,6 +1007,36 @@ fn load_first_account(secret_ref: &str) -> Result<(String, String)> {
     anyhow::bail!("account secret contains no usable account")
 }
 
+/// Append-only record of every game uuid this collector has ever seen live.
+///
+/// The state file is a working queue — entries leave it once fetched or given
+/// up on — so it is not a record of what existed. This is: one JSON object per
+/// line, appended the moment a uuid appears in the live list, rotated by UTC
+/// day so a long-running collector does not accumulate one enormous file.
+/// Failures are logged and swallowed: losing the audit trail must never stop
+/// collection.
+fn append_discovered(discovery_dir: &Path, game: &LiveGame) {
+    let entry = serde_json::json!({
+        "uuid": game.uuid,
+        "mode_id": game.mode_id,
+        "start_time": game.start_time,
+        "discovered_at": Utc::now().to_rfc3339(),
+    });
+    let path = discovery_dir.join(format!("{}.jsonl", Utc::now().format("%Y-%m-%d")));
+    let appended = std::fs::create_dir_all(discovery_dir).and_then(|()| {
+        use std::io::Write as _;
+        // O_APPEND keeps concurrent writers from interleaving a short line.
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        writeln!(file, "{entry}")
+    });
+    if let Err(error) = appended {
+        warn!(error = %error, uuid = %game.uuid, "failed to record discovered game uuid");
+    }
+}
+
 fn load_state(path: &Path) -> Result<(Vec<LiveGame>, Vec<LiveGame>)> {
     #[derive(Deserialize)]
     struct State {
@@ -1067,6 +1112,37 @@ mod tests {
 
         // Anything that is not a server answer at all is a transport failure.
         assert!(reconnects_on(&anyhow::Error::msg("connection reset")));
+    }
+
+    #[test]
+    fn discovery_log_appends_every_uuid_and_survives_the_working_queue() {
+        let dir = std::env::temp_dir().join(format!("mjai-disc-{}", Uuid::new_v4().simple()));
+        let game = |uuid: &str| LiveGame {
+            uuid: uuid.into(),
+            mode_id: 12,
+            start_time: 1_700_000_000,
+            queued_at: None,
+        };
+        append_discovered(&dir, &game("260727-aaaa"));
+        append_discovered(&dir, &game("260727-bbbb"));
+
+        let file = std::fs::read_dir(&dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&file)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "each discovery is its own line");
+        assert_eq!(lines[0]["uuid"], "260727-aaaa");
+        assert_eq!(lines[1]["uuid"], "260727-bbbb");
+        assert_eq!(lines[0]["mode_id"], 12);
+        assert!(lines[0]["discovered_at"].is_string());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
