@@ -9,28 +9,37 @@ use flate2::read::GzDecoder;
 use mjai_management::auth::{
     AuthError, AuthSettings, LoginRequest, RegisterRequest, UserRole, VerifyEmailRequest,
 };
+use mjai_management::catalog::Catalog;
+use mjai_management::pack::PackStore;
 use mjai_management::watch::{WatchEvent, WatchEventKind};
-use mjai_management::{AppState, api, config::Config};
+use mjai_management::{AppState, api, config::Config, recovery};
 use serde_json::Value;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-fn test_state() -> (AppState, std::path::PathBuf) {
-    test_state_with_email(None)
-}
-
-fn test_state_with_email(email_api_url: Option<String>) -> (AppState, std::path::PathBuf) {
-    let data_dir = std::env::temp_dir().join(format!("mjai-api-test-{}", Uuid::new_v4()));
-    let state = AppState::local(Config {
+/// The suite talks to the real PostgreSQL and ClickHouse; there is no in-memory
+/// mode left to fall back to, and skipping when they are absent would leave the
+/// SQL untested. `docker compose -f docker-compose.yml -f docker-compose.dev.yml
+/// up -d postgres clickhouse` provides them locally, CI uses service containers.
+fn test_config(data_dir: &std::path::Path, email_api_url: Option<String>) -> Config {
+    Config {
         listen: "127.0.0.1:0".into(),
         api_key: "test-secret".into(),
-        data_dir: data_dir.clone(),
+        data_dir: data_dir.to_path_buf(),
         max_record_bytes: 16 * 1024,
         max_batch_bytes: 1024 * 1024,
         max_batch_records: 100,
         pack_target_bytes: 1024 * 1024,
+        postgres_dsn: env_or(
+            "MJAI_POSTGRES_DSN",
+            "postgres://mjai:mjai@127.0.0.1:5432/mjai",
+        ),
+        clickhouse_url: env_or("MJAI_CLICKHOUSE_URL", "http://127.0.0.1:8123"),
+        clickhouse_user: env_or("MJAI_CLICKHOUSE_USER", "mjai"),
+        clickhouse_password: env_or("MJAI_CLICKHOUSE_PASSWORD", "mjai"),
+        database_wait_secs: 30,
         mihomo_controller_url: "http://127.0.0.1:1".into(),
         mihomo_secret: "test-mihomo-secret".into(),
         mihomo_proxy_url: "http://127.0.0.1:7890".into(),
@@ -40,8 +49,32 @@ fn test_state_with_email(email_api_url: Option<String>) -> (AppState, std::path:
         email_api_url,
         email_api_token: None,
         email_from: "noreply@example.com".into(),
-    })
-    .unwrap();
+    }
+}
+
+fn env_or(key: &str, fallback: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| fallback.to_owned())
+}
+
+fn test_data_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("mjai-api-test-{}", Uuid::new_v4()))
+}
+
+/// Every test shares one durable index, so each one tags its records with a
+/// source nobody else uses instead of relying on an empty table.
+fn test_source(data_dir: &std::path::Path) -> String {
+    data_dir.file_name().unwrap().to_string_lossy().into_owned()
+}
+
+async fn test_state() -> (AppState, std::path::PathBuf) {
+    test_state_with_email(None).await
+}
+
+async fn test_state_with_email(email_api_url: Option<String>) -> (AppState, std::path::PathBuf) {
+    let data_dir = test_data_dir();
+    let state = AppState::local(test_config(&data_dir, email_api_url))
+        .await
+        .unwrap();
     (state, data_dir)
 }
 
@@ -57,28 +90,29 @@ async fn capture_email(
     StatusCode::OK
 }
 
-fn ingest_request(key: &str, body: &'static str) -> Request<Body> {
+fn ingest_request(source: &str, key: &str, body: &'static str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri("/api/v1/records")
         .header(header::AUTHORIZATION, "Bearer test-secret")
         .header(header::CONTENT_TYPE, "application/x-ndjson")
         .header("idempotency-key", key)
-        .header("x-mjai-source", "test-collector")
+        .header("x-mjai-source", source)
         .body(Body::from(body))
         .unwrap()
 }
 
 #[tokio::test]
 async fn ingests_and_reads_one_record_without_reading_a_whole_pack() {
-    let (state, data_dir) = test_state();
+    let (state, data_dir) = test_state().await;
+    let source = test_source(&data_dir);
     let app = api::router(state);
     let raw = r#"{"type":"start_game","names":["a","b","c","d"],"rule":"tonpu"}
 {"type":"start_kyoku","bakaze":"E","kyoku":1}"#;
 
     let response = app
         .clone()
-        .oneshot(ingest_request("game-1", raw))
+        .oneshot(ingest_request(&source, "game-1", raw))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
@@ -103,7 +137,10 @@ async fn ingests_and_reads_one_record_without_reading_a_whole_pack() {
         raw
     );
 
-    let duplicate = app.oneshot(ingest_request("game-1", raw)).await.unwrap();
+    let duplicate = app
+        .oneshot(ingest_request(&source, "game-1", raw))
+        .await
+        .unwrap();
     assert_eq!(duplicate.status(), StatusCode::OK);
     let duplicate_json: Value =
         serde_json::from_slice(&to_bytes(duplicate.into_body(), usize::MAX).await.unwrap())
@@ -115,7 +152,7 @@ async fn ingests_and_reads_one_record_without_reading_a_whole_pack() {
 
 #[tokio::test]
 async fn rejects_unauthenticated_collection() {
-    let (state, data_dir) = test_state();
+    let (state, data_dir) = test_state().await;
     let response = api::router(state)
         .oneshot(
             Request::builder()
@@ -132,7 +169,7 @@ async fn rejects_unauthenticated_collection() {
 
 #[tokio::test]
 async fn logs_in_the_bootstrap_admin_and_protects_user_management() {
-    let (state, data_dir) = test_state();
+    let (state, data_dir) = test_state().await;
     let app = api::router(state);
 
     let response = app
@@ -216,7 +253,7 @@ async fn requires_email_verification_before_a_registered_user_can_log_in() {
         .await
     });
 
-    let (state, data_dir) = test_state_with_email(Some(email_url));
+    let (state, data_dir) = test_state_with_email(Some(email_url)).await;
     let admin = state
         .auth
         .login(LoginRequest {
@@ -274,7 +311,8 @@ async fn requires_email_verification_before_a_registered_user_can_log_in() {
 
 #[tokio::test]
 async fn ingests_a_tar_batch_as_independent_records() {
-    let (state, data_dir) = test_state();
+    let (state, data_dir) = test_state().await;
+    let source = test_source(&data_dir);
     let app = api::router(state);
     let records = [
         (
@@ -306,7 +344,7 @@ async fn ingests_a_tar_batch_as_independent_records() {
                 .header(header::AUTHORIZATION, "Bearer test-secret")
                 .header(header::CONTENT_TYPE, "application/x-tar")
                 .header("idempotency-key", "batch-1")
-                .header("x-mjai-source", "test-collector")
+                .header("x-mjai-source", source.as_str())
                 .body(Body::from(body))
                 .unwrap(),
         )
@@ -322,12 +360,13 @@ async fn ingests_a_tar_batch_as_independent_records() {
 
 #[tokio::test]
 async fn creates_and_downloads_a_filtered_archive() {
-    let (state, data_dir) = test_state();
+    let (state, data_dir) = test_state().await;
+    let source = test_source(&data_dir);
     let app = api::router(state);
     let raw = r#"{"type":"start_game","names":["a","b","c","d"]}"#;
     let response = app
         .clone()
-        .oneshot(ingest_request("export-game", raw))
+        .oneshot(ingest_request(&source, "export-game", raw))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
@@ -340,9 +379,9 @@ async fn creates_and_downloads_a_filtered_archive() {
                 .uri("/api/v1/downloads")
                 .header(header::AUTHORIZATION, "Bearer test-secret")
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    r#"{"filter":{"source":"test-collector"},"format":"tar.gz"}"#,
-                ))
+                .body(Body::from(format!(
+                    r#"{{"filter":{{"source":"{source}"}},"format":"tar.gz"}}"#
+                )))
                 .unwrap(),
         )
         .await
@@ -398,8 +437,120 @@ async fn creates_and_downloads_a_filtered_archive() {
 }
 
 #[tokio::test]
+async fn re_indexes_packs_the_index_never_saw() {
+    // The bug this reproduces: pack bytes on disk with nothing pointing at
+    // them, which is what every restart used to produce.
+    let data_dir = test_data_dir();
+    let packs = PackStore::new(data_dir.join("packs"), 1024 * 1024).unwrap();
+    let raw = br#"{"type":"start_game","names":["a","b","c","d"],"rule":"tonpu"}"#;
+    let orphans: Vec<Uuid> = (0..3)
+        .map(|_| {
+            let id = Uuid::new_v4();
+            packs.append(id, raw).unwrap();
+            id
+        })
+        .collect();
+
+    let catalog = Catalog::connect(&test_config(&data_dir, None))
+        .await
+        .unwrap();
+    assert_eq!(recovery::recover(&catalog, &packs).await.unwrap(), 3);
+    // Every boot runs this, so a second pass must find nothing left to do.
+    assert_eq!(recovery::recover(&catalog, &packs).await.unwrap(), 0);
+
+    let record = catalog.get(orphans[0]).await.unwrap().unwrap();
+    assert_eq!(record.source, "recovered");
+    assert_eq!(record.players, ["a", "b", "c", "d"]);
+    assert_eq!(record.rule.as_deref(), Some("tonpu"));
+    assert_eq!(packs.read(&record.storage).unwrap(), raw);
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+#[tokio::test]
+async fn pages_records_by_keyset_without_repeating_or_dropping_one() {
+    let (state, data_dir) = test_state().await;
+    let source = test_source(&data_dir);
+    let app = api::router(state);
+    let raw = r#"{"type":"start_game","names":["a","b","c","d"]}"#;
+    for key in ["page-1", "page-2", "page-3"] {
+        let response = app
+            .clone()
+            .oneshot(ingest_request(&source, key, raw))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..3 {
+        let query = match &cursor {
+            Some(cursor) => format!("source={source}&limit=2&cursor={cursor}"),
+            None => format!("source={source}&limit=2"),
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/records?{query}"))
+                    .header(header::AUTHORIZATION, "Bearer test-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let page: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        for item in page["items"].as_array().unwrap() {
+            seen.push(item["id"].as_str().unwrap().to_owned());
+        }
+        cursor = page["next_cursor"].as_str().map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    assert_eq!(seen.len(), 3, "keyset paging lost or repeated a record");
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len(), 3);
+    assert!(cursor.is_none(), "the last page still offered a cursor");
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+#[tokio::test]
+async fn rejects_a_reused_idempotency_key_with_different_content() {
+    let (state, data_dir) = test_state().await;
+    let source = test_source(&data_dir);
+    let app = api::router(state);
+    let response = app
+        .clone()
+        .oneshot(ingest_request(
+            &source,
+            "same-key",
+            r#"{"type":"start_game","names":["a","b","c","d"]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let response = app
+        .oneshot(ingest_request(
+            &source,
+            "same-key",
+            r#"{"type":"start_game","names":["e","f","g","h"]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+#[tokio::test]
 async fn reports_watch_uuid_and_conversion_transitions() {
-    let (state, data_dir) = test_state();
+    let (state, data_dir) = test_state().await;
     let app = api::router(state.clone());
     for event in [
         WatchEventKind::Live,
@@ -443,7 +594,7 @@ async fn reports_watch_uuid_and_conversion_transitions() {
 
 #[tokio::test]
 async fn updates_and_persists_online_watch_configuration() {
-    let (state, data_dir) = test_state();
+    let (state, data_dir) = test_state().await;
     let app = api::router(state.clone());
     let response = app
         .clone()

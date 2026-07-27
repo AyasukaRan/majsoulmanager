@@ -17,6 +17,10 @@ services:
       MJAI_MAX_BATCH_BYTES: ${MJAI_MAX_BATCH_BYTES:-536870912}
       MJAI_MAX_BATCH_RECORDS: ${MJAI_MAX_BATCH_RECORDS:-50000}
       MJAI_PACK_TARGET_BYTES: ${MJAI_PACK_TARGET_BYTES:-268435456}
+      MJAI_POSTGRES_DSN: postgres://mjai:mjai@postgres:5432/mjai
+      MJAI_CLICKHOUSE_URL: http://clickhouse:8123
+      MJAI_CLICKHOUSE_USER: mjai
+      MJAI_CLICKHOUSE_PASSWORD: mjai
       MJAI_MIHOMO_CONTROLLER_URL: http://mihomo:9090
       MJAI_MIHOMO_SECRET: ${MJAI_MIHOMO_SECRET:-change-mihomo-me}
       MJAI_MIHOMO_PROXY_URL: http://mihomo:7890
@@ -34,6 +38,10 @@ services:
     depends_on:
       mihomo-perms:
         condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
     restart: unless-stopped
 
   mihomo:
@@ -57,6 +65,9 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # Both initdb mounts only run when the data volume is first created, so on an
+  # existing deployment they are dead weight; the API applies the same files at
+  # startup, which is what actually reaches the live volumes.
   postgres:
     image: postgres:17-alpine
     environment:
@@ -71,6 +82,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    restart: unless-stopped
 
   clickhouse:
     image: clickhouse/clickhouse-server:25.3-alpine
@@ -86,6 +98,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    restart: unless-stopped
 
   rustfs-perms:
     image: alpine:3.21
