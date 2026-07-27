@@ -40,14 +40,23 @@ use crate::{
 const FILTER_ID_OFFSET: i32 = 200;
 const SETTLE_SECS: u64 = 120;
 const RECONNECT_DELAY_SECS: u64 = 5;
-// Login client version numbers. The package (Unity build, e.g. 4.0.45) is
-// discovered dynamically from index.html. The code version (res_version, e.g.
-// 0.16.257) lives only in the Unity runtime with no lightweight HTTP source,
-// so it is pinned here as a fallback and overridable via config.client_version;
-// the server rejects a stale value with error 151, so bump it (or set the
-// config) when Majsoul updates. Both defaults are captured real-client values.
+// Login client version numbers, both captured from a real web client.
+//
+// Measured against the live CN server: only `client_version_string`
+// (`WebGL_2022-<code>`) is validated, and only as a *lower bound* — the server
+// accepts anything at or above roughly (current - 3 patches) and accepts
+// arbitrarily future values, while `client_version { resource, package }` is
+// not checked at all. So the pinned code version only has to be recent enough,
+// and on rejection any high value restores service (see CN_FALLBACK_VERSION).
 const CN_CODE_VERSION: &str = "0.16.257";
 const CN_PACKAGE_VERSION: &str = "4.0.45";
+// Used after the server rejects the pinned version with error 151. Being above
+// the floor is all that matters, so this needs no discovery and never goes
+// stale.
+// ponytail: relies on the check staying a lower bound; if Majsoul ever adds an
+// upper bound, discover the real version instead (binary-searching the floor
+// with real credentials costs ~6 logins).
+const CN_FALLBACK_VERSION: &str = "0.99.999";
 
 pub struct ManagedWatchDependencies {
     pub data_dir: PathBuf,
@@ -163,6 +172,11 @@ pub(crate) async fn run(
         .map(proxy_display)
         .unwrap_or_else(|| "直连".into());
 
+    // Set once the server rejects our client version (151); the reconnect below
+    // then retries with CN_FALLBACK_VERSION, which the version floor always
+    // accepts.
+    let mut bump_version = false;
+
     loop {
         dependencies.logs.append(
             WatchLogLevel::Info,
@@ -177,6 +191,7 @@ pub(crate) async fn run(
             login_worker.clone(),
             &dependencies.logs,
             &cache_dir,
+            bump_version,
         )
         .await
         {
@@ -217,12 +232,14 @@ pub(crate) async fn run(
                     "collector",
                     format!("登录失败: {detail}"),
                 );
-                if detail.contains("151") {
+                if detail.contains("151") && !bump_version {
+                    bump_version = true;
                     dependencies.logs.append(
                         WatchLogLevel::Warn,
                         "collector",
-                        "error 151 通常是客户端版本过期。请运行版本探测脚本抓取最新 res_version,在 Watch 配置的 client_version 里更新。"
-                            .to_string(),
+                        format!(
+                            "error 151 = 客户端版本过期,重连时自动改用 {CN_FALLBACK_VERSION}(服务端只校验版本下限)。"
+                        ),
                     );
                 }
             }
@@ -368,6 +385,19 @@ fn decode_base64_field(value: &serde_json::Value, field: &str) -> Result<Vec<u8>
     Ok(STANDARD.decode(encoded)?)
 }
 
+/// Client code version to send at login. `bump` wins over the configured value
+/// because it is only set once the server has already rejected that value.
+fn login_code_version(config: &WatchServiceConfig, bump: bool) -> String {
+    if bump {
+        return CN_FALLBACK_VERSION.to_string();
+    }
+    config
+        .client_version
+        .clone()
+        .unwrap_or_else(|| CN_CODE_VERSION.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn connect(
     config: &WatchServiceConfig,
     username: &str,
@@ -376,6 +406,7 @@ async fn connect(
     worker: Option<Arc<PluginWorker>>,
     logs: &WatchLogBuffer,
     cache_dir: &Path,
+    bump_version: bool,
 ) -> Result<(LoginTransport, String)> {
     if let Some(worker) = worker {
         let result = worker
@@ -386,7 +417,13 @@ async fn connect(
                     "username": username,
                     "password": password,
                     "proxy_url": proxy,
-                    "client_version": config.client_version,
+                    // None lets the module pick its own default; once the
+                    // server has rejected a version we force the safe one.
+                    "client_version": if bump_version {
+                        Some(CN_FALLBACK_VERSION.to_string())
+                    } else {
+                        config.client_version.clone()
+                    },
                 }),
             )
             .await
@@ -417,12 +454,10 @@ async fn connect(
     );
     // Login sends client_version_string = WebGL_2022-<code_version>; the code
     // version differs from the resource version and is pinned (overridable via
-    // config.client_version). The package (Unity build) is discovered from
-    // index.html, falling back to the pinned default.
-    let code_version = config
-        .client_version
-        .clone()
-        .unwrap_or_else(|| CN_CODE_VERSION.to_string());
+    // config.client_version). `bump_version` takes precedence because it is only
+    // set after the server rejected whatever we tried last. The package (Unity
+    // build) is discovered from index.html, falling back to the pinned default.
+    let code_version = login_code_version(config, bump_version);
     let package_version = discover_package_version(&http, &config.server, cache_dir)
         .await
         .unwrap_or_else(|_| CN_PACKAGE_VERSION.to_string());
@@ -763,6 +798,19 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bumped_version_overrides_pin_and_config() {
+        let mut config = WatchServiceConfig::default();
+        assert_eq!(login_code_version(&config, false), CN_CODE_VERSION);
+        assert_eq!(login_code_version(&config, true), CN_FALLBACK_VERSION);
+
+        config.client_version = Some("0.16.100".to_string());
+        assert_eq!(login_code_version(&config, false), "0.16.100");
+        // The configured value is what the server just rejected, so the bump
+        // must win over it too.
+        assert_eq!(login_code_version(&config, true), CN_FALLBACK_VERSION);
+    }
 
     #[test]
     fn loads_account_without_exposing_it_to_config_json() {
