@@ -14,7 +14,11 @@ pub struct Config {
     #[arg(long, env = "MJAI_DATA_DIR", default_value = "data")]
     pub data_dir: PathBuf,
 
-    #[arg(long, env = "MJAI_MAX_RECORD_BYTES", default_value_t = 16 * 1024)]
+    // The "about 10KB per mjson" figure describes the gzip file on disk, not the payload this
+    // limit applies to. Measured over 300 real 4p throne records, decompressed:
+    // min 11,352 / p50 53,668 / p95 80,374 / max 106,157 bytes. 16 KiB rejected every one of
+    // them; 256 KiB keeps ~2.5x headroom over the observed max.
+    #[arg(long, env = "MJAI_MAX_RECORD_BYTES", default_value_t = 256 * 1024)]
     pub max_record_bytes: usize,
 
     #[arg(

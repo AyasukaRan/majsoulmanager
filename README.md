@@ -8,7 +8,7 @@
 ## 当前能力
 
 - `POST /api/v1/records`：接收单个 mjai/NDJSON 文件，支持幂等键和 SHA-256 校验。
-- `POST /api/v1/records/batch`：接收 tar/tar.gz 批次，每个 member 是一份 mjson。
+- `POST /api/v1/records/batch`：接收 tar/tar.gz 批次，每个 member 是一份 mjson，member 本身是 gzip 的也直接接收；`played_at` 逐条取自 `majsoul.start_time`。
 - `GET /api/v1/records`：按来源、时间、玩家筛选，使用游标分页。
 - `POST /api/v1/downloads`：创建异步批量导出任务。
 - `GET /api/v1/downloads/{job_id}`：查询导出进度和下载地址。

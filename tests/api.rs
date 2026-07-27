@@ -5,14 +5,14 @@ use axum::{
     http::{Request, StatusCode, header},
     routing::post,
 };
-use flate2::read::GzDecoder;
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use mjai_management::auth::{
     AuthError, AuthSettings, LoginRequest, RegisterRequest, UserRole, VerifyEmailRequest,
 };
 use mjai_management::watch::{WatchEvent, WatchEventKind};
 use mjai_management::{AppState, api, config::Config};
 use serde_json::Value;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -27,7 +27,7 @@ fn test_state_with_email(email_api_url: Option<String>) -> (AppState, std::path:
         listen: "127.0.0.1:0".into(),
         api_key: "test-secret".into(),
         data_dir: data_dir.clone(),
-        max_record_bytes: 16 * 1024,
+        max_record_bytes: 256 * 1024,
         max_batch_bytes: 1024 * 1024,
         max_batch_records: 100,
         pack_target_bytes: 1024 * 1024,
@@ -317,6 +317,108 @@ async fn ingests_a_tar_batch_as_independent_records() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(json["accepted"], 2);
     assert_eq!(json["rejected"], 0);
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+/// Two real majsoul2mjai records, gzip exactly as the collector left them on disk (48,677 and
+/// 25,630 bytes decompressed, both over the old 16 KiB record limit), plus a member that inflates
+/// past the limit to prove decompression is bounded.
+#[tokio::test]
+async fn ingests_gzip_tar_members_with_their_own_played_at() {
+    let (state, data_dir) = test_state();
+    let app = api::router(state);
+    let throne_4p =
+        include_bytes!("fixtures/260716-00000000-0000-4000-8000-000000000004.mjson").to_vec();
+    let mut bomb = GzEncoder::new(Vec::new(), Compression::default());
+    bomb.write_all(&vec![b'{'; 1024 * 1024]).unwrap();
+    let members = [
+        (
+            "260716-00000000-0000-4000-8000-000000000004.mjson",
+            throne_4p.clone(),
+        ),
+        (
+            "260716-00000000-0000-4000-8000-000000000003.mjson",
+            include_bytes!("fixtures/260716-00000000-0000-4000-8000-000000000003.mjson").to_vec(),
+        ),
+        ("oversize.mjson", bomb.finish().unwrap()),
+    ];
+    let mut archive = tar::Builder::new(Vec::new());
+    for (name, raw) in &members {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(raw.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, name, raw.as_slice())
+            .unwrap();
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/records/batch")
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .header(header::CONTENT_TYPE, "application/x-tar")
+                .header("idempotency-key", "batch-real")
+                .header("x-mjai-source", "historical-import")
+                .body(Body::from(archive.into_inner().unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let json: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(json["accepted"], 2);
+    assert_eq!(json["rejected"], 1);
+    assert!(json["errors"][0].as_str().unwrap().starts_with("oversize"));
+
+    // A batch-wide played_at would return both records or neither; only the 4p throne game
+    // started inside this window (majsoul.start_time 1784207242 = 2026-07-16T13:07:22Z).
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/records?played_from=2026-07-16T13:00:00Z&played_to=2026-07-16T14:00:00Z")
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(page["items"].as_array().unwrap().len(), 1);
+    assert_eq!(page["items"][0]["played_at"], "2026-07-16T13:07:22Z");
+    assert_eq!(page["items"][0]["players"].as_array().unwrap().len(), 4);
+    let id = page["items"][0]["id"].as_str().unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/records/{id}/raw"))
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut expected = Vec::new();
+    GzDecoder::new(throne_4p.as_slice())
+        .read_to_end(&mut expected)
+        .unwrap();
+    // The point of the fixture: a real record is far past the old 16 KiB limit,
+    // so this round trip could not have happened before it was raised.
+    assert!(expected.len() > 16 * 1024, "{} bytes", expected.len());
+    assert_eq!(
+        to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        expected
+    );
+
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 

@@ -435,7 +435,9 @@ fn ingest_one(
                 source: source.to_owned(),
                 sha256: sha256.clone(),
                 received_at: Utc::now(),
-                played_at,
+                // A batch carries one header for tens of thousands of games, so the record's own
+                // majsoul.start_time is the only usable played_at; the header stays an override.
+                played_at: played_at.or(metadata.played_at),
                 players: metadata.players,
                 rule: metadata.rule,
                 event_count: metadata.event_count,
@@ -567,6 +569,8 @@ fn process_batch_archive(
                 .to_string_lossy()
                 .into_owned();
             let size = entry.size() as usize;
+            // Stored size, which for a gzip member is the compressed one, so this only bounds the
+            // read; the record limit is enforced against the decompressed payload below.
             if size == 0 || size > state.config.max_record_bytes {
                 response.rejected += 1;
                 push_batch_error(
@@ -580,6 +584,22 @@ fn process_batch_archive(
                 response.rejected += 1;
                 push_batch_error(&mut response.errors, format!("{member_path}: {error}"));
                 continue;
+            }
+            // Detected by content, not by name: the collector's files are all named `.mjson` but
+            // are gzip on disk, and decompressing 3.2GB into ~34GB to build an archive is wasted
+            // work. Bounded to the limit plus one byte so a crafted member cannot allocate
+            // freely and ingest_one still sees an over-limit payload and rejects it.
+            if raw.starts_with(&[0x1f, 0x8b]) {
+                let mut inflated = Vec::new();
+                let inflate = flate2::read::GzDecoder::new(raw.as_slice())
+                    .take(state.config.max_record_bytes as u64 + 1)
+                    .read_to_end(&mut inflated);
+                if let Err(error) = inflate {
+                    response.rejected += 1;
+                    push_batch_error(&mut response.errors, format!("{member_path}: {error}"));
+                    continue;
+                }
+                raw = inflated;
             }
             let item_key = format!("{batch_key}/{member_path}");
             match ingest_one(state, &item_key, source, played_at, &raw) {
