@@ -3,6 +3,7 @@ pub mod auth;
 pub mod catalog;
 pub mod clickhouse;
 pub mod config;
+pub mod gc;
 pub mod majsoul;
 pub mod managed_watch;
 pub mod mihomo;
@@ -21,6 +22,7 @@ use catalog::Catalog;
 use config::Config;
 use managed_watch::ManagedWatchDependencies;
 use mihomo::MihomoManager;
+use objects::Objects;
 use pack::PackStore;
 use watch::WatchRegistry;
 use watch_log::WatchLogBuffer;
@@ -32,6 +34,7 @@ pub struct AppState {
     pub auth: Arc<AuthStore>,
     pub catalog: Arc<Catalog>,
     pub mihomo: Arc<MihomoManager>,
+    pub objects: Arc<Objects>,
     pub packs: Arc<PackStore>,
     pub watch: Arc<WatchRegistry>,
     pub watch_service: Arc<WatchSupervisor>,
@@ -41,10 +44,27 @@ pub struct AppState {
 impl AppState {
     pub async fn local(config: Config) -> anyhow::Result<Self> {
         let data_dir = config.data_dir.clone();
-        let pack_dir = data_dir.join("packs");
         let export_dir = data_dir.join("exports");
         std::fs::create_dir_all(&export_dir)?;
-        let packs = Arc::new(PackStore::new(pack_dir, config.pack_target_bytes)?);
+        let objects = Arc::new(Objects::new(
+            &config.s3_endpoint_url,
+            &config.s3_bucket,
+            &config.s3_region,
+            &config.s3_access_key,
+            &config.s3_secret_key,
+        )?);
+        let packs = Arc::new(PackStore::new(
+            &data_dir,
+            config.pack_target_bytes,
+            Arc::clone(&objects),
+        )?);
+        // Before the recovery scan, so a staging pack a crash left behind is
+        // never re-indexed: its records were never acknowledged to the broker,
+        // which still owes every one of them.
+        let discarded = packs.discard_staging()?;
+        if discarded > 0 {
+            tracing::info!(discarded, "discarded staging packs left by a previous run");
+        }
         let catalog = Arc::new(Catalog::connect(&config).await?);
         // Before anything is served: an index missing rows would let the API
         // report a record as absent while its bytes sit in a pack.
@@ -88,6 +108,7 @@ impl AppState {
             packs,
             catalog,
             mihomo,
+            objects,
             watch,
             watch_service,
             config: Arc::new(config),

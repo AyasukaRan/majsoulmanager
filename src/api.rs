@@ -758,6 +758,7 @@ async fn get_raw(
     let raw = state
         .packs
         .read(&record.storage)
+        .await
         .map_err(|error| ApiError::Internal(error.to_string()))?;
     if hex::encode(Sha256::digest(&raw)) != record.sha256 {
         return Err(ApiError::Internal("record checksum mismatch".into()));
@@ -824,7 +825,7 @@ async fn write_export(
             .scan(&request.filter, cursor, EXPORT_PAGE_SIZE)
             .await?;
         for record in &page {
-            writer.append(record, state)?;
+            writer.append(record, state).await?;
             written += 1;
         }
         match next {
@@ -853,10 +854,10 @@ impl ExportWriter {
         })
     }
 
-    fn append(&mut self, record: &Record, state: &AppState) -> anyhow::Result<()> {
+    async fn append(&mut self, record: &Record, state: &AppState) -> anyhow::Result<()> {
         match self {
             Self::TarGz(archive) => {
-                let raw = state.packs.read(&record.storage)?;
+                let raw = state.packs.read(&record.storage).await?;
                 let mut header = TarHeader::new_gnu();
                 header.set_size(raw.len() as u64);
                 header.set_mode(0o644);

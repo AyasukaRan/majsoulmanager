@@ -34,7 +34,7 @@ pub async fn recover(catalog: &Catalog, packs: &PackStore) -> anyhow::Result<usi
             if known.contains(&id) {
                 continue;
             }
-            let raw = match packs.read(&location) {
+            let raw = match packs.read(&location).await {
                 Ok(raw) => raw,
                 Err(error) => {
                     tracing::warn!(record = %id, pack = pack.key, %error, "skipped an unreadable pack entry");

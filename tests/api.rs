@@ -11,6 +11,7 @@ use mjai_management::auth::{
     AuthError, AuthSettings, LoginRequest, RegisterRequest, UserRole, VerifyEmailRequest,
 };
 use mjai_management::catalog::{Catalog, Cursor, RecordFilter};
+use mjai_management::objects::Objects;
 use mjai_management::pack::PackStore;
 use mjai_management::watch::{WatchEvent, WatchEventKind};
 use mjai_management::{AppState, api, config::Config, recovery};
@@ -711,7 +712,20 @@ async fn re_indexes_packs_the_index_never_saw() {
     // The bug this reproduces: pack bytes on disk with nothing pointing at
     // them, which is what every restart used to produce.
     let data_dir = test_data_dir();
-    let packs = PackStore::new(data_dir.join("packs"), 1024 * 1024).unwrap();
+    let config = test_config(&data_dir, None);
+    // Nothing here leaves the local pack directory, so the endpoint is only a
+    // constructor argument; a read that fell through to it would be the bug.
+    let objects = Arc::new(
+        Objects::new(
+            &config.s3_endpoint_url,
+            &config.s3_bucket,
+            &config.s3_region,
+            &config.s3_access_key,
+            &config.s3_secret_key,
+        )
+        .unwrap(),
+    );
+    let packs = PackStore::new(&data_dir, 1024 * 1024, objects).unwrap();
     let raw = br#"{"type":"start_game","names":["a","b","c","d"],"rule":"tonpu"}"#;
     let orphans: Vec<Uuid> = (0..3)
         .map(|_| {
@@ -721,9 +735,7 @@ async fn re_indexes_packs_the_index_never_saw() {
         })
         .collect();
 
-    let catalog = Catalog::connect(&test_config(&data_dir, None))
-        .await
-        .unwrap();
+    let catalog = Catalog::connect(&config).await.unwrap();
     assert_eq!(recovery::recover(&catalog, &packs).await.unwrap(), 3);
     // Every boot runs this, so a second pass must find nothing left to do.
     assert_eq!(recovery::recover(&catalog, &packs).await.unwrap(), 0);
@@ -732,7 +744,7 @@ async fn re_indexes_packs_the_index_never_saw() {
     assert_eq!(record.source, "recovered");
     assert_eq!(record.players, ["a", "b", "c", "d"]);
     assert_eq!(record.rule.as_deref(), Some("tonpu"));
-    assert_eq!(packs.read(&record.storage).unwrap(), raw);
+    assert_eq!(packs.read(&record.storage).await.unwrap(), raw);
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 
