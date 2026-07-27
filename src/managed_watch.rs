@@ -24,7 +24,7 @@ use crate::{
         modes::{mode_metadata, room_modes, uuid_year},
         proto::{FieldIterator, extract_string, extract_varint},
         rpc::{
-            FETCH_GAME_LIVE_LIST_METHOD, FETCH_GAME_RECORD_METHOD, MajsoulRpc,
+            FETCH_GAME_LIVE_LIST_METHOD, FETCH_GAME_RECORD_METHOD, MajsoulRpc, ServerError,
             build_fetch_game_live_list_request, build_fetch_game_record_request,
             ensure_success_response,
         },
@@ -39,6 +39,9 @@ use crate::{
 
 const FILTER_ID_OFFSET: i32 = 200;
 const SETTLE_SECS: u64 = 120;
+// How long a finished game may keep failing to fetch before it is dropped from
+// the pending queue.
+const GIVE_UP_SECS: u64 = 3 * 3600;
 const RECONNECT_DELAY_SECS: u64 = 5;
 // Login client version numbers, both captured from a real web client.
 //
@@ -217,6 +220,7 @@ pub(crate) async fn run(
                 if let Err(error) = watch_session(
                     &config,
                     &dependencies,
+                    &source,
                     &modes,
                     &client_version,
                     &state_path,
@@ -695,6 +699,7 @@ async fn connect(
 async fn watch_session(
     config: &WatchServiceConfig,
     dependencies: &ManagedWatchDependencies,
+    source: &str,
     modes: &[i32],
     client_version: &str,
     state_path: &Path,
@@ -761,7 +766,40 @@ async fn watch_session(
                             Some(error.to_string()),
                             None,
                         ))?;
-                        return Err(error);
+                        // A business error is about this one record: the socket
+                        // answered, so tearing the session down neither fixes it
+                        // nor lets the other pending games through — the record
+                        // would just fail again after every reconnect, forever.
+                        // Only a stale session or a transport failure is worth
+                        // reconnecting for.
+                        let server = error.downcast_ref::<ServerError>().copied();
+                        let Some(server) = server.filter(|code| !code.is_session_stale()) else {
+                            return Err(error);
+                        };
+                        // The paipu for a game can legitimately lag behind its
+                        // disappearance from the live list, but not for hours;
+                        // past that it is never coming and the entry would
+                        // otherwise be retried every poll for the life of the
+                        // process.
+                        if game
+                            .queued_at
+                            .is_some_and(|queued| now.saturating_sub(queued) > GIVE_UP_SECS)
+                        {
+                            pending.remove(&game.uuid);
+                            persist_state(state_path, tracked.values(), pending.values())?;
+                            dependencies.logs.append(
+                                WatchLogLevel::Warn,
+                                source,
+                                format!(
+                                    "放弃对局 {} (服务端错误 {} 持续超过 {} 分钟)",
+                                    game.uuid,
+                                    server.code,
+                                    GIVE_UP_SECS / 60
+                                ),
+                            );
+                        }
+                        tokio::time::sleep(Duration::from_millis(config.request_delay_ms)).await;
+                        continue;
                     }
                 };
             dependencies
@@ -1005,6 +1043,31 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mirrors the decision `watch_session` makes on a failed record fetch.
+    fn reconnects_on(error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<ServerError>()
+            .copied()
+            .filter(|code| !code.is_session_stale())
+            .is_none()
+    }
+
+    #[test]
+    fn only_a_stale_session_or_transport_failure_reconnects() {
+        // 1203 (record not available) is about one game. Reconnecting neither
+        // fixes it nor lets the rest of the queue through, so the session must
+        // survive it.
+        let business = ensure_success_response(&[0x08, 0xb3, 0x09], "fetchGameRecord").unwrap_err();
+        assert!(!reconnects_on(&business), "1203 must not kill the session");
+
+        // 1201 is ERR_TOKEN_NOT_EXIST: a fresh login is exactly the cure.
+        let stale = ensure_success_response(&[0x08, 0xb1, 0x09], "fetchGameRecord").unwrap_err();
+        assert!(reconnects_on(&stale), "a stale session must reconnect");
+
+        // Anything that is not a server answer at all is a transport failure.
+        assert!(reconnects_on(&anyhow::Error::msg("connection reset")));
+    }
 
     #[test]
     fn version_round_trips_and_carries_patch_overflow() {
