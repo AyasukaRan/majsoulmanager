@@ -98,48 +98,39 @@ pub struct InstallModuleRequest {
     pub artifact_base64: String,
 }
 
+/// One collector: an account watching one room and player count. Everything
+/// here is per-instance; anything shared by every collector (server, proxy,
+/// modules, pacing) stays on [`WatchServiceConfig`].
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct WatchServiceConfig {
-    pub revision: u64,
+pub struct WatchInstance {
+    /// Stable slug. Also names this instance's state file and tags its log
+    /// lines, so it is validated as a plain identifier.
+    pub id: String,
     pub enabled: bool,
     pub room: String,
     pub players: u8,
     pub modes: Vec<String>,
-    pub server: String,
     pub account_secret_ref: String,
-    #[serde(default)]
-    pub proxy_mode: WatchProxyMode,
-    pub custom_proxy_url: Option<String>,
     pub client_version: Option<String>,
-    pub poll_interval_secs: u64,
-    pub request_delay_ms: u64,
-    pub login_module: ModuleRef,
-    pub pb_fetch_module: ModuleRef,
 }
 
-impl Default for WatchServiceConfig {
+impl Default for WatchInstance {
     fn default() -> Self {
         Self {
-            revision: 1,
-            enabled: false,
+            id: "default".into(),
+            enabled: true,
             room: "jade".into(),
             players: 4,
             modes: vec!["east".into(), "south".into()],
-            server: "cn".into(),
             account_secret_ref: "file:/run/secrets/majsoul_accounts".into(),
-            proxy_mode: WatchProxyMode::Mihomo,
-            custom_proxy_url: None,
             client_version: None,
-            poll_interval_secs: 10,
-            request_delay_ms: 500,
-            login_module: ModuleRef::builtin(),
-            pb_fetch_module: ModuleRef::builtin(),
         }
     }
 }
 
-impl WatchServiceConfig {
-    pub fn validate(&self) -> Result<(), WatchServiceError> {
+impl WatchInstance {
+    fn validate(&self) -> Result<(), WatchServiceError> {
+        validate_identifier("instance id", &self.id)?;
         if !matches!(self.room.as_str(), "gold" | "jade" | "throne" | "all") {
             return Err(WatchServiceError::InvalidConfig(
                 "room must be gold, jade, throne or all".into(),
@@ -159,6 +150,137 @@ impl WatchServiceConfig {
             return Err(WatchServiceError::InvalidConfig(
                 "modes must contain east and/or south".into(),
             ));
+        }
+        validate_secret_ref(&self.account_secret_ref)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WatchServiceConfig {
+    pub revision: u64,
+    /// Master switch. An instance runs only when both this and its own
+    /// `enabled` are set.
+    pub enabled: bool,
+    pub server: String,
+    #[serde(default)]
+    pub proxy_mode: WatchProxyMode,
+    pub custom_proxy_url: Option<String>,
+    pub poll_interval_secs: u64,
+    pub request_delay_ms: u64,
+    pub login_module: ModuleRef,
+    pub pb_fetch_module: ModuleRef,
+    pub instances: Vec<WatchInstance>,
+}
+
+impl Default for WatchServiceConfig {
+    fn default() -> Self {
+        Self {
+            revision: 1,
+            enabled: false,
+            server: "cn".into(),
+            proxy_mode: WatchProxyMode::Mihomo,
+            custom_proxy_url: None,
+            poll_interval_secs: 10,
+            request_delay_ms: 500,
+            login_module: ModuleRef::builtin(),
+            pb_fetch_module: ModuleRef::builtin(),
+            instances: vec![WatchInstance::default()],
+        }
+    }
+}
+
+/// Fold a pre-multi-instance config into the current shape: the five
+/// per-collector keys that used to sit at the top level become a single
+/// instance. Leaves an already-migrated document untouched, so it is safe to
+/// run on every load.
+fn migrate_legacy_config(document: &mut serde_json::Value) {
+    let Some(object) = document.as_object_mut() else {
+        return;
+    };
+    let already_migrated = object
+        .get("instances")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|instances| !instances.is_empty());
+    if already_migrated {
+        return;
+    }
+    let legacy_keys = ["room", "players", "modes", "account_secret_ref"];
+    if !legacy_keys.iter().any(|key| object.contains_key(*key)) {
+        // Nothing to fold — an "instances": [] written by hand. Synthesising a
+        // partial instance here would fail to deserialize and take the whole
+        // API down, so leave it for validate() to reject with a clear message.
+        return;
+    }
+    let mut instance = serde_json::Map::new();
+    instance.insert("id".into(), LEGACY_INSTANCE_ID.into());
+    instance.insert("enabled".into(), true.into());
+    for key in legacy_keys {
+        if let Some(value) = object.remove(key) {
+            instance.insert(key.into(), value);
+        }
+    }
+    // client_version is optional everywhere, so a missing key is not a
+    // migration failure — only a present one needs moving.
+    instance.insert(
+        "client_version".into(),
+        object
+            .remove("client_version")
+            .unwrap_or(serde_json::Value::Null),
+    );
+    object.insert(
+        "instances".into(),
+        serde_json::Value::Array(vec![serde_json::Value::Object(instance)]),
+    );
+}
+
+/// Instance id given to a migrated legacy configuration. Also the name its
+/// pre-migration state file is moved to.
+pub const LEGACY_INSTANCE_ID: &str = "default";
+
+impl WatchServiceConfig {
+    /// Instances that should actually be running: the master switch and the
+    /// instance's own switch both have to be on.
+    pub fn active_instances(&self) -> impl Iterator<Item = &WatchInstance> {
+        self.instances
+            .iter()
+            .filter(|instance| self.enabled && instance.enabled)
+    }
+
+    pub fn validate(&self) -> Result<(), WatchServiceError> {
+        if self.instances.is_empty() {
+            return Err(WatchServiceError::InvalidConfig(
+                "at least one watch instance is required".into(),
+            ));
+        }
+        for instance in &self.instances {
+            instance.validate()?;
+        }
+        // Ids name state files and tag log lines, so duplicates would make two
+        // collectors silently share state.
+        let mut seen = std::collections::BTreeSet::new();
+        if let Some(duplicate) = self
+            .instances
+            .iter()
+            .find(|instance| !seen.insert(&instance.id))
+        {
+            return Err(WatchServiceError::InvalidConfig(format!(
+                "duplicate watch instance id {}",
+                duplicate.id
+            )));
+        }
+        // Majsoul allows one session per account, so two collectors sharing a
+        // secret would kick each other off in a reconnect loop forever.
+        let mut accounts = std::collections::BTreeSet::new();
+        if let Some(shared) = self
+            .instances
+            .iter()
+            .find(|instance| !accounts.insert(&instance.account_secret_ref))
+        {
+            return Err(WatchServiceError::InvalidConfig(format!(
+                "watch instance {} reuses another instance's account_secret_ref; \
+                 each collector needs its own account",
+                shared.id
+            )));
         }
         if !matches!(self.server.as_str(), "cn" | "en" | "jp") {
             return Err(WatchServiceError::InvalidConfig(
@@ -193,7 +315,6 @@ impl WatchServiceConfig {
                 }
             }
         }
-        validate_secret_ref(&self.account_secret_ref)?;
         validate_module_ref(&self.login_module)?;
         validate_module_ref(&self.pb_fetch_module)?;
         Ok(())
@@ -709,7 +830,7 @@ pub struct WatchSupervisor {
     dependencies: Arc<ManagedWatchDependencies>,
     logs: Arc<WatchLogBuffer>,
     generation: AtomicU64,
-    task: Mutex<Option<JoinHandle<()>>>,
+    tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl WatchSupervisor {
@@ -723,7 +844,25 @@ impl WatchSupervisor {
         std::fs::create_dir_all(&watch_dir)?;
         let config_path = watch_dir.join("config.json");
         let config = match std::fs::read(&config_path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Ok(bytes) => {
+                let mut document: serde_json::Value = serde_json::from_slice(&bytes)?;
+                let legacy = document.get("instances").is_none();
+                migrate_legacy_config(&mut document);
+                let config: WatchServiceConfig = serde_json::from_value(document)?;
+                if legacy {
+                    // The single collector kept its state in an unsuffixed
+                    // file; move it so the migrated instance picks up its
+                    // in-flight games instead of restarting from nothing.
+                    // Never overwrite: a state file already under the new name
+                    // is newer than anything the legacy path left behind.
+                    let migrated_state = watch_dir.join(format!("state-{LEGACY_INSTANCE_ID}.json"));
+                    if !migrated_state.exists() {
+                        let _ = std::fs::rename(watch_dir.join("state.json"), migrated_state);
+                    }
+                    persist_json(&config_path, &config)?;
+                }
+                config
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let config = WatchServiceConfig::default();
                 persist_json(&config_path, &config)?;
@@ -741,7 +880,7 @@ impl WatchSupervisor {
             dependencies,
             logs,
             generation: AtomicU64::new(0),
-            task: Mutex::new(None),
+            tasks: Mutex::new(Vec::new()),
         })
     }
 
@@ -835,7 +974,7 @@ impl WatchSupervisor {
             );
             return Err(error);
         }
-        self.stop_task().await;
+        self.stop_tasks().await;
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         {
             let mut runtime = self.runtime.write();
@@ -843,11 +982,38 @@ impl WatchSupervisor {
             runtime.updated_at = Utc::now();
             runtime.last_error = None;
         }
-        let supervisor = Arc::clone(self);
-        let task = tokio::spawn(async move {
-            supervisor.run_generation(generation, config).await;
-        });
-        *self.task.lock().await = Some(task);
+        let mut tasks = Vec::new();
+        for instance in config.active_instances().cloned().collect::<Vec<_>>() {
+            let supervisor = Arc::clone(self);
+            let config = config.clone();
+            tasks.push(tokio::spawn(async move {
+                supervisor.run_instance(generation, config, instance).await;
+            }));
+        }
+        if !tasks.is_empty() {
+            // Every field here describes the generation, not one collector, so
+            // it is written once instead of racily by each spawned task.
+            let mut runtime = self.runtime.write();
+            runtime.phase = ServicePhase::Running;
+            runtime.active_revision = Some(config.revision);
+            runtime.login_module = Some(config.login_module.clone());
+            runtime.pb_fetch_module = Some(config.pb_fetch_module.clone());
+            runtime.started_at = Some(Utc::now());
+            runtime.updated_at = Utc::now();
+        }
+        if tasks.is_empty() {
+            // Nothing will ever move the phase off Starting, so settle it here.
+            let mut runtime = self.runtime.write();
+            runtime.phase = ServicePhase::Stopped;
+            runtime.updated_at = Utc::now();
+            drop(runtime);
+            self.logs.append(
+                WatchLogLevel::Warn,
+                "service",
+                "没有启用的采集实例，watch 服务不会连接任何账号",
+            );
+        }
+        *self.tasks.lock().await = tasks;
         Ok(())
     }
 
@@ -870,7 +1036,7 @@ impl WatchSupervisor {
         }
         self.logs
             .append(WatchLogLevel::Info, "service", "watch 服务停止中");
-        self.stop_task().await;
+        self.stop_tasks().await;
         let mut runtime = self.runtime.write();
         runtime.phase = ServicePhase::Stopped;
         runtime.updated_at = Utc::now();
@@ -882,28 +1048,37 @@ impl WatchSupervisor {
             .append(WatchLogLevel::Info, "service", "watch 服务已停止");
     }
 
-    async fn stop_task(&self) {
-        if let Some(task) = self.task.lock().await.take() {
+    async fn stop_tasks(&self) {
+        let tasks = std::mem::take(&mut *self.tasks.lock().await);
+        // Abort everything before awaiting anything: dropping a JoinHandle
+        // detaches its task, so if this future is cancelled part-way through
+        // the loop, any handle not yet aborted would leave a collector logging
+        // in forever with no way to stop it.
+        for task in &tasks {
             task.abort();
+        }
+        for task in tasks {
             let _ = task.await;
         }
     }
 
-    async fn run_generation(self: Arc<Self>, generation: u64, config: WatchServiceConfig) {
-        {
-            let mut runtime = self.runtime.write();
-            runtime.phase = ServicePhase::Running;
-            runtime.active_revision = Some(config.revision);
-            runtime.login_module = Some(config.login_module.clone());
-            runtime.pb_fetch_module = Some(config.pb_fetch_module.clone());
-            runtime.started_at = Some(Utc::now());
-            runtime.updated_at = Utc::now();
-            runtime.last_error = None;
-        }
+    /// Run one collector for the lifetime of `generation`. Instances are
+    /// independent: one failing leaves the others collecting, and the shared
+    /// runtime status reports the first failure with the instance that caused
+    /// it, since per-instance detail is already tagged in the log stream.
+    async fn run_instance(
+        self: Arc<Self>,
+        generation: u64,
+        config: WatchServiceConfig,
+        instance: WatchInstance,
+    ) {
+        // The runtime status describes the generation and is set by start();
+        // an instance only ever reports its own failure into it.
+        let id = instance.id.clone();
         self.logs.append(
             WatchLogLevel::Info,
             "service",
-            format!("watch 服务已启动 (generation {generation})"),
+            format!("采集实例 {id} 已启动 (generation {generation})"),
         );
 
         let login_worker = self
@@ -916,7 +1091,14 @@ impl WatchSupervisor {
             .await;
         let result = match (login_worker, pb_worker) {
             (Ok(login), Ok(pb)) => {
-                crate::managed_watch::run(config, Arc::clone(&self.dependencies), login, pb).await
+                crate::managed_watch::run(
+                    config,
+                    instance,
+                    Arc::clone(&self.dependencies),
+                    login,
+                    pb,
+                )
+                .await
             }
             (Err(error), _) | (_, Err(error)) => Err(anyhow::Error::msg(error.to_string())),
         };
@@ -925,22 +1107,26 @@ impl WatchSupervisor {
             runtime.updated_at = Utc::now();
             match result {
                 Ok(()) => {
-                    runtime.phase = ServicePhase::Stopped;
                     drop(runtime);
                     self.logs.append(
                         WatchLogLevel::Info,
                         "service",
-                        format!("watch 服务已退出 (generation {generation})"),
+                        format!("采集实例 {id} 已退出 (generation {generation})"),
                     );
                 }
                 Err(error) => {
                     runtime.phase = ServicePhase::Failed;
-                    runtime.last_error = Some(format!("{error:#}"));
+                    // First failure wins: with several collectors down, the one
+                    // that broke first is the one worth reporting, and a later
+                    // failure must not overwrite it.
+                    runtime
+                        .last_error
+                        .get_or_insert_with(|| format!("[{id}] {error:#}"));
                     drop(runtime);
                     self.logs.append(
                         WatchLogLevel::Error,
                         "service",
-                        format!("watch 服务失败: {error:#}"),
+                        format!("采集实例 {id} 失败: {error:#}"),
                     );
                 }
             }
@@ -988,7 +1174,10 @@ mod tests {
     #[test]
     fn rejects_plaintext_secret_in_online_config() {
         let config = WatchServiceConfig {
-            account_secret_ref: "my-password".into(),
+            instances: vec![WatchInstance {
+                account_secret_ref: "my-password".into(),
+                ..WatchInstance::default()
+            }],
             ..WatchServiceConfig::default()
         };
         assert!(config.validate().is_err());
@@ -1000,6 +1189,118 @@ mod tests {
         config.validate().unwrap();
         assert!(!config.enabled);
         assert_eq!(config.login_module, ModuleRef::builtin());
+    }
+
+    #[test]
+    fn migrates_a_pre_multi_instance_config() {
+        let mut document = serde_json::json!({
+            "revision": 18,
+            "enabled": true,
+            "room": "throne",
+            "players": 3,
+            "modes": ["south"],
+            "server": "cn",
+            "account_secret_ref": "file:/var/lib/mjai/majsoul_accounts",
+            "proxy_mode": "direct",
+            "custom_proxy_url": null,
+            "client_version": "0.16.254",
+            "poll_interval_secs": 10,
+            "request_delay_ms": 500,
+            "login_module": {"name": "builtin", "version": BUILTIN_MODULE_VERSION},
+            "pb_fetch_module": {"name": "builtin", "version": BUILTIN_MODULE_VERSION},
+        });
+        migrate_legacy_config(&mut document);
+        let config: WatchServiceConfig = serde_json::from_value(document).unwrap();
+        config.validate().unwrap();
+
+        let instance = &config.instances[0];
+        assert_eq!(config.instances.len(), 1);
+        assert_eq!(instance.id, LEGACY_INSTANCE_ID);
+        assert_eq!(instance.room, "throne");
+        assert_eq!(instance.players, 3);
+        assert_eq!(instance.client_version.as_deref(), Some("0.16.254"));
+        assert!(instance.enabled, "a migrated collector must keep running");
+        assert_eq!(config.server, "cn");
+    }
+
+    #[test]
+    fn migration_leaves_an_already_migrated_config_alone() {
+        let original = serde_json::to_value(WatchServiceConfig::default()).unwrap();
+        let mut document = original.clone();
+        migrate_legacy_config(&mut document);
+        assert_eq!(document, original);
+    }
+
+    #[test]
+    fn rejects_duplicate_instance_ids() {
+        let config = WatchServiceConfig {
+            instances: vec![WatchInstance::default(), WatchInstance::default()],
+            ..WatchServiceConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_two_instances_sharing_one_account() {
+        let config = WatchServiceConfig {
+            instances: vec![
+                WatchInstance {
+                    id: "four".into(),
+                    ..WatchInstance::default()
+                },
+                WatchInstance {
+                    id: "three".into(),
+                    players: 3,
+                    ..WatchInstance::default()
+                },
+            ],
+            ..WatchServiceConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn migration_leaves_a_hand_written_empty_instance_list_to_validation() {
+        // Synthesising an instance from nothing would fail to deserialize and
+        // take the API down; a clear validation error is the better failure.
+        let mut document = serde_json::json!({"instances": []});
+        migrate_legacy_config(&mut document);
+        assert_eq!(document["instances"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn rejects_an_instance_id_that_would_escape_the_state_directory() {
+        let config = WatchServiceConfig {
+            instances: vec![WatchInstance {
+                id: "../../etc/passwd".into(),
+                ..WatchInstance::default()
+            }],
+            ..WatchServiceConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn an_instance_runs_only_when_both_switches_are_on() {
+        let mut config = WatchServiceConfig {
+            enabled: true,
+            instances: vec![
+                WatchInstance {
+                    id: "four".into(),
+                    ..WatchInstance::default()
+                },
+                WatchInstance {
+                    id: "three".into(),
+                    enabled: false,
+                    players: 3,
+                    ..WatchInstance::default()
+                },
+            ],
+            ..WatchServiceConfig::default()
+        };
+        assert_eq!(config.active_instances().count(), 1);
+        config.enabled = false;
+        assert_eq!(config.active_instances().count(), 0);
     }
 
     #[cfg(unix)]

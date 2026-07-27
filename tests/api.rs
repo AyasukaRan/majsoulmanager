@@ -457,18 +457,33 @@ async fn updates_and_persists_online_watch_configuration() {
                     r#"{
                         "revision":1,
                         "enabled":false,
-                        "room":"throne",
-                        "players":4,
-                        "modes":["south"],
                         "server":"cn",
-                        "account_secret_ref":"env:MAJSOUL_TEST_ACCOUNT",
                         "proxy_mode":"mihomo",
                         "custom_proxy_url":null,
-                        "client_version":null,
                         "poll_interval_secs":15,
                         "request_delay_ms":800,
                         "login_module":{"name":"builtin","version":"majsoul2mjai-da985809"},
-                        "pb_fetch_module":{"name":"builtin","version":"majsoul2mjai-da985809"}
+                        "pb_fetch_module":{"name":"builtin","version":"majsoul2mjai-da985809"},
+                        "instances":[
+                            {
+                                "id":"four-player",
+                                "enabled":true,
+                                "room":"throne",
+                                "players":4,
+                                "modes":["south"],
+                                "account_secret_ref":"env:MAJSOUL_TEST_ACCOUNT",
+                                "client_version":null
+                            },
+                            {
+                                "id":"three-player",
+                                "enabled":true,
+                                "room":"jade",
+                                "players":3,
+                                "modes":["east","south"],
+                                "account_secret_ref":"env:MAJSOUL_TEST_ACCOUNT_3P",
+                                "client_version":null
+                            }
+                        ]
                     }"#,
                 ))
                 .unwrap(),
@@ -479,14 +494,19 @@ async fn updates_and_persists_online_watch_configuration() {
     let json: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(json["revision"], 2);
-    assert_eq!(json["room"], "throne");
+    assert_eq!(json["instances"][0]["room"], "throne");
+    assert_eq!(json["instances"][1]["players"], 3);
     assert_eq!(state.watch_service.config().request_delay_ms, 800);
+    assert_eq!(state.watch_service.config().instances.len(), 2);
 
     let persisted: Value =
         serde_json::from_slice(&std::fs::read(data_dir.join("watch/config.json")).unwrap())
             .unwrap();
     assert_eq!(persisted["revision"], 2);
-    assert_eq!(persisted["account_secret_ref"], "env:MAJSOUL_TEST_ACCOUNT");
+    assert_eq!(
+        persisted["instances"][0]["account_secret_ref"],
+        "env:MAJSOUL_TEST_ACCOUNT"
+    );
 
     let response = app
         .oneshot(

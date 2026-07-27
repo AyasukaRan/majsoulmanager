@@ -101,21 +101,28 @@ export type WatchLogPage = {
   next_cursor: number | null;
 };
 
-export type WatchServiceConfig = {
-  revision: number;
+/** One collector: an account watching one room and player count. */
+export type WatchInstance = {
+  id: string;
   enabled: boolean;
   room: "gold" | "jade" | "throne" | "all";
   players: 3 | 4;
   modes: Array<"east" | "south">;
-  server: "cn" | "en" | "jp";
   account_secret_ref: string;
+  client_version: string | null;
+};
+
+export type WatchServiceConfig = {
+  revision: number;
+  enabled: boolean;
+  server: "cn" | "en" | "jp";
   proxy_mode: "direct" | "mihomo" | "custom";
   custom_proxy_url: string | null;
-  client_version: string | null;
   poll_interval_secs: number;
   request_delay_ms: number;
   login_module: WatchModuleRef;
   pb_fetch_module: WatchModuleRef;
+  instances: WatchInstance[];
 };
 
 export type InstalledWatchModule = {
