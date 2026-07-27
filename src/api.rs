@@ -9,7 +9,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path as AxumPath, Query, State},
     http::{
         HeaderMap, HeaderValue, Request, StatusCode,
-        header::{AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_TYPE},
+        header::{AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE},
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -24,6 +24,7 @@ use subtle::ConstantTimeEq;
 use tar::{Builder as TarBuilder, Header as TarHeader};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
+use tokio_util::io::ReaderStream;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
@@ -34,8 +35,8 @@ use crate::{
         RegistrationStatus, UpdateUserRequest, UserView, VerifyEmailRequest,
     },
     catalog::{
-        DownloadFormat, DownloadJob, DownloadRequest, IdempotencyClaim, IdempotencyError, JobState,
-        Record, RecordFilter,
+        CatalogError, Cursor, DownloadFormat, DownloadJob, DownloadRequest, IdempotencyClaim,
+        JobState, Record, RecordFilter,
     },
     mihomo::{MihomoAction, MihomoError, MihomoStatus, ProxySelection, SubscriptionUpdate},
     mjai,
@@ -390,7 +391,7 @@ async fn ingest(
                 .map_err(|_| ApiError::BadRequest("X-Mjai-Played-At must be RFC 3339".into()))
         })
         .transpose()?;
-    let response = ingest_one(&state, &idempotency_key, &source, played_at, body.as_ref())?;
+    let response = ingest_one(&state, &idempotency_key, &source, played_at, body.as_ref()).await?;
     let status = if response.duplicate {
         StatusCode::OK
     } else {
@@ -399,7 +400,7 @@ async fn ingest(
     Ok((status, Json(response)))
 }
 
-fn ingest_one(
+async fn ingest_one(
     state: &AppState,
     idempotency_key: &str,
     source: &str,
@@ -415,7 +416,11 @@ fn ingest_one(
     let id = Uuid::new_v4();
 
     let scoped_idempotency_key = format!("{source}\0{idempotency_key}");
-    match state.catalog.claim(&scoped_idempotency_key, id, &sha256)? {
+    match state
+        .catalog
+        .claim(&scoped_idempotency_key, id, &sha256)
+        .await?
+    {
         IdempotencyClaim::Existing(record) => Ok(IngestResponse {
             id: record.id,
             status: "indexed",
@@ -426,21 +431,33 @@ fn ingest_one(
             let location = match state.packs.append(id, body) {
                 Ok(location) => location,
                 Err(error) => {
-                    state.catalog.abandon_claim(&scoped_idempotency_key, id);
+                    // A claim left behind only costs the collector a `409` on
+                    // its next retry of this key, and reporting it would hide
+                    // the pack failure that actually stopped the ingest.
+                    if let Err(claim) = state
+                        .catalog
+                        .abandon_claim(&scoped_idempotency_key, id)
+                        .await
+                    {
+                        tracing::warn!(%claim, "could not release the idempotency claim");
+                    }
                     return Err(ApiError::Internal(error.to_string()));
                 }
             };
-            state.catalog.insert(Record {
-                id,
-                source: source.to_owned(),
-                sha256: sha256.clone(),
-                received_at: Utc::now(),
-                played_at,
-                players: metadata.players,
-                rule: metadata.rule,
-                event_count: metadata.event_count,
-                storage: location,
-            });
+            state
+                .catalog
+                .insert(Record {
+                    id,
+                    source: source.to_owned(),
+                    sha256: sha256.clone(),
+                    received_at: Utc::now(),
+                    played_at,
+                    players: metadata.players,
+                    rule: metadata.rule,
+                    event_count: metadata.event_count,
+                    storage: location,
+                })
+                .await?;
             Ok(IngestResponse {
                 id,
                 status: "indexed",
@@ -511,22 +528,31 @@ async fn ingest_batch(
     drop(output);
 
     let worker_state = state.clone();
+    // The tar walk stays on a blocking thread; only the catalogue calls inside
+    // it are async, and driving them from here keeps the reactor free.
+    let handle = tokio::runtime::Handle::current();
     let result = tokio::task::spawn_blocking(move || {
-        process_batch_archive(&worker_state, &staging_path, &batch_key, &source, played_at)
+        handle.block_on(process_batch_archive(
+            &worker_state,
+            &staging_path,
+            &batch_key,
+            &source,
+            played_at,
+        ))
     })
     .await
     .map_err(|error| ApiError::Internal(error.to_string()))?;
     result.map(|response| (StatusCode::ACCEPTED, Json(response)))
 }
 
-fn process_batch_archive(
+async fn process_batch_archive(
     state: &AppState,
     path: &Path,
     batch_key: &str,
     source: &str,
     played_at: Option<DateTime<Utc>>,
 ) -> Result<BatchIngestResponse, ApiError> {
-    let result = (|| {
+    let result = async {
         let mut file =
             std::fs::File::open(path).map_err(|error| ApiError::BadRequest(error.to_string()))?;
         let mut magic = [0u8; 2];
@@ -582,7 +608,7 @@ fn process_batch_archive(
                 continue;
             }
             let item_key = format!("{batch_key}/{member_path}");
-            match ingest_one(state, &item_key, source, played_at, &raw) {
+            match ingest_one(state, &item_key, source, played_at, &raw).await {
                 Ok(result) if result.duplicate => response.duplicates += 1,
                 Ok(_) => response.accepted += 1,
                 Err(error) => {
@@ -592,7 +618,8 @@ fn process_batch_archive(
             }
         }
         Ok(response)
-    })();
+    }
+    .await;
     let _ = std::fs::remove_file(path);
     result
 }
@@ -612,7 +639,7 @@ struct SearchQuery {
     received_to: Option<DateTime<Utc>>,
     played_from: Option<DateTime<Utc>>,
     played_to: Option<DateTime<Utc>>,
-    cursor: Option<Uuid>,
+    cursor: Option<Cursor>,
     #[serde(default = "default_page_size")]
     limit: usize,
 }
@@ -624,7 +651,7 @@ fn default_page_size() -> usize {
 #[derive(Serialize)]
 struct RecordPage {
     items: Vec<Record>,
-    next_cursor: Option<Uuid>,
+    next_cursor: Option<Cursor>,
 }
 
 async fn search(
@@ -644,7 +671,10 @@ async fn search(
         played_from: query.played_from,
         played_to: query.played_to,
     };
-    let (items, next_cursor) = state.catalog.search(&filter, query.cursor, query.limit);
+    let (items, next_cursor) = state
+        .catalog
+        .search(&filter, query.cursor, query.limit)
+        .await?;
     Ok(Json(RecordPage { items, next_cursor }))
 }
 
@@ -652,14 +682,19 @@ async fn get_record(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<Uuid>,
 ) -> Result<Json<Record>, ApiError> {
-    state.catalog.get(id).map(Json).ok_or(ApiError::NotFound)
+    state
+        .catalog
+        .get(id)
+        .await?
+        .map(Json)
+        .ok_or(ApiError::NotFound)
 }
 
 async fn get_raw(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<Uuid>,
 ) -> Result<Response, ApiError> {
-    let record = state.catalog.get(id).ok_or(ApiError::NotFound)?;
+    let record = state.catalog.get(id).await?.ok_or(ApiError::NotFound)?;
     let raw = state
         .packs
         .read(&record.storage)
@@ -680,76 +715,109 @@ async fn get_raw(
     Ok(response)
 }
 
+/// One keyset page of hits held in memory at a time. docs/architecture.md line
+/// 88 forbids materialising the whole hit set, which an export of the 数亿 scale
+/// this is sized for would otherwise do.
+const EXPORT_PAGE_SIZE: usize = 1_000;
+
 async fn create_download(
     State(state): State<AppState>,
     Json(request): Json<DownloadRequest>,
 ) -> Result<(StatusCode, Json<DownloadJob>), ApiError> {
-    let id = Uuid::new_v4();
-    let job = DownloadJob {
-        id,
-        state: JobState::Queued,
-        created_at: Utc::now(),
-        record_count: 0,
-        download_url: None,
-        error: None,
-    };
-    state.catalog.insert_job(job.clone());
-    tokio::task::spawn_blocking(move || run_export(state, id, request));
+    let job = state.catalog.create_job(&request).await?;
+    let id = job.id;
+    // Compression and pack reads are blocking; the catalogue pages they are
+    // interleaved with are not.
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || handle.block_on(run_export(state, id, request)));
     Ok((StatusCode::ACCEPTED, Json(job)))
 }
 
-fn run_export(state: AppState, id: Uuid, request: DownloadRequest) {
-    state
-        .catalog
-        .update_job(id, |job| job.state = JobState::Running);
-    let records = state.catalog.all_matching(&request.filter);
-    let extension = match request.format {
-        DownloadFormat::TarGz => "tar.gz",
-        DownloadFormat::ManifestJsonl => "manifest.jsonl",
+async fn run_export(state: AppState, id: Uuid, request: DownloadRequest) {
+    if let Err(error) = state.catalog.start_job(id).await {
+        tracing::error!(job = %id, %error, "could not mark the export as running");
+        return;
+    }
+    let outcome = match write_export(&state, id, &request).await {
+        Ok(count) => Ok((count, format!("exports/{id}.{}", request.format.as_str()))),
+        Err(error) => Err(error.to_string()),
     };
-    let path = state.export_dir.join(format!("{id}.{extension}"));
-    let result = match request.format {
-        DownloadFormat::TarGz => write_tar_gz(&path, &records, &state),
-        DownloadFormat::ManifestJsonl => write_manifest(&path, &records),
-    };
-    state.catalog.update_job(id, |job| match result {
-        Ok(()) => {
-            job.state = JobState::Completed;
-            job.record_count = records.len();
-            job.download_url = Some(format!("/api/v1/downloads/{id}/file"));
-        }
-        Err(error) => {
-            job.state = JobState::Failed;
-            job.error = Some(error.to_string());
-        }
-    });
+    if let Err(error) = state.catalog.finish_job(id, outcome).await {
+        tracing::error!(job = %id, %error, "could not record the export outcome");
+    }
 }
 
-fn write_tar_gz(path: &Path, records: &[Record], state: &AppState) -> anyhow::Result<()> {
-    let output = std::fs::File::create(path)?;
-    let encoder = GzEncoder::new(output, Compression::default());
-    let mut archive = TarBuilder::new(encoder);
-    for record in records {
-        let raw = state.packs.read(&record.storage)?;
-        let mut header = TarHeader::new_gnu();
-        header.set_size(raw.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        archive.append_data(&mut header, format!("{}.mjson", record.id), raw.as_slice())?;
+async fn write_export(
+    state: &AppState,
+    id: Uuid,
+    request: &DownloadRequest,
+) -> anyhow::Result<usize> {
+    let path = state
+        .export_dir
+        .join(format!("{id}.{}", request.format.as_str()));
+    let mut writer = ExportWriter::create(request.format, &path)?;
+    let mut cursor = None;
+    let mut written = 0usize;
+    loop {
+        let (page, next) = state
+            .catalog
+            .scan(&request.filter, cursor, EXPORT_PAGE_SIZE)
+            .await?;
+        for record in &page {
+            writer.append(record, state)?;
+            written += 1;
+        }
+        match next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
     }
-    archive.finish()?;
-    let encoder = archive.into_inner()?;
-    encoder.finish()?;
-    Ok(())
+    writer.finish()?;
+    Ok(written)
 }
 
-fn write_manifest(path: &Path, records: &[Record]) -> anyhow::Result<()> {
-    let mut output = std::fs::File::create(path)?;
-    for record in records {
-        serde_json::to_writer(&mut output, record)?;
-        output.write_all(b"\n")?;
+enum ExportWriter {
+    TarGz(TarBuilder<GzEncoder<std::fs::File>>),
+    Manifest(std::fs::File),
+}
+
+impl ExportWriter {
+    fn create(format: DownloadFormat, path: &Path) -> std::io::Result<Self> {
+        let output = std::fs::File::create(path)?;
+        Ok(match format {
+            DownloadFormat::TarGz => Self::TarGz(TarBuilder::new(GzEncoder::new(
+                output,
+                Compression::default(),
+            ))),
+            DownloadFormat::ManifestJsonl => Self::Manifest(output),
+        })
     }
-    Ok(())
+
+    fn append(&mut self, record: &Record, state: &AppState) -> anyhow::Result<()> {
+        match self {
+            Self::TarGz(archive) => {
+                let raw = state.packs.read(&record.storage)?;
+                let mut header = TarHeader::new_gnu();
+                header.set_size(raw.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                archive.append_data(&mut header, format!("{}.mjson", record.id), raw.as_slice())?;
+            }
+            Self::Manifest(output) => {
+                serde_json::to_writer(&mut *output, record)?;
+                output.write_all(b"\n")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> anyhow::Result<()> {
+        if let Self::TarGz(mut archive) = self {
+            archive.finish()?;
+            archive.into_inner()?.finish()?;
+        }
+        Ok(())
+    }
 }
 
 async fn get_download(
@@ -759,6 +827,7 @@ async fn get_download(
     state
         .catalog
         .get_job(id)
+        .await?
         .map(Json)
         .ok_or(ApiError::NotFound)
 }
@@ -767,7 +836,7 @@ async fn download_file(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<Uuid>,
 ) -> Result<Response, ApiError> {
-    let job = state.catalog.get_job(id).ok_or(ApiError::NotFound)?;
+    let job = state.catalog.get_job(id).await?.ok_or(ApiError::NotFound)?;
     if !matches!(job.state, JobState::Completed) {
         return Err(ApiError::Conflict("download is not ready".into()));
     }
@@ -785,10 +854,27 @@ async fn download_file(
             "manifest.jsonl"
         }
     };
-    let data = tokio::fs::read(state.export_dir.join(format!("{id}.{extension}")))
+    // Streamed, not read: an export of the whole corpus is as large as the pack
+    // corpus itself, and buffering it would put that in the API's heap on top
+    // of the copy already on disk.
+    let file = tokio::fs::File::open(state.export_dir.join(format!("{id}.{extension}")))
         .await
         .map_err(|_| ApiError::NotFound)?;
-    let mut response = data.into_response();
+    // Both headers are the streaming body's replacement for what `Vec<u8>` used
+    // to give for free: axum's `IntoResponse` for bytes sets the content type
+    // and the length, its `Body` impl sets neither, and a download without a
+    // total size is a progress bar that never fills.
+    let length = file.metadata().await.ok().map(|metadata| metadata.len());
+    let mut response = Body::from_stream(ReaderStream::new(file)).into_response();
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    if let Some(length) = length {
+        response
+            .headers_mut()
+            .insert(CONTENT_LENGTH, HeaderValue::from(length));
+    }
     response.headers_mut().insert(
         CONTENT_DISPOSITION,
         HeaderValue::from_str(&format!("attachment; filename=\"{id}.{extension}\""))
@@ -828,9 +914,18 @@ enum ApiError {
     Internal(String),
 }
 
-impl From<IdempotencyError> for ApiError {
-    fn from(error: IdempotencyError) -> Self {
-        ApiError::Conflict(error.to_string())
+impl From<CatalogError> for ApiError {
+    fn from(error: CatalogError) -> Self {
+        match error {
+            CatalogError::Conflict | CatalogError::Pending => ApiError::Conflict(error.to_string()),
+            CatalogError::WindowTooWide(_) => ApiError::BadRequest(error.to_string()),
+            // A `500` is what makes the collector back off, which is the point:
+            // the record is already packed, so the backlog needs ingest to stop
+            // long enough for the index to catch up, not a retry loop.
+            CatalogError::Backlogged(_) | CatalogError::Index(_) | CatalogError::Store(_) => {
+                ApiError::Internal(error.to_string())
+            }
+        }
     }
 }
 
