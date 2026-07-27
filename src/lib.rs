@@ -7,6 +7,7 @@ pub mod majsoul;
 pub mod managed_watch;
 pub mod mihomo;
 pub mod mjai;
+pub mod objects;
 pub mod pack;
 pub mod recovery;
 pub mod watch;

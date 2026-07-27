@@ -51,6 +51,20 @@ fn test_config(data_dir: &std::path::Path, email_api_url: Option<String>) -> Con
         email_api_url,
         email_api_token: None,
         email_from: "noreply@example.com".into(),
+        // Nothing in this suite reaches object storage or the broker yet; these
+        // carry the compiled-in defaults so the literal stays exhaustive.
+        s3_endpoint_url: env_or("MJAI_S3_ENDPOINT_URL", "http://127.0.0.1:9000"),
+        s3_access_key: env_or("MJAI_S3_ACCESS_KEY", "rustfsadmin"),
+        s3_secret_key: env_or("MJAI_S3_SECRET_KEY", "rustfsadmin"),
+        s3_bucket: env_or("MJAI_S3_BUCKET", "mjai-raw"),
+        s3_region: env_or("MJAI_S3_REGION", "us-east-1"),
+        kafka_bootstrap_servers: env_or("MJAI_KAFKA_BOOTSTRAP_SERVERS", "127.0.0.1:9092"),
+        kafka_topic: env_or("MJAI_KAFKA_TOPIC", "mjai.records.raw"),
+        kafka_partitions: 1,
+        kafka_max_lag: 50_000,
+        pack_max_age_secs: 300,
+        gc_grace_secs: 86_400,
+        gc_interval_secs: 3_600,
     }
 }
 
