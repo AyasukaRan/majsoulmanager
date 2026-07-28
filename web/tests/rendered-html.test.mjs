@@ -105,11 +105,38 @@ test("a new collector is created watching every ranked room", async () => {
   // nobody can fetch afterwards, so the default is pinned here and in
   // WatchInstance::default, and the two have to say the same thing.
   const source = await readFile(
-    new URL("../components/watch-control-panel.tsx", import.meta.url),
+    new URL("../components/watch/instance-list.tsx", import.meta.url),
     "utf8",
   );
   assert.match(source, /room: "all"/);
   assert.match(source, /<option value="all">全部<\/option>/);
+});
+
+/**
+ * The room field sat at its default for days because it did not look like a
+ * setting among a page of readings, and an operator following a live collection
+ * was one stray click from editing what drove it. Configuration reappearing on
+ * the monitoring page is exactly the regression this guards.
+ */
+test("the monitoring page holds no configuration and points at the settings page", async () => {
+  const [watch, settings, shell] = await Promise.all(
+    [
+      "app/(dashboard)/watch/page.tsx",
+      "app/(dashboard)/settings/page.tsx",
+      "components/app-shell.tsx",
+    ].map((file) => readFile(new URL(file, projectRoot), "utf8")),
+  );
+
+  assert.doesNotMatch(watch, /components\/watch\//);
+  assert.doesNotMatch(watch, /WatchSettings|WatchServiceCard|WatchProxyCard/);
+  assert.match(watch, /href="\/settings"/);
+
+  assert.match(settings, /<WatchSettings \/>/);
+  // A member reaching the settings route would be handed the proxy subscription
+  // field and the stop button, so the page turns them away rather than only
+  // hiding the nav entry.
+  assert.match(settings, /user\.role !== "admin"/);
+  assert.match(shell, /href: "\/settings".+admin: true/);
 });
 
 test("contains shadcn configuration and no disposable starter", async () => {
