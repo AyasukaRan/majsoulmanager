@@ -9,6 +9,7 @@ import {
   Layers3,
   LogOut,
   Radio,
+  Settings,
   Users,
 } from "lucide-react";
 import type { SessionUser } from "@/lib/session";
@@ -19,6 +20,9 @@ const nav = [
   { href: "/records", label: "牌谱索引", icon: Database },
   { href: "/watch", label: "Watch 服务", icon: Radio },
   { href: "/exports", label: "批量导出", icon: Archive },
+  // Last, beside 用户管理: the two entries that change how the deployment runs
+  // rather than report on it, and the two the page itself refuses to a member.
+  { href: "/settings", label: "设置", icon: Settings, admin: true },
   { href: "/users", label: "用户管理", icon: Users, admin: true },
 ];
 

@@ -1633,6 +1633,49 @@ async fn lists_the_newest_download_jobs() {
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 
+/// A configuration is saved whole, so an edit built on a revision that has moved
+/// on does not merge — it replaces, deleting whatever was added since. A second
+/// console tab, or one left open across a deploy, would take a collector and its
+/// state key with it, and the queue named by that key would be orphaned while
+/// both tabs reported success.
+#[tokio::test]
+async fn refuses_a_configuration_edited_against_a_revision_that_moved_on() {
+    let (state, data_dir) = test_state().await;
+    let app = api::router(state.clone());
+    let stale = state.watch_service.config();
+    let body = serde_json::to_string(&stale).unwrap();
+
+    let accepted = app
+        .clone()
+        .oneshot(watch_config_request(&body))
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::OK);
+    assert_eq!(json_body(accepted).await["revision"], stale.revision + 1);
+
+    // Byte for byte what the first save sent, which is what a tab that has not
+    // re-read holds. 412 rather than 409: the edit has to be rebuilt on the
+    // current document, not retried as it stands.
+    let refused = app.oneshot(watch_config_request(&body)).await.unwrap();
+    assert_eq!(refused.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(
+        state.watch_service.config().revision,
+        stale.revision + 1,
+        "a refused save must not have moved the revision"
+    );
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+fn watch_config_request(body: &str) -> Request<Body> {
+    Request::builder()
+        .method("PUT")
+        .uri("/api/v1/watch/config")
+        .header(header::AUTHORIZATION, "Bearer test-secret")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_owned()))
+        .unwrap()
+}
+
 #[tokio::test]
 async fn updates_and_persists_online_watch_configuration() {
     let (state, data_dir) = test_state().await;

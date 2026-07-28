@@ -159,12 +159,8 @@ pub(crate) async fn run(
             }
         }
     }
-    let state_path = dependencies
-        .data_dir
-        .join(format!("watch/state-{}.json", instance.id));
-    let discovery_dir = dependencies
-        .data_dir
-        .join(format!("watch/discovered/{}", instance.id));
+    let state_path = state_path(&dependencies.data_dir, &instance);
+    let discovery_dir = discovery_dir(&dependencies.data_dir, &instance);
     // Shared: the gateway, package version and version floor are properties of
     // the Majsoul deployment, not of the account, so instances benefit from
     // each other's lookups.
@@ -318,6 +314,26 @@ pub(crate) async fn run(
         );
         tokio::time::sleep(Duration::from_secs(RECONNECT_DELAY_SECS)).await;
     }
+}
+
+/// This collector's working queue, named by the instance's immutable key and
+/// never by its id.
+///
+/// The id is a label an operator may rename at any moment, and a renamed state
+/// file is not reported missing: [`load_state`] answers `Ok` with an empty
+/// queue for a file that is not there, so the collector would come back up
+/// looking healthy while every game it had seen live but not yet fetched — up
+/// to [`GIVE_UP_SECS`] of them, still being played or still answering 1203 —
+/// was left in a file nothing will ever open again.
+fn state_path(data_dir: &Path, instance: &WatchInstance) -> PathBuf {
+    data_dir.join(format!("watch/state-{}.json", instance.key))
+}
+
+/// Where [`append_discovered`] writes, keyed the same way and for a weaker
+/// version of the same reason: a rename would not lose the audit trail, but it
+/// would silently start a second one beside it with nothing joining the two.
+fn discovery_dir(data_dir: &Path, instance: &WatchInstance) -> PathBuf {
+    data_dir.join(format!("watch/discovered/{}", instance.key))
 }
 
 /// Renders a proxy URL as `scheme://host[:port]`, never exposing credentials.
@@ -1110,6 +1126,27 @@ mod tests {
 
         // Anything that is not a server answer at all is a transport failure.
         assert!(reconnects_on(&anyhow::Error::msg("connection reset")));
+    }
+
+    /// Issue #37: renaming a collector used to move its state file, and a state
+    /// file that has moved reads back as an empty queue rather than as an
+    /// error, discarding every game already seen live and not yet fetched.
+    #[test]
+    fn renaming_a_collector_leaves_its_queue_and_its_discovery_log_where_they_are() {
+        let data_dir = Path::new("/var/lib/mjai");
+        let mut instance = WatchInstance {
+            id: "three-player".into(),
+            key: "three-player".into(),
+            ..WatchInstance::default()
+        };
+        let queue = state_path(data_dir, &instance);
+        let discovered = discovery_dir(data_dir, &instance);
+        assert!(queue.ends_with("watch/state-three-player.json"));
+        assert!(discovered.ends_with("watch/discovered/three-player"));
+
+        instance.id = "sanma".into();
+        assert_eq!(state_path(data_dir, &instance), queue);
+        assert_eq!(discovery_dir(data_dir, &instance), discovered);
     }
 
     #[test]
