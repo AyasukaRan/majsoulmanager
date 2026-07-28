@@ -8,6 +8,7 @@ import {
   type MihomoStatus,
   type WatchServiceConfig,
 } from "@/lib/mjai-api";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { useBusyAction } from "@/components/watch/busy-action";
 import { WatchProxyCard } from "@/components/watch/proxy-card";
@@ -46,10 +47,27 @@ export function WatchSettings() {
   }, [refresh]);
 
   if (!config) {
+    // A failed first read used to leave this page on the loading line forever,
+    // with the error set into a message that only the loaded branch renders. On
+    // the old combined page the status panel below kept polling and showed its
+    // own amber badge, so the operator still got a signal; alone on this page
+    // there is nothing else to notice, and the only way out was a browser
+    // reload.
     return (
       <Card className="border-border/70 shadow-none">
-        <CardContent className="flex h-36 items-center justify-center text-sm text-muted-foreground">
-          正在读取 Watch 与代理配置…
+        <CardContent className="flex h-36 flex-col items-center justify-center gap-3 text-sm text-muted-foreground">
+          {message ? (
+            <>
+              <p className="text-center text-xs text-red-700 dark:text-red-300">
+                读取 Watch 与代理配置失败：{message}
+              </p>
+              <Button variant="outline" size="sm" onClick={() => void refresh()}>
+                重试
+              </Button>
+            </>
+          ) : (
+            "正在读取 Watch 与代理配置…"
+          )}
         </CardContent>
       </Card>
     );

@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 
 import {
+  ApiRequestError,
   jsonRequest,
   type InstalledWatchModule,
   type WatchModuleRef,
@@ -68,14 +69,30 @@ export function WatchServiceCard({
 
   async function saveConfig() {
     await run("保存失败", async () => {
-      const saved = await jsonRequest<WatchServiceConfig>("/api/watch/config", {
-        method: "PUT",
-        body: JSON.stringify(config),
-      });
-      // The response carries the key the backend assigned to every instance
-      // created here, and the next save hands it straight back.
-      onChange(saved);
-      return `配置 r${saved.revision} 已保存并应用`;
+      try {
+        const saved = await jsonRequest<WatchServiceConfig>(
+          "/api/watch/config",
+          { method: "PUT", body: JSON.stringify(config) },
+        );
+        // The response carries the key the backend assigned to every instance
+        // created here, and the next save hands it straight back.
+        onChange(saved);
+        return `配置 r${saved.revision} 已保存并应用`;
+      } catch (error) {
+        // A configuration is saved whole, so an edit built on a revision that
+        // has moved on would delete whatever was added since — including a
+        // collector, and with it the queue named by the key that collector was
+        // never told about. The backend refuses it; this pulls the current
+        // document down so the operator can see what changed and redo the edit
+        // on top of it, rather than being left holding one that can never be
+        // saved. Only this status: every other failure means the edit in hand
+        // is still the right one, and discarding it would be the rudeness.
+        if (error instanceof ApiRequestError && error.status === 412) {
+          await onReload();
+          throw new Error("配置已被其他人修改，已重新载入当前配置，请重新编辑后保存");
+        }
+        throw error;
+      }
     });
   }
 

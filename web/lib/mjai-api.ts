@@ -245,9 +245,30 @@ export async function jsonRequest<T>(
     value = null;
   }
   if (!response.ok || value === null) {
-    throw new Error(value?.error ?? `请求失败(${response.status})`);
+    throw new ApiRequestError(
+      value?.error ?? `请求失败(${response.status})`,
+      response.status,
+    );
   }
   return value;
+}
+
+/**
+ * Carries the status alongside the message, because some failures need a
+ * different response and not just a different sentence: a 412 on a configuration
+ * save means the document was edited elsewhere and this copy has to be rebuilt
+ * on the current one, where every other failure means the edit in hand is still
+ * the right one to retry. Callers that only render `error.message` are
+ * unaffected.
+ */
+export class ApiRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = "ApiRequestError";
+  }
 }
 
 /**

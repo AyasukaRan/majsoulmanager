@@ -1109,6 +1109,10 @@ enum ApiError {
     Forbidden(String),
     #[error("{0}")]
     Conflict(String),
+    /// The caller edited a version of something that has since moved on, and
+    /// the edit has to be rebuilt rather than retried.
+    #[error("{0}")]
+    PreconditionFailed(String),
     #[error("{0}")]
     Internal(String),
 }
@@ -1156,6 +1160,14 @@ impl From<WatchServiceError> for ApiError {
                 ApiError::BadRequest(error.to_string())
             }
             WatchServiceError::ModuleHealth(_) => ApiError::Conflict(error.to_string()),
+            // 412 rather than 409, which module health already uses: the two
+            // need different answers from a client. A failed health check means
+            // fix the module and try again with the same edit; a revision
+            // conflict means the edit itself is against a document that no
+            // longer exists and has to be rebuilt on the current one.
+            WatchServiceError::RevisionConflict { .. } => {
+                ApiError::PreconditionFailed(error.to_string())
+            }
             WatchServiceError::Io(_) | WatchServiceError::Json(_) => {
                 ApiError::Internal(error.to_string())
             }
@@ -1204,6 +1216,7 @@ impl IntoResponse for ApiError {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::PreconditionFailed(_) => StatusCode::PRECONDITION_FAILED,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, Json(serde_json::json!({"error": self.to_string()}))).into_response()

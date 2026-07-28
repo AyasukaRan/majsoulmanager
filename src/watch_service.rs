@@ -292,10 +292,27 @@ impl WatchServiceConfig {
     /// console that returns the key it was given, so a missing key there means
     /// the instance has never been stored at all.
     fn adopt_ids_as_keys(&mut self) -> bool {
+        // An id is only safe to adopt if nothing already holds it as a key. A
+        // configuration where an instance was renamed keeps the old id as that
+        // instance's key, so a collector added by hand under the freed-up name
+        // would otherwise be given a key that is already in use, and two
+        // collectors sharing one state file is a queue each of them believes it
+        // owns. Minting instead costs the hand-added instance nothing: it has
+        // no queue on disk to inherit.
+        let taken: std::collections::HashSet<String> = self
+            .instances
+            .iter()
+            .filter(|instance| !instance.key.is_empty())
+            .map(|instance| instance.key.clone())
+            .collect();
         let mut adopted = false;
         for instance in &mut self.instances {
             if instance.key.is_empty() {
-                instance.key = instance.id.clone();
+                instance.key = if taken.contains(&instance.id) {
+                    new_instance_key()
+                } else {
+                    instance.id.clone()
+                };
                 adopted = true;
             }
         }
@@ -498,6 +515,10 @@ pub enum WatchAction {
 pub enum WatchServiceError {
     #[error("invalid watch configuration: {0}")]
     InvalidConfig(String),
+    #[error(
+        "watch configuration has moved on: this edit was made against r{submitted}, the service is at r{current}"
+    )]
+    RevisionConflict { submitted: u64, current: u64 },
     #[error("module not installed: {0}/{1}")]
     ModuleNotInstalled(String, String),
     #[error("module package is invalid: {0}")]
@@ -943,6 +964,15 @@ impl WatchSupervisor {
                 // hand-edited rename in config.json is as safe as one made
                 // through the console.
                 let adopted = config.adopt_ids_as_keys();
+                // Before the document is written back, not after. Adoption can
+                // produce a configuration that does not validate — a
+                // hand-added instance whose id is already some other
+                // instance's key is the reachable case — and persisting first
+                // would replace a file that at least parsed with one that
+                // cannot start, turning a rejected edit into a boot loop that
+                // takes the whole management API down with it. Validation runs
+                // again below for the paths that do not reach here.
+                config.validate()?;
                 if legacy {
                     // The single collector kept its state in an unsuffixed
                     // file; move it so the migrated instance picks up its
@@ -1020,10 +1050,33 @@ impl WatchSupervisor {
         next.mint_missing_keys();
         next.validate()?;
         self.probe_modules(&next).await?;
-        let current = self.config();
-        next.revision = current.revision.saturating_add(1);
-        persist_json(&self.config_path, &next)?;
-        *self.config.write() = next.clone();
+        let submitted = next.revision;
+        {
+            // A configuration is replaced whole, so a caller editing a revision
+            // that has moved on is not submitting a stale field — it is
+            // submitting a document that never existed, which deletes whatever
+            // was added since and revives whatever was removed. A collector
+            // added by someone else disappears along with its state file, and a
+            // client that predates a field submits nothing for it. Refusing is
+            // the only answer that does not silently pick a winner, and the
+            // console already shows the revision it is editing, so an operator
+            // is told exactly what they would be reloading past.
+            //
+            // Checked and swapped under one lock, `persist_json` included: the
+            // state this guards against is precisely two writers interleaving,
+            // and a file that disagrees with memory is the same failure one
+            // step later. It is one small synchronous write.
+            let mut current = self.config.write();
+            if submitted != current.revision {
+                return Err(WatchServiceError::RevisionConflict {
+                    submitted,
+                    current: current.revision,
+                });
+            }
+            next.revision = current.revision.saturating_add(1);
+            persist_json(&self.config_path, &next)?;
+            *current = next.clone();
+        }
         if next.enabled {
             self.reload().await?;
         } else {
@@ -1496,6 +1549,41 @@ mod tests {
         config.instances[1].id = "sanma".into();
         assert!(!config.adopt_ids_as_keys());
         assert_eq!(config.instances[1].key, "three-player");
+    }
+
+    /// Adoption is only safe for an id nothing already holds. Renaming frees an
+    /// id while its old value stays on as that instance's key, so a collector
+    /// added by hand under the freed name would be handed a key already in use —
+    /// two collectors on one state file, each believing it owns the queue. The
+    /// configuration also has to stay loadable: this used to be caught by
+    /// `validate` only after the broken document had been written back over the
+    /// working one, which turns a bad hand edit into a boot loop.
+    #[test]
+    fn adoption_never_hands_out_a_key_another_instance_already_holds() {
+        let mut config = WatchServiceConfig {
+            instances: vec![
+                WatchInstance {
+                    id: "four-player".into(),
+                    key: "default".into(),
+                    ..WatchInstance::default()
+                },
+                WatchInstance {
+                    id: "default".into(),
+                    key: String::new(),
+                    account_secret_ref: "env:OTHER_ACCOUNT".into(),
+                    ..WatchInstance::default()
+                },
+            ],
+            ..WatchServiceConfig::default()
+        };
+
+        assert!(config.adopt_ids_as_keys());
+        assert_ne!(
+            config.instances[1].key, "default",
+            "the renamed instance's queue was handed to a second collector"
+        );
+        assert!(!config.instances[1].key.is_empty());
+        config.validate().unwrap();
     }
 
     /// The API rule, which is the inverse: a console round-trips the key it was
