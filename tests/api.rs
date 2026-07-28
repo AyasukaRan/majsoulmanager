@@ -1325,7 +1325,9 @@ async fn collapsed_rows(config: &Config, source: &str) -> u64 {
 /// It walks the whole index rather than this test's source, because that is what
 /// the pass does, so it is one of the slower cases in the suite; every row it
 /// meets from another test points at a pack outside this data directory and is
-/// skipped, which is the same path an unreadable pack takes in production.
+/// skipped, which is the same path an unreadable pack takes in production — and
+/// which is why the assertion at the end is that the pass did *not* mark itself
+/// done.
 #[tokio::test]
 async fn rewrites_the_metadata_of_a_row_indexed_before_the_parser_fix() {
     let (state, data_dir) = test_state().await;
@@ -1387,12 +1389,24 @@ async fn rewrites_the_metadata_of_a_row_indexed_before_the_parser_fix() {
         "the rewritten row landed beside the old one instead of over it"
     );
 
+    // And the marker is deliberately withheld. The shared index carries rows
+    // from every other case in the suite, whose packs sit in data directories
+    // this process cannot reach, so this pass necessarily meets records it
+    // cannot read — the same shape as an object store that will not serve, and
+    // the case the one-shot marker must not be spent on. The rewrite above still
+    // happened, which is the point: the pass does what it can and simply has not
+    // earned the right to declare the corpus done. When the marker is written is
+    // pinned by `backfill`'s own unit tests, where nothing else is in the index
+    // to make the answer depend on what the rest of the suite left behind.
     let marked = sqlx::query("SELECT 1 FROM completed_backfills WHERE name = $1")
         .bind(mjai_management::backfill::NAME)
         .fetch_optional(state.catalog.postgres())
         .await
         .unwrap();
-    assert!(marked.is_some(), "the backfill did not mark itself done");
+    assert!(
+        marked.is_none(),
+        "a pass that could not read every row must not mark itself done"
+    );
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 
