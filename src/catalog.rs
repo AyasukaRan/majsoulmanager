@@ -609,13 +609,18 @@ impl Catalog {
         outcome: Result<(usize, String), String>,
     ) -> Result<(), CatalogError> {
         let (state, count, object_key, error) = match outcome {
-            Ok((count, object_key)) => ("completed", count as i64, Some(object_key), None),
-            Err(error) => ("failed", 0, None, Some(error)),
+            Ok((count, object_key)) => ("completed", Some(count as i64), Some(object_key), None),
+            // The count is left as `record_job_progress` last published it
+            // rather than zeroed. Overwriting it here would make a job that
+            // died on its last page read exactly like one that died on its
+            // first, which is the ambiguity that publishing progress at all was
+            // meant to remove.
+            Err(error) => ("failed", None, None, Some(error)),
         };
         sqlx::query(
             "UPDATE download_jobs
-             SET state = $2, record_count = $3, result_object_key = $4, error = $5,
-                 completed_at = now()
+             SET state = $2, record_count = coalesce($3, record_count),
+                 result_object_key = $4, error = $5, completed_at = now()
              WHERE id = $1",
         )
         .bind(id)

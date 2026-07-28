@@ -163,14 +163,19 @@ pub struct Config {
     pub pack_max_age_secs: u64,
 
     /// The age at which a pack seals once the worker has caught up with the
-    /// log. Waiting out the full age limit with nothing left to consume only
-    /// delays every record in the pack becoming readable, and leaves the broker
-    /// holding the only copy of bytes the API has already acknowledged. It also
-    /// costs least exactly when it fires: a quiet period produces a small pack
-    /// because few records arrived, so the objects this adds are proportional
-    /// to the traffic that produced them rather than to the clock. Under load
-    /// the worker is never at the end of the log, so the size target still
-    /// decides and the object count still holds.
+    /// topic. Waiting out the full age limit with nothing left to consume only
+    /// delays every record in the pack becoming readable and prolongs the window
+    /// in which the broker's single volume holds the only copy of bytes the API
+    /// has already answered `202` for.
+    ///
+    /// It buys that with one object and one ClickHouse part per interval in
+    /// which anything arrived at all — the age runs from the pack's first
+    /// append, so a continuous trickle seals every interval whether the pack
+    /// holds one record or twenty. At 30 seconds that is at most 2,880 a day
+    /// against 288 at the age limit, and both the GC's bucket listing and
+    /// `indexed_counts`' grouping scale with the number of packs. Raise it if
+    /// that starts to cost more than the visibility is worth; past that point
+    /// the honest fix is compacting small packs, not waiting longer.
     #[arg(long, env = "MJAI_PACK_IDLE_SECS", default_value_t = 30)]
     pub pack_idle_secs: u64,
 

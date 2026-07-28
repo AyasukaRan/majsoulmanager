@@ -488,29 +488,39 @@ async fn ingest_batch(
     let mut output = tokio::fs::File::create(&staging_path)
         .await
         .map_err(|error| ApiError::Internal(error.to_string()))?;
-    let mut received = 0usize;
-    while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|error| ApiError::BadRequest(error.to_string()))?;
-        if let Ok(data) = frame.into_data() {
-            received = received
-                .checked_add(data.len())
-                .ok_or(ApiError::PayloadTooLarge(state.config.max_batch_bytes))?;
-            if received > state.config.max_batch_bytes {
-                drop(output);
-                let _ = tokio::fs::remove_file(&staging_path).await;
-                return Err(ApiError::PayloadTooLarge(state.config.max_batch_bytes));
+    // Every exit from the upload has to take the half-written archive with it.
+    // A 400MB import whose connection resets at 300MB is the ordinary failure
+    // here — a collector retries it, and the operator may retry it several
+    // times — and nothing sweeps this directory, so a leak on that path fills
+    // the API's disk one abandoned attempt at a time until someone notices.
+    let uploaded = async {
+        let mut received = 0usize;
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|error| ApiError::BadRequest(error.to_string()))?;
+            if let Ok(data) = frame.into_data() {
+                received = received
+                    .checked_add(data.len())
+                    .ok_or(ApiError::PayloadTooLarge(state.config.max_batch_bytes))?;
+                if received > state.config.max_batch_bytes {
+                    return Err(ApiError::PayloadTooLarge(state.config.max_batch_bytes));
+                }
+                output
+                    .write_all(&data)
+                    .await
+                    .map_err(|error| ApiError::Internal(error.to_string()))?;
             }
-            output
-                .write_all(&data)
-                .await
-                .map_err(|error| ApiError::Internal(error.to_string()))?;
         }
+        output
+            .flush()
+            .await
+            .map_err(|error| ApiError::Internal(error.to_string()))
     }
-    output
-        .flush()
-        .await
-        .map_err(|error| ApiError::Internal(error.to_string()))?;
+    .await;
     drop(output);
+    if let Err(error) = uploaded {
+        let _ = tokio::fs::remove_file(&staging_path).await;
+        return Err(error);
+    }
 
     let worker_state = state.clone();
     // The tar walk stays on a blocking thread; only the catalogue calls inside
@@ -663,19 +673,28 @@ async fn process_batch_archive(
                     continue;
                 }
                 response.accepted += 1;
-                // Produced in size-bounded chunks rather than one request at the end: a 50,000 member
-                // import is gigabytes, and holding all of it to produce at once would trade the pack
-                // worker's memory bound for the API's. The record joins the chunk before the bound is
-                // tested rather than after, because a record still in hand while a flush is in flight
-                // holds a claim that nothing owns, and a failed flush would drop it un-released.
-                // Overshooting the bound by one record costs nothing: `Kafka::produce_batch` re-chunks
-                // by its own, so this accumulator only decides how much is resident at once, never
-                // what fits in a produce request.
+                // Produced in size-bounded chunks rather than one request at the end: a 50,000
+                // member import is gigabytes, and holding all of it to produce at once would trade
+                // the pack worker's memory bound for the API's.
+                //
+                // The bound is tested before the record joins the chunk, so a chunk stays under it
+                // and `produce_batch` sends it as a single request per partition. Pushing first
+                // and testing after would overshoot by up to one record, which splits every flush
+                // in two, and a split whose first request lands and whose second fails releases
+                // the claims of records that are already durably in the topic: the retry produces
+                // them again under fresh record ids, and `record_id` is in the sorting key, so
+                // ReplacingMergeTree cannot converge those two rows. The record in hand is not in
+                // `pending` yet and so is not covered by the walk's release, which is why the
+                // failing branch releases it explicitly rather than dropping it.
+                if pending_bytes + claimed.raw_len() > MAX_PRODUCE_BATCH_BYTES
+                    && let Err(error) =
+                        produce_batch_chunk(state, &mut pending, &mut pending_bytes).await
+                {
+                    indexer::abandon_claimed(&state.catalog, vec![claimed]).await;
+                    return Err(error);
+                }
                 pending_bytes += claimed.raw_len();
                 pending.push(claimed);
-                if pending_bytes >= MAX_PRODUCE_BATCH_BYTES {
-                    produce_batch_chunk(state, &mut pending, &mut pending_bytes).await?;
-                }
             }
             produce_batch_chunk(state, &mut pending, &mut pending_bytes).await
         }

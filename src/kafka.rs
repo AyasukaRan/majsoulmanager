@@ -54,8 +54,15 @@ use crate::config::Config;
 /// one record that crosses the bound. Counting uncompressed bytes against a
 /// limit the broker applies to the compressed batch errs the safe way.
 ///
-/// Public because the batch import path stops accumulating at the same bound,
-/// which is what makes one `produce_batch` call one produce request.
+/// Public because the batch import path accumulates against the same bound,
+/// which is what keeps a chunk to one produce request per partition. It counts
+/// raw bytes where `produce_chunks` counts framed ones, so the two agree only
+/// to within the framing; `produce_chunks` is the one that actually enforces
+/// the broker's limit, and this one exists so that the common case does not
+/// reach it with a batch that has to be split. That matters because a split
+/// whose first request lands and whose second fails releases claims for records
+/// already durably in the topic, and the retry re-produces them under fresh
+/// record ids that `ReplacingMergeTree` cannot converge.
 pub const MAX_PRODUCE_BATCH_BYTES: usize = 768 * 1024;
 
 /// rskafka hardcodes `acks = -1` and a 30 second broker-side produce timeout,

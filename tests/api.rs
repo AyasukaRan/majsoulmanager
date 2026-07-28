@@ -644,6 +644,45 @@ async fn fails_the_batch_when_records_cannot_be_stored() {
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 
+/// A batch that fails partway has already claimed idempotency keys for the
+/// members it got through, and those records never reached the topic. Unless
+/// the claims are released, the retry the operator is supposed to make is told
+/// they are duplicates and skips them: the records exist nowhere, and every
+/// response says the import succeeded.
+///
+/// The failure is forced with a record ceiling of one, because it is the only
+/// way to fail the walk *after* a member has been claimed — the backlog ceiling
+/// used above is checked before the claim, so it leaves nothing to release and
+/// would let this whole path be deleted with the suite still green.
+#[tokio::test]
+async fn releases_the_claims_of_a_batch_that_failed_partway() {
+    let data_dir = test_data_dir();
+    let source = test_source(&data_dir);
+    let archive = tar_of(&two_records());
+
+    let mut ceilinged = test_config(&data_dir, None);
+    ceilinged.max_batch_records = 1;
+    let response = api::router(AppState::local(ceilinged).await.unwrap())
+        .oneshot(batch_request(&source, "batch-partial", archive.clone()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // The same archive under the same key. The first member was claimed and
+    // dropped, so it has to come back as accepted; counted as a duplicate, it
+    // would be a record this server lost while reporting success.
+    let state = AppState::local(test_config(&data_dir, None)).await.unwrap();
+    let response = api::router(state)
+        .oneshot(batch_request(&source, "batch-partial", archive))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = json_body(response).await;
+    assert_eq!(body["accepted"], 2, "a released claim must re-ingest");
+    assert_eq!(body["duplicates"], 0);
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
 #[tokio::test]
 async fn creates_and_downloads_a_filtered_archive() {
     let (state, data_dir) = test_state().await;

@@ -43,9 +43,17 @@ export function dayStart(day: string) {
 
 export function dayEnd(day: string) {
   if (!day) return ""
-  const end = new Date(`${day}T00:00:00`)
-  end.setDate(end.getDate() + 1)
-  return end.toISOString()
+  const next = new Date(`${day}T00:00:00`)
+  next.setDate(next.getDate() + 1)
+  // Resolved back through `dayStart` rather than used directly, so that
+  // `dayEnd(d)` and `dayStart(d + 1)` are the same instant by construction. In
+  // the few zones whose DST jump lands on midnight, one of those midnights does
+  // not exist and the runtime resolves it an hour away; two bounds computed
+  // independently would then overlap, and that hour's records would come back
+  // under both days — in the table, and in two separate export archives.
+  return dayStart(
+    `${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, "0")}-${String(next.getDate()).padStart(2, "0")}`,
+  )
 }
 
 const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB", "PB"]

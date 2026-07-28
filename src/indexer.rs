@@ -35,6 +35,19 @@ use crate::{
 /// a spin.
 const RETRY_DELAY: Duration = Duration::from_secs(2);
 
+/// The ceiling on the wait between consecutive seal failures.
+///
+/// A seal that keeps failing re-packs the same backlog under a fresh key every
+/// time, and an attempt whose upload lands but whose insert does not leaves that
+/// object behind for the GC, so it is the *retry* cadence and not the seal
+/// cadence that decides what a downstream outage costs in objects and in bytes
+/// written. Without the backoff that cadence is `MJAI_PACK_IDLE_SECS`, and
+/// lowering that knob to shrink the window in which the broker holds the only
+/// copy of a record would silently multiply the churn of every ClickHouse
+/// outage by the same factor. Capped low enough that recovery is picked up
+/// within about a minute.
+const MAX_SEAL_BACKOFF: Duration = Duration::from_secs(64);
+
 #[derive(Debug, Error)]
 pub enum IngestError {
     /// The caller's record is bad. Nothing was claimed and nothing was
@@ -336,6 +349,8 @@ pub struct PackWorker {
     /// signal that it has caught up with the partition. It decides whether an
     /// open pack is still waiting for records or has simply stopped growing.
     at_end_of_log: bool,
+    /// Consecutive failed seals, which is what the retry backs off on.
+    seal_failures: u32,
     open: Option<PackWriter>,
     rows: Vec<Record>,
 }
@@ -362,6 +377,7 @@ impl PackWorker {
             cursor: committed,
             committed,
             at_end_of_log: false,
+            seal_failures: 0,
             open: None,
             rows: Vec::new(),
         })
@@ -408,17 +424,21 @@ impl PackWorker {
                 }
             }
             let stopping = *shutdown.borrow_and_update();
-            if (stopping || self.pack_is_ready())
-                && self.open.is_some()
-                && let Err(error) = self.seal().await
-            {
-                tracing::error!(
-                    partition = self.partition,
-                    %error,
-                    "封包、上传或写索引失败，本批记录会从上次提交的位点重新消费"
-                );
-                self.discard();
-                tokio::time::sleep(RETRY_DELAY).await;
+            if (stopping || self.pack_is_ready()) && self.open.is_some() {
+                match self.seal().await {
+                    Ok(()) => self.seal_failures = 0,
+                    Err(error) => {
+                        tracing::error!(
+                            partition = self.partition,
+                            %error,
+                            failures = self.seal_failures + 1,
+                            "封包、上传或写索引失败，本批记录会从上次提交的位点重新消费"
+                        );
+                        self.discard();
+                        self.seal_failures = self.seal_failures.saturating_add(1);
+                        tokio::time::sleep(seal_backoff(self.seal_failures)).await;
+                    }
+                }
             }
             if stopping {
                 tracing::info!(partition = self.partition, "pack worker stopped");
@@ -581,6 +601,13 @@ impl PackWorker {
     }
 }
 
+/// How long to wait before retrying a seal that has failed this many times in a
+/// row, doubling from `RETRY_DELAY` up to `MAX_SEAL_BACKOFF`.
+fn seal_backoff(consecutive_failures: u32) -> Duration {
+    let doublings = consecutive_failures.saturating_sub(1).min(16);
+    (RETRY_DELAY * 2u32.saturating_pow(doublings)).min(MAX_SEAL_BACKOFF)
+}
+
 /// The seal decision, lifted out of the worker so it can be tested without a
 /// broker, an object store and an index behind it.
 ///
@@ -589,9 +616,15 @@ impl PackWorker {
 /// the end of the log with a pack that has stopped growing: nothing is coming
 /// to fill it, so waiting only delays every record in it becoming readable and
 /// prolongs the window in which the broker's single volume holds the only copy
-/// of bytes the API has already answered `202` for. It cannot inflate the
-/// object count under load either — a worker with a backlog is never at the end
-/// of the log, so the size target is what decides whenever it matters.
+/// of bytes the API has already answered `202` for.
+///
+/// What it costs is one object per idle interval in which anything arrived at
+/// all, not per record: the age is measured from the pack's first append, so a
+/// continuous trickle seals a pack every `idle_age` whether that pack holds one
+/// record or twenty. `MJAI_PACK_IDLE_SECS` carries the arithmetic. Note that
+/// "at the end of the log" means a one second long poll came back empty, which
+/// a worker draining a bulk import faster than the API produces will also see,
+/// so the size target does not always win under load.
 fn should_seal(
     size: u64,
     target: u64,
@@ -676,6 +709,23 @@ mod tests {
         assert!(
             ready(1, 30, true),
             "caught up with the log, a pack past the idle age has stopped growing"
+        );
+    }
+
+    /// The retry cadence has to be decoupled from the seal cadence: every
+    /// failed attempt re-uploads the backlog under a fresh key, so a seal that
+    /// keeps failing at the idle interval would leave ten times the orphans of
+    /// one failing at the age limit purely because the visibility knob moved.
+    #[test]
+    fn backs_off_between_repeated_seal_failures() {
+        assert_eq!(seal_backoff(1), RETRY_DELAY, "the first retry is immediate");
+        assert_eq!(seal_backoff(2), RETRY_DELAY * 2);
+        assert_eq!(seal_backoff(4), RETRY_DELAY * 8);
+        assert_eq!(seal_backoff(6), MAX_SEAL_BACKOFF, "and then it caps");
+        assert_eq!(
+            seal_backoff(u32::MAX),
+            MAX_SEAL_BACKOFF,
+            "a long outage must not overflow into a wait nobody survives"
         );
     }
 
