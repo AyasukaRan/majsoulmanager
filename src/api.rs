@@ -754,6 +754,7 @@ fn push_batch_error(errors: &mut Vec<String>, error: String) {
 struct SearchQuery {
     source: Option<String>,
     player: Option<String>,
+    rule: Option<String>,
     received_from: Option<DateTime<Utc>>,
     received_to: Option<DateTime<Utc>>,
     played_from: Option<DateTime<Utc>>,
@@ -785,6 +786,7 @@ async fn search(
     let filter = RecordFilter {
         source: query.source,
         player: query.player,
+        rule: query.rule,
         received_from: query.received_from,
         received_to: query.received_to,
         played_from: query.played_from,

@@ -1249,6 +1249,167 @@ async fn an_exclusive_sub_millisecond_upper_bound_keeps_the_record_it_covers() {
     );
 }
 
+/// docs/architecture.md lists `rule` among the filter fields, and choosing a
+/// composite token for it is only worth anything if a page can be narrowed to
+/// one. Three records under this test's own source, of which exactly one is the
+/// mode being asked for; the source is part of every filter here because the
+/// index is shared and durable, so a page filtered on the rule alone would also
+/// answer with whatever every other run has left behind.
+#[tokio::test]
+async fn filters_a_page_down_to_one_rule() {
+    let data_dir = test_data_dir();
+    let config = test_config(&data_dir, None);
+    let source = test_source(&data_dir);
+    let catalog = Catalog::connect(&config).await.unwrap();
+    for (index, rule) in [Some("3p-jade-south"), Some("4p-throne-east"), None]
+        .into_iter()
+        .enumerate()
+    {
+        let mut record = sample_record(&source, index as u32);
+        record.rule = rule.map(str::to_owned);
+        catalog.insert_batch(&[record]).await.unwrap();
+    }
+
+    let filter = RecordFilter {
+        source: Some(source.clone()),
+        rule: Some("3p-jade-south".into()),
+        ..RecordFilter::default()
+    };
+    let (page, _) = catalog.search(&filter, None, 10).await.unwrap();
+    assert_eq!(page.len(), 1, "the rule filter did not narrow the page");
+    assert_eq!(page[0].rule.as_deref(), Some("3p-jade-south"));
+
+    // The console picks the value from a fixed list, but the API takes it from a
+    // query string, so the statement has to survive a quote. An interpolated
+    // rule would end the string literal here and either fail the query or match
+    // every row this source has.
+    let injected = RecordFilter {
+        rule: Some("' OR 1 = 1 --".into()),
+        ..filter
+    };
+    let (page, _) = catalog.search(&injected, None, 10).await.unwrap();
+    assert!(page.is_empty(), "a quoted rule changed the statement");
+}
+
+/// Rows left after ReplacingMergeTree has collapsed the duplicates a re-insert
+/// created. `indexed_rows` counts distinct ids and would answer 1 whether the
+/// backfill replaced a row or added a second one beside it under a different
+/// sorting key; this tells those two apart, and they are the difference between
+/// a rewritten index and one that has silently doubled.
+async fn collapsed_rows(config: &Config, source: &str) -> u64 {
+    #[derive(serde::Deserialize)]
+    struct Rows {
+        rows: u64,
+    }
+    let index = mjai_management::clickhouse::ClickHouse::new(
+        &config.clickhouse_url,
+        &config.clickhouse_user,
+        &config.clickhouse_password,
+    )
+    .unwrap();
+    let rows: Vec<Rows> = index
+        .query(
+            "SELECT count() AS rows FROM mjai.records FINAL WHERE source = {source:String}",
+            &[("source", source.to_owned())],
+        )
+        .await
+        .unwrap();
+    rows.first().map(|row| row.rows).unwrap_or_default()
+}
+
+/// The 18,633 records collected before the parser learned to read the Majsoul
+/// header carry no rule and a `played_at` at the midnight of the day in the
+/// game's uuid, and fixing the parser only reaches what comes after it. This is
+/// one such row, rewritten from its own bytes.
+///
+/// It walks the whole index rather than this test's source, because that is what
+/// the pass does, so it is one of the slower cases in the suite; every row it
+/// meets from another test points at a pack outside this data directory and is
+/// skipped, which is the same path an unreadable pack takes in production — and
+/// which is why the assertion at the end is that the pass did *not* mark itself
+/// done.
+#[tokio::test]
+async fn rewrites_the_metadata_of_a_row_indexed_before_the_parser_fix() {
+    let (state, data_dir) = test_state().await;
+    let config = test_config(&data_dir, None);
+    let source = test_source(&data_dir);
+
+    let mut raw = Vec::new();
+    GzDecoder::new(
+        include_bytes!("fixtures/260716-00000000-0000-4000-8000-000000000004.mjson").as_slice(),
+    )
+    .read_to_end(&mut raw)
+    .unwrap();
+    let id = Uuid::new_v4();
+    let mut writer = state.packs.legacy_writer().unwrap();
+    let storage = writer.append(id, &raw).unwrap();
+
+    // Milliseconds, because that is the resolution the index stores and the
+    // assertion below compares a rewritten row against the value read here.
+    let received_at = Utc::now().trunc_subsecs(3);
+    let stale = mjai_management::catalog::Record {
+        id,
+        source: source.clone(),
+        sha256: "0".repeat(64),
+        received_at,
+        played_at: Some("2026-07-16T00:00:00Z".parse().unwrap()),
+        players: vec!["p0".into(), "p1".into(), "p2".into(), "p3".into()],
+        rule: None,
+        event_count: 300,
+        storage,
+    };
+    state.catalog.insert_batch(&[stale]).await.unwrap();
+
+    // The marker lives in the shared test database, so without this a second run
+    // of the suite would find the backfill already done and assert nothing.
+    sqlx::query("DELETE FROM completed_backfills WHERE name = $1")
+        .bind(mjai_management::backfill::NAME)
+        .execute(state.catalog.postgres())
+        .await
+        .unwrap();
+    mjai_management::backfill::rewrite_record_metadata(state.clone()).await;
+
+    let fixed = state.catalog.get(id).await.unwrap().unwrap();
+    // The fixture's own header: 4 players in the throne room over a south game,
+    // started at majsoul.start_time 1784207242.
+    assert_eq!(fixed.rule.as_deref(), Some("4p-throne-south"));
+    assert_eq!(
+        fixed.played_at,
+        Some("2026-07-16T13:07:22Z".parse().unwrap())
+    );
+    // Every column of the sorting key, back unchanged. A rewrite that moved one
+    // of them would still answer the two assertions above, because `get` reads
+    // the newest row for an id whatever its key.
+    assert_eq!(fixed.received_at, received_at, "the rewrite moved a row");
+    assert_eq!(fixed.source, source);
+    assert_eq!(fixed.id, id);
+    assert_eq!(
+        collapsed_rows(&config, &source).await,
+        1,
+        "the rewritten row landed beside the old one instead of over it"
+    );
+
+    // And the marker is deliberately withheld. The shared index carries rows
+    // from every other case in the suite, whose packs sit in data directories
+    // this process cannot reach, so this pass necessarily meets records it
+    // cannot read — the same shape as an object store that will not serve, and
+    // the case the one-shot marker must not be spent on. The rewrite above still
+    // happened, which is the point: the pass does what it can and simply has not
+    // earned the right to declare the corpus done. When the marker is written is
+    // pinned by `backfill`'s own unit tests, where nothing else is in the index
+    // to make the answer depend on what the rest of the suite left behind.
+    let marked = sqlx::query("SELECT 1 FROM completed_backfills WHERE name = $1")
+        .bind(mjai_management::backfill::NAME)
+        .fetch_optional(state.catalog.postgres())
+        .await
+        .unwrap();
+    assert!(
+        marked.is_none(),
+        "a pass that could not read every row must not mark itself done"
+    );
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
 #[tokio::test]
 async fn rejects_a_reused_idempotency_key_with_different_content() {
     let (state, data_dir) = test_state().await;

@@ -70,6 +70,35 @@ test("dashboard pages read from the API instead of literals", async () => {
   );
 });
 
+/**
+ * The records table lives behind the session, so this reads the component
+ * rather than rendered HTML — the same way the page test above does. What it
+ * guards is that the rule filter offers the whole domain the indexer can write
+ * and that every option carries Chinese wording, because a dropdown missing a
+ * mode silently makes that mode unfilterable.
+ */
+test("the record index filters on the twelve rules and names them in Chinese", async () => {
+  const source = await readFile(
+    new URL("../components/record-index.tsx", import.meta.url),
+    "utf8",
+  );
+  const modes = ["gold", "jade", "throne"].flatMap((room) =>
+    ["east", "south"].flatMap((length) =>
+      [3, 4].map((players) => `${players}p-${room}-${length}`),
+    ),
+  );
+  for (const mode of modes) {
+    const labelled = new RegExp(`"${mode}": "[^"]*[\\u4e00-\\u9fff][^"]*"`);
+    assert.match(source, labelled, `${mode} has no Chinese label`);
+  }
+  // The token itself, not another dash: an unrecognised rule has to stay legible.
+  assert.match(source, /RULE_LABELS\[record\.rule\] \?\? record\.rule/);
+  // The dropdown is fed from that same map, so it cannot drift out of it.
+  assert.match(source, /Object\.entries\(RULE_LABELS\)/);
+  assert.match(source, /<option value="">全部<\/option>/);
+  assert.match(source, /rule: filters\.rule/);
+});
+
 test("contains shadcn configuration and no disposable starter", async () => {
   const [components, packageJson] = await Promise.all([
     readFile(new URL("../components.json", import.meta.url), "utf8"),

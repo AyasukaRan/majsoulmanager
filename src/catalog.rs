@@ -65,6 +65,7 @@ pub struct Record {
 pub struct RecordFilter {
     pub source: Option<String>,
     pub player: Option<String>,
+    pub rule: Option<String>,
     pub received_from: Option<DateTime<Utc>>,
     pub received_to: Option<DateTime<Utc>>,
     pub played_from: Option<DateTime<Utc>>,
@@ -431,6 +432,14 @@ impl Catalog {
         if let Some(player) = &filter.player {
             sql.push_str(" AND has(players, {player:String})");
             params.push(("player", player.clone()));
+        }
+        // The rule is one of the twelve `{players}p-{room}-{game_length}` tokens
+        // the parser derives, so it is matched whole like the source rather than
+        // by prefix: a substring match would make "3p-jade-east" a hit for
+        // "3p-jade-east-something" the day a thirteenth value appears.
+        if let Some(rule) = &filter.rule {
+            sql.push_str(" AND rule = {rule:String}");
+            params.push(("rule", rule.clone()));
         }
         // Bounds go over the wire as epoch milliseconds: a bare
         // `{x:DateTime64(3)}` would be read in the server timezone, and the
