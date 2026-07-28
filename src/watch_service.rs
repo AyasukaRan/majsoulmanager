@@ -119,7 +119,14 @@ impl Default for WatchInstance {
         Self {
             id: "default".into(),
             enabled: true,
-            room: "jade".into(),
+            // Every ranked room, because the two mistakes are not symmetric. A
+            // room collected and later discarded is a `WHERE rule =` away; a
+            // room never watched is games that no longer exist, since Majsoul
+            // serves a replay only for a while after it ends. Defaulting to one
+            // room read as a starting point rather than a restriction and cost
+            // this deployment several days of ranked play it can never get
+            // back, so narrowing is the choice an operator makes deliberately.
+            room: "all".into(),
             players: 4,
             modes: vec!["east".into(), "south".into()],
             account_secret_ref: "file:/run/secrets/majsoul_accounts".into(),
@@ -1189,6 +1196,23 @@ mod tests {
         config.validate().unwrap();
         assert!(!config.enabled);
         assert_eq!(config.login_module, ModuleRef::builtin());
+    }
+
+    /// The default reaches every instance created without a room being chosen,
+    /// and a room it leaves out cannot be filled in later: Majsoul serves a
+    /// replay only for a while after the game ends, so an unwatched room is
+    /// games that no longer exist. Two instances ran for days on a single-room
+    /// default and collected 61,934 games from a third of the ladder before the
+    /// index carried the room at all, which is why this is pinned rather than
+    /// left to whoever edits the struct next.
+    #[test]
+    fn a_new_instance_watches_every_ranked_room() {
+        let instance = WatchInstance::default();
+        assert_eq!(instance.room, "all");
+        let modes =
+            crate::majsoul::modes::room_modes(&instance.room, &instance.modes, instance.players)
+                .unwrap();
+        assert_eq!(modes.len(), 6, "three rooms across east and south");
     }
 
     #[test]
