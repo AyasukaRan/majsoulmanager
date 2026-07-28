@@ -332,6 +332,10 @@ pub struct PackWorker {
     /// to when a seal fails. Everything between this and `cursor` is in hand
     /// but not yet durable anywhere.
     committed: i64,
+    /// Whether the last fetch came back empty, which is this consumer's only
+    /// signal that it has caught up with the partition. It decides whether an
+    /// open pack is still waiting for records or has simply stopped growing.
+    at_end_of_log: bool,
     open: Option<PackWriter>,
     rows: Vec<Record>,
 }
@@ -357,6 +361,7 @@ impl PackWorker {
             postgres,
             cursor: committed,
             committed,
+            at_end_of_log: false,
             open: None,
             rows: Vec::new(),
         })
@@ -381,6 +386,7 @@ impl PackWorker {
                 match fetched {
                     Some(Ok(fetched)) => {
                         let next = fetched.next_offset();
+                        self.at_end_of_log = fetched.is_end_of_log();
                         let messages = self.decode(fetched.records);
                         if let Err(error) = self.append(messages) {
                             tracing::error!(
@@ -478,18 +484,26 @@ impl PackWorker {
         append_batch(writer, messages, &mut self.rows)
     }
 
-    /// Whether the open pack has reached the size target or the age limit. Both
-    /// are checked after a whole fetched batch rather than after each record,
-    /// so a pack overshoots its target by at most one fetch — 8MiB against a
-    /// 256MB target — and in exchange the offset to commit is always the end of
-    /// a fetched batch rather than a point inside one.
+    /// Whether the open pack should be sealed now. Checked after a whole
+    /// fetched batch rather than after each record, so a pack overshoots its
+    /// target by at most one fetch — 8MiB against a 256MB target — and in
+    /// exchange the offset to commit is always the end of a fetched batch
+    /// rather than a point inside one.
     fn pack_is_ready(&self) -> bool {
         let Some(writer) = self.open.as_ref() else {
             return false;
         };
-        let max_age = Duration::from_secs(self.state.config.pack_max_age_secs);
-        writer.size() >= self.state.config.pack_target_bytes
-            || writer.age().is_some_and(|age| age >= max_age)
+        let Some(age) = writer.age() else {
+            return false;
+        };
+        should_seal(
+            writer.size(),
+            self.state.config.pack_target_bytes,
+            age,
+            Duration::from_secs(self.state.config.pack_max_age_secs),
+            Duration::from_secs(self.state.config.pack_idle_secs),
+            self.at_end_of_log,
+        )
     }
 
     /// Seals whatever is open and, whatever comes of it, takes the local copy
@@ -567,6 +581,28 @@ impl PackWorker {
     }
 }
 
+/// The seal decision, lifted out of the worker so it can be tested without a
+/// broker, an object store and an index behind it.
+///
+/// The third clause is what keeps a quiet period from parking records in the
+/// broker for the full age limit. Between two games arriving, the worker is at
+/// the end of the log with a pack that has stopped growing: nothing is coming
+/// to fill it, so waiting only delays every record in it becoming readable and
+/// prolongs the window in which the broker's single volume holds the only copy
+/// of bytes the API has already answered `202` for. It cannot inflate the
+/// object count under load either — a worker with a backlog is never at the end
+/// of the log, so the size target is what decides whenever it matters.
+fn should_seal(
+    size: u64,
+    target: u64,
+    age: Duration,
+    max_age: Duration,
+    idle_age: Duration,
+    at_end_of_log: bool,
+) -> bool {
+    size >= target || age >= max_age || (at_end_of_log && age >= idle_age)
+}
+
 /// Starts one worker per partition. They own their offsets, so two processes
 /// running these against one topic would double-index every record; this is
 /// called once, from `main`.
@@ -604,6 +640,44 @@ mod tests {
 
     use super::*;
     use crate::{objects::Objects, pack::PackStore};
+
+    /// The size target and the age limit still decide on their own, the idle
+    /// clause only fires once the worker has caught up, and it never overrides
+    /// a pack that is too young to be worth an object.
+    #[test]
+    fn seals_early_only_when_nothing_is_left_to_consume() {
+        const TARGET: u64 = 256 * 1024 * 1024;
+        let max_age = Duration::from_secs(300);
+        let idle = Duration::from_secs(30);
+        let ready = |size, secs, at_end| {
+            should_seal(
+                size,
+                TARGET,
+                Duration::from_secs(secs),
+                max_age,
+                idle,
+                at_end,
+            )
+        };
+
+        assert!(ready(TARGET, 0, false), "a full pack seals whatever else");
+        assert!(
+            ready(1, 300, false),
+            "the age limit does not need an idle log"
+        );
+        assert!(
+            !ready(1, 29, true),
+            "an idle log must not seal a pack younger than the idle age"
+        );
+        assert!(
+            !ready(1, 299, false),
+            "a worker with a backlog waits for the size target or the age limit"
+        );
+        assert!(
+            ready(1, 30, true),
+            "caught up with the log, a pack past the idle age has stopped growing"
+        );
+    }
 
     fn store(root: &Path) -> PackStore {
         // Nothing in these tests leaves the local pack directory, so the

@@ -162,6 +162,18 @@ pub struct Config {
     #[arg(long, env = "MJAI_PACK_MAX_AGE_SECS", default_value_t = 300)]
     pub pack_max_age_secs: u64,
 
+    /// The age at which a pack seals once the worker has caught up with the
+    /// log. Waiting out the full age limit with nothing left to consume only
+    /// delays every record in the pack becoming readable, and leaves the broker
+    /// holding the only copy of bytes the API has already acknowledged. It also
+    /// costs least exactly when it fires: a quiet period produces a small pack
+    /// because few records arrived, so the objects this adds are proportional
+    /// to the traffic that produced them rather than to the clock. Under load
+    /// the worker is never at the end of the log, so the size target still
+    /// decides and the object count still holds.
+    #[arg(long, env = "MJAI_PACK_IDLE_SECS", default_value_t = 30)]
+    pub pack_idle_secs: u64,
+
     /// An object younger than this is never collected, however orphaned it
     /// looks: an upload that has landed but whose index rows are still in
     /// flight is indistinguishable from one whose writer died.

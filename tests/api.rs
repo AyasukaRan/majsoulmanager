@@ -64,6 +64,7 @@ fn test_config(data_dir: &std::path::Path, email_api_url: Option<String>) -> Con
         kafka_partitions: 1,
         kafka_max_lag: 50_000,
         pack_max_age_secs: 300,
+        pack_idle_secs: 30,
         gc_grace_secs: 86_400,
         gc_interval_secs: 3_600,
     }

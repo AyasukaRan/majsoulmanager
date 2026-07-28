@@ -107,7 +107,7 @@ ClickHouse 是记录级索引的事实来源，表定义见 `migrations/clickhou
 | 消费位点 | PostgreSQL `kafka_offsets` | rskafka 没有 consumer group，位点必须自己存；放在 PostgreSQL 是因为事务性状态本来就在那里。代价是每个 partition 只能有一个消费者，多副本会互相覆盖位点。 |
 | topic 保留 | `deploy/redpanda/bootstrap.yml` | `retention_bytes` / `log_retention_ms` 是 cluster property，写在容器命令行的 `--set` 会被 broker 忽略（只在 redpanda.yaml 留一行日志）。bootstrap 文件只在数据卷为空的首次启动读取，之后改用 `rpk cluster config set`。按 641,475 局历史导入、单条 p50 53,668 字节估算约 34.4GB，配 40GiB 上限。 |
 | 积压上限 | `MJAI_KAFKA_MAX_LAG`（默认 50000） | 后台每 5 秒采样一次 high watermark 与已提交位点之差；超过上限时采集入口直接拒绝，单条和批量都以 `500` 结束——记录没丢，但采集器必须退避到 worker 把 topic 消费下去为止。这样 topic 不会涨过保留上限、把已经回过 `202` 的记录悄悄丢掉。采样有滞后，因此是软上限；设成 `0` 等于关闭采集而不必停进程。 |
-| pack 封包 | `MJAI_PACK_TARGET_BYTES` / `MJAI_PACK_MAX_AGE_SECS` | 尺寸或年龄先到者封包。只看尺寸的话，低峰期的记录要等攒满 256MB 才可查，按当前采集速率是数周。 |
+| pack 封包 | `MJAI_PACK_TARGET_BYTES` / `MJAI_PACK_MAX_AGE_SECS` / `MJAI_PACK_IDLE_SECS` | 尺寸或年龄先到者封包。只看尺寸的话，低峰期的记录要等攒满 256MB 才可查，按当前采集速率是数周。第三个是追平 topic 之后的封包年龄（默认 30 秒）：消费本身是毫秒级的，滞后来自攒包，而两局之间已经没有东西再来填这个 pack，等满 `MAX_AGE` 只是拖长记录不可查、以及 broker 那一个卷独自持有已回过 `202` 的字节的时间。它不会在有负载时增加对象数——有积压的 worker 永远追不平，尺寸目标照旧决定封包。 |
 | orphan 回收 | `MJAI_GC_GRACE_SECS`（默认 24 小时） | 比宽限期年轻的对象一律不删：上传已完成、索引还在路上的 pack，和写入者中途死掉留下的 pack，从外面看完全一样。清单查询失败或返回空时整轮放弃删除——空清单和“索引正常但没数据”同样无法区分，按空清单处理会删光语料。 |
 
 ## 容量估算
