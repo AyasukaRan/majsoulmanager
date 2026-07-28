@@ -99,6 +99,19 @@ test("the record index filters on the twelve rules and names them in Chinese", a
   assert.match(source, /rule: filters\.rule/);
 });
 
+test("a new collector is created watching every ranked room", async () => {
+  // Two instances ran for days on the old single-room default and collected
+  // 61,934 games from one third of the ladder. A room nobody watched is games
+  // nobody can fetch afterwards, so the default is pinned here and in
+  // WatchInstance::default, and the two have to say the same thing.
+  const source = await readFile(
+    new URL("../components/watch-control-panel.tsx", import.meta.url),
+    "utf8",
+  );
+  assert.match(source, /room: "all"/);
+  assert.match(source, /<option value="all">全部<\/option>/);
+});
+
 test("contains shadcn configuration and no disposable starter", async () => {
   const [components, packageJson] = await Promise.all([
     readFile(new URL("../components.json", import.meta.url), "utf8"),

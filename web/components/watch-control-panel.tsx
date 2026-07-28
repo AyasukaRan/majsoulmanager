@@ -54,7 +54,10 @@ function newInstance(existing: WatchInstance[]): WatchInstance {
   return {
     id,
     enabled: false,
-    room: "jade",
+    // Matches the backend's own default, and for its reason: a room that was
+    // never watched is games nobody can fetch afterwards, while a room that was
+    // watched and is not wanted is one filter away.
+    room: "all",
     players: 4,
     modes: ["east", "south"],
     // Left blank on purpose: every collector needs its own account, and the
