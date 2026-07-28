@@ -8,7 +8,8 @@ use axum::{
 use chrono::{SubsecRound, TimeDelta, Utc};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use mjai_management::auth::{
-    AuthError, AuthSettings, LoginRequest, RegisterRequest, UserRole, VerifyEmailRequest,
+    AuthError, AuthSettings, CreateUserRequest, LoginRequest, RegisterRequest, UserRole,
+    VerifyEmailRequest,
 };
 use mjai_management::catalog::{Catalog, Cursor, RecordFilter};
 use mjai_management::objects::Objects;
@@ -1642,12 +1643,13 @@ async fn lists_the_newest_download_jobs() {
 async fn refuses_a_configuration_edited_against_a_revision_that_moved_on() {
     let (state, data_dir) = test_state().await;
     let app = api::router(state.clone());
+    let session = admin_session(&state);
     let stale = state.watch_service.config();
     let body = serde_json::to_string(&stale).unwrap();
 
     let accepted = app
         .clone()
-        .oneshot(watch_config_request(&body))
+        .oneshot(watch_config_request(&body, &session))
         .await
         .unwrap();
     assert_eq!(accepted.status(), StatusCode::OK);
@@ -1656,7 +1658,10 @@ async fn refuses_a_configuration_edited_against_a_revision_that_moved_on() {
     // Byte for byte what the first save sent, which is what a tab that has not
     // re-read holds. 412 rather than 409: the edit has to be rebuilt on the
     // current document, not retried as it stands.
-    let refused = app.oneshot(watch_config_request(&body)).await.unwrap();
+    let refused = app
+        .oneshot(watch_config_request(&body, &session))
+        .await
+        .unwrap();
     assert_eq!(refused.status(), StatusCode::PRECONDITION_FAILED);
     assert_eq!(
         state.watch_service.config().revision,
@@ -1666,14 +1671,132 @@ async fn refuses_a_configuration_edited_against_a_revision_that_moved_on() {
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 
-fn watch_config_request(body: &str) -> Request<Body> {
+fn watch_config_request(body: &str, session: &str) -> Request<Body> {
     Request::builder()
         .method("PUT")
         .uri("/api/v1/watch/config")
         .header(header::AUTHORIZATION, "Bearer test-secret")
+        .header("x-mjai-user-session", session)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body.to_owned()))
         .unwrap()
+}
+
+/// The bootstrap administrator's session. Changing what the collectors do needs
+/// one: the machine key says the request came from a deployment that holds it,
+/// and cannot say who is behind it.
+fn admin_session(state: &AppState) -> String {
+    state
+        .auth
+        .login(LoginRequest {
+            email: "admin@example.com".into(),
+            password: "test-password-123".into(),
+        })
+        .unwrap()
+        .session_token
+}
+
+/// Every route that changes what the collectors do, so that one added to the
+/// table without the guard is caught here rather than in production.
+const COLLECTOR_CONTROL_ROUTES: [(&str, &str); 6] = [
+    ("PUT", "/api/v1/watch/config"),
+    ("POST", "/api/v1/watch/actions"),
+    ("POST", "/api/v1/watch/modules"),
+    ("PUT", "/api/v1/watch/proxy/subscription"),
+    ("PUT", "/api/v1/watch/proxy/selection"),
+    ("POST", "/api/v1/watch/proxy/actions"),
+];
+
+/// The console holds the machine key and attaches it to whatever a browser asks
+/// of it, so the key proves only that a request came through the console — which
+/// is true of every member's request. The settings page is rendered for
+/// administrators alone, but nothing stopped a member from calling the proxy
+/// paths behind it directly: rewrite which accounts collect and which rooms they
+/// watch, stop collection, install a login module, repoint outbound traffic.
+///
+/// The body is deliberately `{}`, which no handler here would accept. A refusal
+/// has to come before anything reads it, or a member learns whether their
+/// payload parsed and the guard is one shape of request away from being a
+/// formality.
+#[tokio::test]
+async fn refuses_collector_control_without_an_administrator_session() {
+    let (state, data_dir) = test_state().await;
+    let app = api::router(state.clone());
+    let admin = admin_session(&state);
+    state
+        .auth
+        .create_user(
+            &admin,
+            CreateUserRequest {
+                name: "Member".into(),
+                email: "member@example.com".into(),
+                password: "member-password-123".into(),
+                role: UserRole::Member,
+            },
+        )
+        .unwrap();
+    let member = state
+        .auth
+        .login(LoginRequest {
+            email: "member@example.com".into(),
+            password: "member-password-123".into(),
+        })
+        .unwrap()
+        .session_token;
+
+    for (method, uri) in COLLECTOR_CONTROL_ROUTES {
+        let control = |session: Option<&str>| {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(session) = session {
+                request = request.header("x-mjai-user-session", session);
+            }
+            request.body(Body::from("{}")).unwrap()
+        };
+
+        let anonymous = app.clone().oneshot(control(None)).await.unwrap();
+        assert_eq!(
+            anonymous.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri} accepted the machine key alone"
+        );
+
+        let refused = app.clone().oneshot(control(Some(&member))).await.unwrap();
+        assert_eq!(
+            refused.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {uri} accepted an ordinary member"
+        );
+    }
+
+    // And the reads the monitoring page makes stay open to that same member,
+    // which is the other half of the rule: this is not "the collectors are
+    // administrator-only", it is "changing them is".
+    for uri in [
+        "/api/v1/watch/status",
+        "/api/v1/watch/config",
+        "/api/v1/watch/modules",
+        "/api/v1/watch/proxy",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, "Bearer test-secret")
+                    .header("x-mjai-user-session", &member)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri} refused a member");
+    }
+
+    std::fs::remove_dir_all(data_dir).unwrap();
 }
 
 #[tokio::test]
@@ -1687,6 +1810,7 @@ async fn updates_and_persists_online_watch_configuration() {
                 .method("PUT")
                 .uri("/api/v1/watch/config")
                 .header(header::AUTHORIZATION, "Bearer test-secret")
+                .header("x-mjai-user-session", admin_session(&state))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{

@@ -50,6 +50,27 @@ use crate::{
 
 pub fn router(state: AppState) -> Router {
     let max_batch = state.config.max_batch_bytes;
+    // Everything that changes what the collectors do, kept in one table so that
+    // the rule is stated once instead of being remembered six times. See
+    // `require_admin_session` for why the machine key is not enough here, and
+    // why the reads below it deliberately stay open to every member.
+    let admin = Router::new()
+        .route("/api/v1/watch/config", put(put_watch_config))
+        .route("/api/v1/watch/actions", post(post_watch_action))
+        .route("/api/v1/watch/modules", post(install_watch_module))
+        .route(
+            "/api/v1/watch/proxy/subscription",
+            put(put_watch_proxy_subscription),
+        )
+        .route(
+            "/api/v1/watch/proxy/selection",
+            put(put_watch_proxy_selection),
+        )
+        .route("/api/v1/watch/proxy/actions", post(post_watch_proxy_action))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_admin_session,
+        ));
     let protected = Router::new()
         .route("/api/v1/records", post(ingest).get(search))
         .route("/api/v1/records/batch", post(ingest_batch))
@@ -65,23 +86,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/watch/status", get(get_watch_status))
         .route("/api/v1/watch/logs", get(get_watch_logs))
         .route("/api/v1/watch/config", get(get_watch_config))
-        .route("/api/v1/watch/config", put(put_watch_config))
-        .route("/api/v1/watch/actions", post(post_watch_action))
-        .route(
-            "/api/v1/watch/modules",
-            get(get_watch_modules).post(install_watch_module),
-        )
+        .route("/api/v1/watch/modules", get(get_watch_modules))
         .route("/api/v1/watch/modules/protocol", get(get_module_protocol))
         .route("/api/v1/watch/proxy", get(get_watch_proxy))
-        .route(
-            "/api/v1/watch/proxy/subscription",
-            put(put_watch_proxy_subscription),
-        )
-        .route(
-            "/api/v1/watch/proxy/selection",
-            put(put_watch_proxy_selection),
-        )
-        .route("/api/v1/watch/proxy/actions", post(post_watch_proxy_action))
+        .merge(admin)
         .route("/api/v1/users", get(get_users).post(create_user))
         .route("/api/v1/users/{id}", put(update_user))
         .route(
@@ -343,6 +351,43 @@ async fn post_watch_proxy_action(
 
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status": "ok"}))
+}
+
+/// The guard on everything that changes what the collectors do.
+///
+/// `require_auth` proves only that a request came from something holding the
+/// machine key, and the console holds that key on behalf of every user it
+/// serves: it attaches the key itself and forwards whatever the browser asked
+/// for. The key therefore cannot say who is behind a request, and a route that
+/// asks nothing further is open to every member with a console login, whatever
+/// the console chooses to render for them. Only the session carries an identity,
+/// which is why this refuses a request that presents none even though the key
+/// alone would otherwise be enough — an operator working outside the console
+/// takes one from `POST /api/v1/auth/login`.
+///
+/// Reads are deliberately not behind this. The status, the logs, the
+/// configuration document, the installed modules and the proxy status are what
+/// the monitoring page shows every member, and none of them carries a secret:
+/// `account_secret_ref` names an environment variable rather than holding one.
+///
+/// It is a layer rather than a line in each handler so that a route added to the
+/// table above is covered by where it was written down, and so that a member is
+/// refused before a body is parsed rather than after.
+async fn require_admin_session(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let session = request
+        .headers()
+        .get(USER_SESSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty());
+    match session.map(|session| state.auth.require_admin(session)) {
+        Some(Ok(_)) => next.run(request).await,
+        Some(Err(error)) => ApiError::from(error).into_response(),
+        None => ApiError::Unauthorized.into_response(),
+    }
 }
 
 async fn require_auth(

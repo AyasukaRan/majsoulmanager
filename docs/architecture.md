@@ -25,6 +25,8 @@ Pack/Index worker
                             └──► mihomo ──► 雀魂网关
 ```
 
+API key 证明的是"请求来自持有这个 key 的部署"，不是"谁在发这个请求"——控制台代所有登录用户持有它。因此改动采集行为的六个接口（`PUT /watch/config`、`POST /watch/actions`、`POST /watch/modules`、以及 `/watch/proxy` 下的三个写接口）额外要求 `X-Mjai-User-Session` 属于管理员，光有 key 会被拒。读接口不设这道门：监控页给所有成员看的就是它们，`account_secret_ref` 存的是环境变量名而不是密码。
+
 采集入口只做校验、幂等占位和写入 Redpanda；打包、上传 RustFS 和批量写 ClickHouse 由 pack/index worker 完成，offset 在写完索引之后才提交。worker 目前是 API 进程内的一组任务（每个 partition 一个），拆成独立二进制是下一步，与之相关的代码已经按“不依赖 AppState 的纯函数 + 一个 worker 结构”组织。
 
 Watch 与查询 API 同镜像部署但属于独立受管任务。配置 revision、运行 phase 和
