@@ -62,17 +62,34 @@ pub fn parse_metadata(payload: &[u8]) -> Result<Metadata, ParseError> {
                 .collect()
         })
         .unwrap_or_default();
-    let rule = start.get("rule").map(|rule| match rule {
-        Value::String(value) => value.chars().take(256).collect(),
-        other => other.to_string(),
-    });
+    let majsoul = start.get("majsoul");
+
+    // A converted Majsoul record never carries `start_game.rule`, so the rule has to come from the
+    // header sitting next to the names instead, as `{players}p-{room}-{game_length}`. That keeps it
+    // a filter token rather than a display string, and the twelve ranked modes are the only values
+    // it can take. An explicit `rule` still wins: a non-Majsoul mjai log may carry one, and that is
+    // what the field originally means. A record converted without the optional game metadata has a
+    // header without those three keys, and there we would rather have no rule than a half-formed
+    // token, which would be a thirteenth value nobody can filter for in a LowCardinality column.
+    let rule = start
+        .get("rule")
+        .map(|rule| match rule {
+            Value::String(value) => value.chars().take(256).collect(),
+            other => other.to_string(),
+        })
+        .or_else(|| {
+            let header = majsoul?;
+            let players = header.get("players")?.as_u64()?;
+            let room = header.get("room")?.as_str()?;
+            let length = header.get("game_length")?.as_str()?;
+            Some(format!("{players}p-{room}-{length}"))
+        });
 
     // majsoul2mjai merges the source game's unix start_time into the start_game event itself,
     // next to the names this function already reads; both fixtures under tests/fixtures have that
     // shape. Read off that event rather than scanned over all of them, so the cost does not grow
     // with the record and no other event can shadow the header.
-    let played_at = start
-        .get("majsoul")
+    let played_at = majsoul
         .and_then(|majsoul| majsoul.get("start_time"))
         .and_then(Value::as_i64)
         .and_then(|seconds| DateTime::from_timestamp(seconds, 0));
@@ -121,6 +138,35 @@ mod tests {
             Some("2026-07-16T13:07:22Z".parse::<DateTime<Utc>>().unwrap())
         );
         assert_eq!(metadata.players, ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn derives_the_rule_from_the_majsoul_header() {
+        let raw = br#"{"majsoul":{"uuid":"260716-00000000","start_time":1784211956,"mode_id":24,"room":"jade","game_length":"south","players":3,"account_ids":[0,0,0],"year":2026},"names":["p0","p1","p2"],"type":"start_game"}
+{"type":"start_kyoku","bakaze":"E","kyoku":1}"#;
+        assert_eq!(
+            parse_metadata(raw).unwrap().rule.as_deref(),
+            Some("3p-jade-south")
+        );
+
+        let four_player = br#"{"majsoul":{"uuid":"260716-00000001","mode_id":15,"room":"throne","game_length":"east","players":4},"names":["p0","p1","p2","p3"],"type":"start_game"}"#;
+        assert_eq!(
+            parse_metadata(four_player).unwrap().rule.as_deref(),
+            Some("4p-throne-east")
+        );
+    }
+
+    #[test]
+    fn leaves_the_rule_empty_when_the_header_lacks_the_mode() {
+        // What a record converted without the optional GameMetadata looks like.
+        let raw = br#"{"majsoul":{"uuid":"260716-00000000","start_time":1784211956,"account_ids":[0,0,0,0]},"names":["p0","p1","p2","p3"],"type":"start_game"}"#;
+        assert_eq!(parse_metadata(raw).unwrap().rule, None);
+    }
+
+    #[test]
+    fn an_explicit_rule_beats_the_majsoul_header() {
+        let raw = br#"{"majsoul":{"room":"jade","game_length":"south","players":3},"names":["p0","p1","p2"],"rule":"tonpu","type":"start_game"}"#;
+        assert_eq!(parse_metadata(raw).unwrap().rule.as_deref(), Some("tonpu"));
     }
 
     #[test]
