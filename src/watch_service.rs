@@ -103,9 +103,19 @@ pub struct InstallModuleRequest {
 /// modules, pacing) stays on [`WatchServiceConfig`].
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WatchInstance {
-    /// Stable slug. Also names this instance's state file and tags its log
-    /// lines, so it is validated as a plain identifier.
+    /// Display label, and the tag on this collector's log lines
+    /// (`collector:{id}`), so it is validated as a plain identifier. Free to
+    /// rename: nothing durable is named by it.
     pub id: String,
+    /// Immutable name of everything this collector keeps on disk. Assigned once
+    /// by [`new_instance_key`] and never offered as an editable field, because
+    /// the state file it names holds games already seen live but not yet
+    /// fetched and a key that moved would point at a file that is not there —
+    /// which `load_state` reports as an empty queue rather than as a loss.
+    /// Empty only in transit, between deserializing a document that predates
+    /// keys and the caller settling one; `validate` rejects it.
+    #[serde(default)]
+    pub key: String,
     pub enabled: bool,
     pub room: String,
     pub players: u8,
@@ -118,6 +128,11 @@ impl Default for WatchInstance {
     fn default() -> Self {
         Self {
             id: "default".into(),
+            // The one key that is not generated: a fresh deployment lays its
+            // state down under the same name the pre-key builds used, so the
+            // shape of the data directory does not depend on when it was
+            // created.
+            key: "default".into(),
             enabled: true,
             // Every ranked room, because the two mistakes are not symmetric. A
             // room collected and later discarded is a `WHERE rule =` away; a
@@ -135,8 +150,17 @@ impl Default for WatchInstance {
     }
 }
 
+/// The one place an instance key is minted, so no other component has to agree
+/// on the format. It carries no meaning on purpose: a key that encoded the id
+/// would invite someone to re-derive it, and by then the id may have been
+/// renamed.
+fn new_instance_key() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
 impl WatchInstance {
     fn validate(&self) -> Result<(), WatchServiceError> {
+        validate_identifier("instance key", &self.key)?;
         validate_identifier("instance id", &self.id)?;
         if !matches!(self.room.as_str(), "gold" | "jade" | "throne" | "all") {
             return Err(WatchServiceError::InvalidConfig(
@@ -241,7 +265,8 @@ fn migrate_legacy_config(document: &mut serde_json::Value) {
 }
 
 /// Instance id given to a migrated legacy configuration. Also the name its
-/// pre-migration state file is moved to.
+/// pre-migration state file is moved to, which still resolves because the
+/// migrated instance carries no key and so adopts this id as one.
 pub const LEGACY_INSTANCE_ID: &str = "default";
 
 impl WatchServiceConfig {
@@ -253,6 +278,44 @@ impl WatchServiceConfig {
             .filter(|instance| self.enabled && instance.enabled)
     }
 
+    /// Settle the keys of a configuration read off disk: an instance stored
+    /// without one predates keys, and the state file it has been using all
+    /// along is named by its id, so the id *is* its key. Minting fresh keys
+    /// here would leave every existing queue on disk with nothing reading it,
+    /// and each holds up to `GIVE_UP_SECS` worth of games seen live and not yet
+    /// fetched. Reports whether anything changed, so the caller can write the
+    /// keys back and stop depending on this rule.
+    ///
+    /// This is deliberately the opposite of [`Self::mint_missing_keys`], which
+    /// the API path uses: a document on disk was written before keys existed,
+    /// whereas an instance arriving through the API has been round-tripped by a
+    /// console that returns the key it was given, so a missing key there means
+    /// the instance has never been stored at all.
+    fn adopt_ids_as_keys(&mut self) -> bool {
+        let mut adopted = false;
+        for instance in &mut self.instances {
+            if instance.key.is_empty() {
+                instance.key = instance.id.clone();
+                adopted = true;
+            }
+        }
+        adopted
+    }
+
+    /// Settle the keys of a configuration submitted through the API: anything
+    /// without a key is a newly created instance and gets a fresh one. Taking
+    /// its id, the way [`Self::adopt_ids_as_keys`] does, would hand a new
+    /// collector whatever queue a deleted instance of the same name left
+    /// behind. A key already present is never replaced — that is the console
+    /// handing back what it was given.
+    fn mint_missing_keys(&mut self) {
+        for instance in &mut self.instances {
+            if instance.key.is_empty() {
+                instance.key = new_instance_key();
+            }
+        }
+    }
+
     pub fn validate(&self) -> Result<(), WatchServiceError> {
         if self.instances.is_empty() {
             return Err(WatchServiceError::InvalidConfig(
@@ -262,16 +325,29 @@ impl WatchServiceConfig {
         for instance in &self.instances {
             instance.validate()?;
         }
-        // Ids name state files and tag log lines, so duplicates would make two
-        // collectors silently share state.
-        let mut seen = std::collections::BTreeSet::new();
+        // Ids tag log lines and are how the console and every report name a
+        // collector, so a duplicate makes two of them indistinguishable.
+        let mut ids = std::collections::BTreeSet::new();
         if let Some(duplicate) = self
             .instances
             .iter()
-            .find(|instance| !seen.insert(&instance.id))
+            .find(|instance| !ids.insert(&instance.id))
         {
             return Err(WatchServiceError::InvalidConfig(format!(
                 "duplicate watch instance id {}",
+                duplicate.id
+            )));
+        }
+        // Keys name state files, so a duplicate would make two collectors
+        // silently share one working queue and fetch each other's games.
+        let mut keys = std::collections::BTreeSet::new();
+        if let Some(duplicate) = self
+            .instances
+            .iter()
+            .find(|instance| !keys.insert(&instance.key))
+        {
+            return Err(WatchServiceError::InvalidConfig(format!(
+                "watch instance {} reuses another instance's state key",
                 duplicate.id
             )));
         }
@@ -348,8 +424,14 @@ fn validate_module_ref(value: &ModuleRef) -> Result<(), WatchServiceError> {
 }
 
 fn validate_identifier(label: &str, value: &str) -> Result<(), WatchServiceError> {
+    // Every caller here names a file or a directory with the result — an
+    // instance key, a module name, a module version — and `.` and `..` pass the
+    // character check while resolving to the containing directory instead of to
+    // a child. They are not identifiers under any reading, so the guard sits
+    // here rather than at each call site.
     if value.is_empty()
         || value.len() > 96
+        || matches!(value, "." | "..")
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
@@ -855,7 +937,12 @@ impl WatchSupervisor {
                 let mut document: serde_json::Value = serde_json::from_slice(&bytes)?;
                 let legacy = document.get("instances").is_none();
                 migrate_legacy_config(&mut document);
-                let config: WatchServiceConfig = serde_json::from_value(document)?;
+                let mut config: WatchServiceConfig = serde_json::from_value(document)?;
+                // Written straight back, so the rule that state files are named
+                // by the id only has to hold for one more boot: after this, a
+                // hand-edited rename in config.json is as safe as one made
+                // through the console.
+                let adopted = config.adopt_ids_as_keys();
                 if legacy {
                     // The single collector kept its state in an unsuffixed
                     // file; move it so the migrated instance picks up its
@@ -866,6 +953,8 @@ impl WatchSupervisor {
                     if !migrated_state.exists() {
                         let _ = std::fs::rename(watch_dir.join("state.json"), migrated_state);
                     }
+                }
+                if legacy || adopted {
                     persist_json(&config_path, &config)?;
                 }
                 config
@@ -927,6 +1016,8 @@ impl WatchSupervisor {
         self: &Arc<Self>,
         mut next: WatchServiceConfig,
     ) -> Result<WatchServiceConfig, WatchServiceError> {
+        // Before validation, which rejects an instance with no key at all.
+        next.mint_missing_keys();
         next.validate()?;
         self.probe_modules(&next).await?;
         let current = self.config();
@@ -1234,12 +1325,17 @@ mod tests {
             "pb_fetch_module": {"name": "builtin", "version": BUILTIN_MODULE_VERSION},
         });
         migrate_legacy_config(&mut document);
-        let config: WatchServiceConfig = serde_json::from_value(document).unwrap();
+        let mut config: WatchServiceConfig = serde_json::from_value(document).unwrap();
+        // Same order as WatchSupervisor::new, and load-bearing: the state file
+        // the single collector was already using is state-default.json, and it
+        // keeps resolving only because the folded instance adopts its id.
+        config.adopt_ids_as_keys();
         config.validate().unwrap();
 
         let instance = &config.instances[0];
         assert_eq!(config.instances.len(), 1);
         assert_eq!(instance.id, LEGACY_INSTANCE_ID);
+        assert_eq!(instance.key, LEGACY_INSTANCE_ID);
         assert_eq!(instance.room, "throne");
         assert_eq!(instance.players, 3);
         assert_eq!(instance.client_version.as_deref(), Some("0.16.254"));
@@ -1255,32 +1351,67 @@ mod tests {
         assert_eq!(document, original);
     }
 
+    /// Two instances differing only in the field under test, so each rejection
+    /// below can be attributed to the rule it is named after.
+    fn two_instances(left: WatchInstance, right: WatchInstance) -> WatchServiceConfig {
+        WatchServiceConfig {
+            instances: vec![left, right],
+            ..WatchServiceConfig::default()
+        }
+    }
+
+    fn rejection(config: &WatchServiceConfig) -> String {
+        config
+            .validate()
+            .expect_err("configuration should have been rejected")
+            .to_string()
+    }
+
     #[test]
     fn rejects_duplicate_instance_ids() {
-        let config = WatchServiceConfig {
-            instances: vec![WatchInstance::default(), WatchInstance::default()],
-            ..WatchServiceConfig::default()
-        };
-        assert!(config.validate().is_err());
+        let config = two_instances(
+            WatchInstance::default(),
+            WatchInstance {
+                key: new_instance_key(),
+                account_secret_ref: "env:OTHER_ACCOUNT".into(),
+                ..WatchInstance::default()
+            },
+        );
+        assert!(rejection(&config).contains("duplicate watch instance id"));
+    }
+
+    #[test]
+    fn rejects_two_instances_sharing_one_state_key() {
+        // Both would read and write one queue, each fetching games the other
+        // had already claimed.
+        let config = two_instances(
+            WatchInstance::default(),
+            WatchInstance {
+                id: "three".into(),
+                players: 3,
+                account_secret_ref: "env:OTHER_ACCOUNT".into(),
+                ..WatchInstance::default()
+            },
+        );
+        assert!(rejection(&config).contains("state key"));
     }
 
     #[test]
     fn rejects_two_instances_sharing_one_account() {
-        let config = WatchServiceConfig {
-            instances: vec![
-                WatchInstance {
-                    id: "four".into(),
-                    ..WatchInstance::default()
-                },
-                WatchInstance {
-                    id: "three".into(),
-                    players: 3,
-                    ..WatchInstance::default()
-                },
-            ],
-            ..WatchServiceConfig::default()
-        };
-        assert!(config.validate().is_err());
+        let config = two_instances(
+            WatchInstance {
+                id: "four".into(),
+                key: new_instance_key(),
+                ..WatchInstance::default()
+            },
+            WatchInstance {
+                id: "three".into(),
+                key: new_instance_key(),
+                players: 3,
+                ..WatchInstance::default()
+            },
+        );
+        assert!(rejection(&config).contains("account"));
     }
 
     #[test]
@@ -1293,15 +1424,125 @@ mod tests {
     }
 
     #[test]
-    fn rejects_an_instance_id_that_would_escape_the_state_directory() {
-        let config = WatchServiceConfig {
-            instances: vec![WatchInstance {
-                id: "../../etc/passwd".into(),
-                ..WatchInstance::default()
-            }],
+    fn rejects_a_key_or_id_that_would_escape_the_state_directory() {
+        // `..` is the one that passes the character check on its own: as a key
+        // it makes the discovery directory resolve to its own parent.
+        for hostile in ["../../etc/passwd", "..", ".", "", "a/b", "a\nb"] {
+            let by_key = WatchServiceConfig {
+                instances: vec![WatchInstance {
+                    key: hostile.into(),
+                    ..WatchInstance::default()
+                }],
+                ..WatchServiceConfig::default()
+            };
+            assert!(by_key.validate().is_err(), "key {hostile:?} was accepted");
+            let by_id = WatchServiceConfig {
+                instances: vec![WatchInstance {
+                    id: hostile.into(),
+                    ..WatchInstance::default()
+                }],
+                ..WatchServiceConfig::default()
+            };
+            assert!(by_id.validate().is_err(), "id {hostile:?} was accepted");
+            // A module name and version name a directory each, through the same
+            // check, which is why the guard lives in validate_identifier rather
+            // than beside the instance.
+            assert!(
+                validate_module_ref(&ModuleRef {
+                    name: hostile.into(),
+                    version: hostile.into(),
+                })
+                .is_err(),
+                "module {hostile:?} was accepted"
+            );
+        }
+    }
+
+    /// The one test standing between this change and two lost queues. The
+    /// running deployment stores its state in `state-default.json` and
+    /// `state-three-player.json`, named by ids, in a config.json written before
+    /// keys existed. If loading ever mints keys instead of adopting the ids,
+    /// both collectors come up pointing at files that do not exist, `load_state`
+    /// reports that as an empty queue rather than as an error, and every game
+    /// seen live but not yet fetched is gone.
+    #[test]
+    fn a_stored_configuration_without_keys_takes_each_id_as_its_key() {
+        let mut document = serde_json::to_value(WatchServiceConfig {
+            instances: vec![
+                WatchInstance::default(),
+                WatchInstance {
+                    id: "three-player".into(),
+                    key: "three-player".into(),
+                    players: 3,
+                    account_secret_ref: "env:OTHER_ACCOUNT".into(),
+                    ..WatchInstance::default()
+                },
+            ],
+            ..WatchServiceConfig::default()
+        })
+        .unwrap();
+        for instance in document["instances"].as_array_mut().unwrap() {
+            instance.as_object_mut().unwrap().remove("key");
+        }
+
+        let mut config: WatchServiceConfig = serde_json::from_value(document).unwrap();
+        assert!(config.adopt_ids_as_keys());
+        assert_eq!(config.instances[0].key, "default");
+        assert_eq!(config.instances[1].key, "three-player");
+        config.validate().unwrap();
+
+        // Idempotent, and a key already stored is never touched: a second boot
+        // must not renumber anything, and neither must a rename.
+        config.instances[1].id = "sanma".into();
+        assert!(!config.adopt_ids_as_keys());
+        assert_eq!(config.instances[1].key, "three-player");
+    }
+
+    /// The API rule, which is the inverse: a console round-trips the key it was
+    /// given, so an instance arriving without one has never been stored.
+    /// Adopting its id here would hand a newly created collector whatever queue
+    /// a deleted instance of the same name left behind.
+    #[test]
+    fn an_instance_arriving_without_a_key_gets_a_fresh_one() {
+        let mut config = WatchServiceConfig {
+            instances: vec![
+                WatchInstance::default(),
+                WatchInstance {
+                    id: "three-player".into(),
+                    key: String::new(),
+                    players: 3,
+                    account_secret_ref: "env:OTHER_ACCOUNT".into(),
+                    ..WatchInstance::default()
+                },
+            ],
             ..WatchServiceConfig::default()
         };
-        assert!(config.validate().is_err());
+        config.mint_missing_keys();
+        config.validate().unwrap();
+
+        let minted = config.instances[1].key.clone();
+        assert!(!minted.is_empty());
+        assert_ne!(minted, "three-player", "the id must not become the key");
+        assert_eq!(
+            config.instances[0].key, "default",
+            "a key that was submitted is what the console handed back"
+        );
+
+        // Saving again — every console save resubmits the whole document — must
+        // leave the collector on the same state file.
+        config.mint_missing_keys();
+        assert_eq!(config.instances[1].key, minted);
+    }
+
+    /// The payoff for issue #37: the id is a label again.
+    #[test]
+    fn renaming_an_instance_leaves_its_key_alone() {
+        let mut config = WatchServiceConfig::default();
+        let key = config.instances[0].key.clone();
+        config.instances[0].id = "four-player".into();
+        config.mint_missing_keys();
+        config.validate().unwrap();
+        assert_eq!(config.instances[0].key, key);
     }
 
     #[test]

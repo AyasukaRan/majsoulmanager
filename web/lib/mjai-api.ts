@@ -158,7 +158,14 @@ export type WatchLogPage = {
 
 /** One collector: an account watching one room and player count. */
 export type WatchInstance = {
+  /** Display label and log tag; safe to rename. */
   id: string;
+  /**
+   * Names this collector's state file on the backend, which is why it is never
+   * edited or invented here: it is absent only on an instance this console has
+   * just created, and the backend assigns one to exactly those.
+   */
+  key?: string;
   enabled: boolean;
   room: "gold" | "jade" | "throne" | "all";
   players: 3 | 4;
