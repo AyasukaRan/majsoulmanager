@@ -267,8 +267,13 @@ async fn collapses_one_game_ingested_from_two_sources() {
     // PostgreSQL outlives a run, so a fixed uuid would be claimed once and
     // answered as a duplicate for every run after it.
     let game = format!("260716-{}", Uuid::new_v4());
+    // 2026-07-16T05:00:00Z, kept well clear of the 13:00–14:00 window
+    // `ingests_gzip_tar_members_with_their_own_played_at` asserts holds exactly
+    // one record. The suite shares one index, so a `played_at` is as much a
+    // shared namespace as a source is, and copying one out of a fixture is
+    // enough to break a test that never mentions this one.
     let collected = format!(
-        r#"{{"type":"start_game","names":["a","b","c","d"],"majsoul":{{"uuid":"{game}","start_time":1784207242,"room":"throne","game_length":"south","players":4}}}}
+        r#"{{"type":"start_game","names":["a","b","c","d"],"majsoul":{{"uuid":"{game}","start_time":1784178000,"room":"throne","game_length":"south","players":4}}}}
 {{"type":"start_kyoku","bakaze":"E","kyoku":1}}"#
     );
 
