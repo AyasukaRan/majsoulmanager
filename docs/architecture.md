@@ -25,7 +25,7 @@ Pack/Index worker
                             └──► mihomo ──► 雀魂网关
 ```
 
-当前仓库的默认本地模式为了零依赖调试，在 API 进程内完成打包并用内存目录保存索引。`.mjpack` 格式和单条读取路径与生产一致。生产模式应把打包、ClickHouse 批量写入和导出拆成独立 worker。
+采集入口只做校验、幂等占位和写入 Redpanda；打包、上传 RustFS 和批量写 ClickHouse 由 pack/index worker 完成，offset 在写完索引之后才提交。worker 目前是 API 进程内的一组任务（每个 partition 一个），拆成独立二进制是下一步，与之相关的代码已经按“不依赖 AppState 的纯函数 + 一个 worker 结构”组织。
 
 Watch 与查询 API 同镜像部署但属于独立受管任务。配置 revision、运行 phase 和
 UUID 队列彼此分离；热重载先校验模块，再替换任务 generation。登录/PB
@@ -60,7 +60,7 @@ ClickHouse 的 `pack_offset` 指向 Zstandard frame 起点，而不是 entry hea
 - 默认单条上限 256KiB，针对解压后的字节数。“单条约 10KB”说的是磁盘上的 gzip 文件；实测 300 条真实 4p 王座记录解压后 min 11,352 / p50 53,668 / p95 80,374 / max 106,157 字节，旧的 16KiB 上限会拒绝其中每一条。老部署的 `.env` 里如果仍写死 16384，升级镜像不会改动它，因此启动时会针对低于 128KiB 的上限打一条警告。
 - 生产批量入口使用 tar/tar.zst，每个 member 是一个 `.mjson`；建议单批 10,000–50,000 条或 64–512MB。
 - tar member 允许本身是 gzip 的（按内容 magic `1f 8b` 判断，不看文件名）；解压读取以单条上限为界，超过上限的 member 直接拒绝，不会无界分配。采集器磁盘布局因此可以原样打包上传，不必先把 3.2GB 展开成约 34GB。归档本身和 member 都按多流 gzip 解压：拼接出来的 gzip 是合法文件，只读第一段会静默丢掉后面的内容。
-- 批次响应区分三种结局：有记录落库就是 `202`（坏 member 记在 `errors` 里）；一条都没落库且存在被拒 member 时是 `422`，避免整批格式不对的导入连着几小时都返回成功；写 pack 失败是服务端丢数据而不是 member 有问题，整批以 `5xx` 结束。
+- 批次响应区分三种结局：有记录被接收就是 `202`（坏 member 记在 `errors` 里）；一条都没被接收且存在被拒 member 时是 `422`，避免整批格式不对的导入连着几小时都返回成功；记录写不进 Kafka、或积压超过 `MJAI_KAFKA_MAX_LAG` 时是服务端留不住这条记录而不是 member 有问题，整批以 `5xx` 结束。
 - API 只在 Kafka 已确认写入后返回 `202`。消费者上传不可变 pack、批量写 ClickHouse，最后提交 Kafka offset。
 
 幂等 ID 应由 `source + Idempotency-Key` 确定，或由服务端生成 UUIDv5。内容 SHA-256 不同却复用同一幂等键时返回 `409`。PostgreSQL 的幂等表只保留业务允许重试的时间窗口（例如 7–30 天），不要永久保存数亿行。
@@ -98,6 +98,18 @@ ClickHouse 是记录级索引的事实来源，表定义见 `migrations/clickhou
 - `.mjpack` header 包含 UUID 和长度，可以离线扫描 RustFS 重建 ClickHouse 索引。
 - SHA-256 用于端到端完整性，不把对象 ETag 当内容哈希。
 
+重放能收敛的前提是排序键在重放前后逐列相同。`received_at` 因此取 Kafka 消息自带的时间戳——由生产者在采集入口打上——而不是消费者的 `Utc::now()`：它同时是分区键和 `ORDER BY` 的第一列，重放时若按当时的时钟重新生成，`ReplacingMergeTree` 会认为那是另一行，于是同一条记录在索引里留下两份而不是收敛成一份。`record_id` 同理，由 API 在占位时分配、存进 PostgreSQL、作为 Kafka message key 一路带下来。`pack_key` 和 `pack_offset` 不在排序键里，允许重放前后不同，旧的那个 pack 变成 orphan 由 GC 回收。
+
+## 运行时依赖与参数
+
+| 事项 | 位置 | 说明 |
+|---|---|---|
+| 消费位点 | PostgreSQL `kafka_offsets` | rskafka 没有 consumer group，位点必须自己存；放在 PostgreSQL 是因为事务性状态本来就在那里。代价是每个 partition 只能有一个消费者，多副本会互相覆盖位点。 |
+| topic 保留 | `deploy/redpanda/bootstrap.yml` | `retention_bytes` / `log_retention_ms` 是 cluster property，写在容器命令行的 `--set` 会被 broker 忽略（只在 redpanda.yaml 留一行日志）。bootstrap 文件只在数据卷为空的首次启动读取，之后改用 `rpk cluster config set`。按 641,475 局历史导入、单条 p50 53,668 字节估算约 34.4GB，配 40GiB 上限。 |
+| 积压上限 | `MJAI_KAFKA_MAX_LAG`（默认 50000） | 后台每 5 秒采样一次 high watermark 与已提交位点之差；超过上限时采集入口直接拒绝，单条和批量都以 `500` 结束——记录没丢，但采集器必须退避到 worker 把 topic 消费下去为止。这样 topic 不会涨过保留上限、把已经回过 `202` 的记录悄悄丢掉。采样有滞后，因此是软上限；设成 `0` 等于关闭采集而不必停进程。 |
+| pack 封包 | `MJAI_PACK_TARGET_BYTES` / `MJAI_PACK_MAX_AGE_SECS` / `MJAI_PACK_IDLE_SECS` | 尺寸或年龄先到者封包。只看尺寸的话，低峰期的记录要等攒满 256MB 才可查，按当前采集速率是数周。第三个是追平 topic 之后的封包年龄（默认 30 秒）：消费本身是毫秒级的，滞后来自攒包，而两局之间已经没有东西再来填这个 pack，等满 `MAX_AGE` 只是拖长记录不可查、以及 broker 那一个卷独自持有已回过 `202` 的字节的时间。它不会在有负载时增加对象数——有积压的 worker 永远追不平，尺寸目标照旧决定封包。 |
+| orphan 回收 | `MJAI_GC_GRACE_SECS`（默认 24 小时） | 比宽限期年轻的对象一律不删：上传已完成、索引还在路上的 pack，和写入者中途死掉留下的 pack，从外面看完全一样。清单查询失败或返回空时整轮放弃删除——空清单和“索引正常但没数据”同样无法区分，按空清单处理会删光语料。 |
+
 ## 容量估算
 
 先用真实样本测量，不用“10KB 上限”直接采购。若平均原文为 5KB：
@@ -111,9 +123,10 @@ ClickHouse 是记录级索引的事实来源，表定义见 `migrations/clickhou
 
 ## 上线前缺口
 
-- RustFS、Kafka、PostgreSQL、ClickHouse 的生产 adapter。
-- 将现有 tar/tar.gz 流式采集 endpoint 接入 Kafka producer，并增加 tar.zst 解码。
-- packer/indexer 与 exporter worker 二进制。
+- tar.zst 解码（tar 与 tar.gz 已支持）。
+- packer/indexer 与 exporter worker 二进制：目前是 API 进程内的任务（每 partition 一个）。位点在 PostgreSQL 且没有任何 rebalance，多副本会从同一行位点各消费一遍、互相覆盖，因此现阶段 API 只能单副本。
+- Redpanda 单节点单 partition、无副本：broker 数据卷损坏等于丢掉尚未打包的那一段记录；上线前至少要给这个卷单独的可靠存储或备份。
+- 历史 pack 上传对象存储后本地副本保留，容量按两份算。确认对象存储读取无误之前不删，删除动作留给人工。
 - JWT/RBAC、租户隔离、审计日志和限流。
-- OpenTelemetry 指标、追踪、DLQ、重放和 orphan GC。
+- OpenTelemetry 指标、追踪、DLQ 与重放（orphan GC 已实现）。
 - 真实数据压测、备份恢复演练和 schema 演进策略。

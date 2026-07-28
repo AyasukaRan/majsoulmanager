@@ -31,6 +31,18 @@ CREATE INDEX IF NOT EXISTS download_jobs_state_created_idx
 CREATE INDEX IF NOT EXISTS download_jobs_expires_at_idx
     ON download_jobs (expires_at);
 
+-- rskafka has no consumer groups and no offset commit API, so the pack worker
+-- stores its own position here. One row per (topic, partition), advanced in a
+-- single upsert only after the records up to next_offset have been packed,
+-- uploaded and indexed.
+CREATE TABLE IF NOT EXISTS kafka_offsets (
+    topic text NOT NULL,
+    partition_id integer NOT NULL,
+    next_offset bigint NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (topic, partition_id)
+);
+
 CREATE TABLE IF NOT EXISTS api_keys (
     id uuid PRIMARY KEY,
     name text NOT NULL,

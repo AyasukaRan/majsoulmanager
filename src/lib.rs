@@ -3,10 +3,14 @@ pub mod auth;
 pub mod catalog;
 pub mod clickhouse;
 pub mod config;
+pub mod gc;
+pub mod indexer;
+pub mod kafka;
 pub mod majsoul;
 pub mod managed_watch;
 pub mod mihomo;
 pub mod mjai;
+pub mod objects;
 pub mod pack;
 pub mod recovery;
 pub mod watch;
@@ -18,8 +22,10 @@ use std::{path::PathBuf, sync::Arc};
 use auth::AuthStore;
 use catalog::Catalog;
 use config::Config;
+use kafka::Kafka;
 use managed_watch::ManagedWatchDependencies;
 use mihomo::MihomoManager;
+use objects::Objects;
 use pack::PackStore;
 use watch::WatchRegistry;
 use watch_log::WatchLogBuffer;
@@ -30,7 +36,9 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub auth: Arc<AuthStore>,
     pub catalog: Arc<Catalog>,
+    pub kafka: Arc<Kafka>,
     pub mihomo: Arc<MihomoManager>,
+    pub objects: Arc<Objects>,
     pub packs: Arc<PackStore>,
     pub watch: Arc<WatchRegistry>,
     pub watch_service: Arc<WatchSupervisor>,
@@ -40,10 +48,25 @@ pub struct AppState {
 impl AppState {
     pub async fn local(config: Config) -> anyhow::Result<Self> {
         let data_dir = config.data_dir.clone();
-        let pack_dir = data_dir.join("packs");
         let export_dir = data_dir.join("exports");
         std::fs::create_dir_all(&export_dir)?;
-        let packs = Arc::new(PackStore::new(pack_dir, config.pack_target_bytes)?);
+        let objects = Arc::new(Objects::new(
+            &config.s3_endpoint_url,
+            &config.s3_bucket,
+            &config.s3_region,
+            &config.s3_access_key,
+            &config.s3_secret_key,
+        )?);
+        let packs = Arc::new(PackStore::new(&data_dir, Arc::clone(&objects))?);
+        // Before the recovery scan, and never re-indexed instead: a staging
+        // pack holds nothing but records whose Kafka offset was never
+        // committed, so the broker still owes every one of them. Indexing it
+        // here *and* letting Kafka redeliver it would give one record two rows
+        // under two pack keys.
+        let discarded = packs.discard_staging()?;
+        if discarded > 0 {
+            tracing::info!(discarded, "discarded staging packs left by a previous run");
+        }
         let catalog = Arc::new(Catalog::connect(&config).await?);
         // Before anything is served: an index missing rows would let the API
         // report a record as absent while its bytes sit in a pack.
@@ -51,6 +74,9 @@ impl AppState {
         if recovered > 0 {
             tracing::info!(recovered, "re-indexed pack entries missing from the index");
         }
+        // After the databases, because a broker that is up while ClickHouse is
+        // not would let ingest accept records into a topic nothing can drain.
+        let kafka = Arc::new(Kafka::connect(&config).await?);
         let auth = Arc::new(AuthStore::new(
             &data_dir,
             &config.admin_email,
@@ -71,7 +97,7 @@ impl AppState {
         let dependencies = Arc::new(ManagedWatchDependencies {
             data_dir: data_dir.clone(),
             catalog: Arc::clone(&catalog),
-            packs: Arc::clone(&packs),
+            kafka: Arc::clone(&kafka),
             registry: Arc::clone(&watch),
             mihomo: Arc::clone(&mihomo),
             logs: Arc::clone(&watch_logs),
@@ -86,7 +112,9 @@ impl AppState {
             auth,
             packs,
             catalog,
+            kafka,
             mihomo,
+            objects,
             watch,
             watch_service,
             config: Arc::new(config),

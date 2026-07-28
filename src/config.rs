@@ -111,6 +111,82 @@ pub struct Config {
 
     #[arg(long, env = "MJAI_EMAIL_FROM", default_value = "noreply@example.com")]
     pub email_from: String,
+
+    #[arg(
+        long,
+        env = "MJAI_S3_ENDPOINT_URL",
+        default_value = "http://rustfs:9000"
+    )]
+    pub s3_endpoint_url: String,
+
+    #[arg(long, env = "MJAI_S3_ACCESS_KEY", default_value = "rustfsadmin")]
+    pub s3_access_key: String,
+
+    #[arg(long, env = "MJAI_S3_SECRET_KEY", default_value = "rustfsadmin")]
+    pub s3_secret_key: String,
+
+    #[arg(long, env = "MJAI_S3_BUCKET", default_value = "mjai-raw")]
+    pub s3_bucket: String,
+
+    /// RustFS never validates the region, it only has to be the same string the
+    /// bucket was created with, which is what the Compose sidecar passes.
+    #[arg(long, env = "MJAI_S3_REGION", default_value = "us-east-1")]
+    pub s3_region: String,
+
+    #[arg(
+        long,
+        env = "MJAI_KAFKA_BOOTSTRAP_SERVERS",
+        default_value = "redpanda:9092"
+    )]
+    pub kafka_bootstrap_servers: String,
+
+    #[arg(long, env = "MJAI_KAFKA_TOPIC", default_value = "mjai.records.raw")]
+    pub kafka_topic: String,
+
+    /// One partition, because a single broker pinned to one core gains nothing
+    /// from more. The pack worker is written per-partition so raising this
+    /// works, but the ceiling is that nothing yet rebalances partitions across
+    /// processes: a second consumer would need its own assignment.
+    #[arg(long, env = "MJAI_KAFKA_PARTITIONS", default_value_t = 1)]
+    pub kafka_partitions: i32,
+
+    /// The durable replacement for the old in-memory pending-row cap. Ingest is
+    /// refused past this backlog so the topic cannot outgrow its retention and
+    /// silently drop records that were already acknowledged as accepted.
+    #[arg(long, env = "MJAI_KAFKA_MAX_LAG", default_value_t = 50_000)]
+    pub kafka_max_lag: i64,
+
+    /// Packs seal on size or on age, whichever comes first. Size alone would
+    /// leave a quiet period's records unindexed and invisible to every query
+    /// until 256MB had accumulated, which at the live collection rate is weeks.
+    #[arg(long, env = "MJAI_PACK_MAX_AGE_SECS", default_value_t = 300)]
+    pub pack_max_age_secs: u64,
+
+    /// The age at which a pack seals once the worker has caught up with the
+    /// topic. Waiting out the full age limit with nothing left to consume only
+    /// delays every record in the pack becoming readable and prolongs the window
+    /// in which the broker's single volume holds the only copy of bytes the API
+    /// has already answered `202` for.
+    ///
+    /// It buys that with one object and one ClickHouse part per interval in
+    /// which anything arrived at all — the age runs from the pack's first
+    /// append, so a continuous trickle seals every interval whether the pack
+    /// holds one record or twenty. At 30 seconds that is at most 2,880 a day
+    /// against 288 at the age limit, and both the GC's bucket listing and
+    /// `indexed_counts`' grouping scale with the number of packs. Raise it if
+    /// that starts to cost more than the visibility is worth; past that point
+    /// the honest fix is compacting small packs, not waiting longer.
+    #[arg(long, env = "MJAI_PACK_IDLE_SECS", default_value_t = 30)]
+    pub pack_idle_secs: u64,
+
+    /// An object younger than this is never collected, however orphaned it
+    /// looks: an upload that has landed but whose index rows are still in
+    /// flight is indistinguishable from one whose writer died.
+    #[arg(long, env = "MJAI_GC_GRACE_SECS", default_value_t = 86_400)]
+    pub gc_grace_secs: u64,
+
+    #[arg(long, env = "MJAI_GC_INTERVAL_SECS", default_value_t = 3_600)]
+    pub gc_interval_secs: u64,
 }
 
 impl Config {

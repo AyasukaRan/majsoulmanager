@@ -1,4 +1,9 @@
-.PHONY: install dev test lint image-build infra-up infra-up-local infra-pull infra-down
+.PHONY: install dev test test-infra lint image-build infra-up infra-up-local infra-pull infra-down
+
+# The overlay is what publishes the infrastructure ports on 127.0.0.1; the base
+# file alone keeps them inside the Compose network, which is right for a
+# deployment and useless for anything running on the host.
+DEV_COMPOSE = docker compose -f docker-compose.yml -f docker-compose.dev.yml
 
 install:
 	cargo fetch
@@ -6,21 +11,43 @@ install:
 dev:
 	cargo run
 
+# tests/api.rs drives the real pipeline end to end, so it needs PostgreSQL,
+# ClickHouse, Redpanda and RustFS listening on the host: run `make test-infra`
+# first. Without them the integration tests fail while building their state,
+# which reads as a broken build rather than as missing infrastructure.
 test:
 	cargo test
+
+# Exactly what the integration suite talks to, and nothing more — naming the
+# services keeps `up` from building the api and web images, which the suite does
+# not use and which cost minutes. CI runs this same target, so there is one
+# definition of the test environment. `--wait` matters: a broker that is up but
+# has not elected a leader fails the first `partition_client` and nothing else,
+# which reads as a broken test rather than as a broker that needed another
+# second.
+#
+# RustFS is started by the second line rather than the first because `up --wait`
+# still exits 1 when any container it started has exited, including the one-shot
+# chown RustFS depends on (docker/compose#10596, open). `run` has no such
+# problem: it honours the same depends_on conditions, so the bucket is only
+# attempted once RustFS reports ready, and a bucket that cannot be created fails
+# here with its own message instead of as an upload error inside a test.
+test-infra:
+	$(DEV_COMPOSE) up -d --wait postgres clickhouse redpanda
+	$(DEV_COMPOSE) run --rm create-bucket
 
 lint:
 	cargo fmt --check
 	cargo clippy --all-targets -- -D warnings
 
 image-build:
-	docker compose -f docker-compose.yml -f docker-compose.dev.yml build api web
+	$(DEV_COMPOSE) build api web
 
 infra-up:
 	docker compose up -d
 
 infra-up-local:
-	docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+	$(DEV_COMPOSE) up -d
 
 infra-pull:
 	docker compose pull api web

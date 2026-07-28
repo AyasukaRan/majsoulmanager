@@ -21,6 +21,27 @@ services:
       MJAI_CLICKHOUSE_URL: http://clickhouse:8123
       MJAI_CLICKHOUSE_USER: mjai
       MJAI_CLICKHOUSE_PASSWORD: mjai
+      # Addresses are pinned to the service names rather than interpolated, the
+      # same as the two above: a deployment's .env names these hosts as
+      # localhost, which is right from the operator's shell and wrong from
+      # inside this network. Redpanda's internal listener, not the external one,
+      # because the external one advertises `localhost` and a client that
+      # followed that would dial itself.
+      MJAI_KAFKA_BOOTSTRAP_SERVERS: redpanda:29092
+      MJAI_S3_ENDPOINT_URL: http://rustfs:9000
+      MJAI_S3_ACCESS_KEY: rustfsadmin
+      MJAI_S3_SECRET_KEY: rustfsadmin
+      MJAI_S3_BUCKET: mjai-raw
+      MJAI_S3_REGION: us-east-1
+      # Tuning knobs, passed through so that setting them in .env does
+      # something. See .env.example for what each one trades.
+      MJAI_KAFKA_TOPIC: ${MJAI_KAFKA_TOPIC:-mjai.records.raw}
+      MJAI_KAFKA_PARTITIONS: ${MJAI_KAFKA_PARTITIONS:-1}
+      MJAI_KAFKA_MAX_LAG: ${MJAI_KAFKA_MAX_LAG:-50000}
+      MJAI_PACK_MAX_AGE_SECS: ${MJAI_PACK_MAX_AGE_SECS:-300}
+      MJAI_PACK_IDLE_SECS: ${MJAI_PACK_IDLE_SECS:-30}
+      MJAI_GC_GRACE_SECS: ${MJAI_GC_GRACE_SECS:-86400}
+      MJAI_GC_INTERVAL_SECS: ${MJAI_GC_INTERVAL_SECS:-3600}
       MJAI_MIHOMO_CONTROLLER_URL: http://mihomo:9090
       MJAI_MIHOMO_SECRET: ${MJAI_MIHOMO_SECRET:-change-mihomo-me}
       MJAI_MIHOMO_PROXY_URL: http://mihomo:7890
@@ -42,6 +63,19 @@ services:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
+      # Ingest cannot accept a record without the broker, so the API exits if it
+      # cannot reach one at boot. Waiting for the health check rather than the
+      # container turns the ten seconds Redpanda takes to elect a leader from a
+      # crash loop into a wait.
+      redpanda:
+        condition: service_healthy
+      # The first thing the API does after the listener is up is upload the
+      # legacy packs, and every seal after that ends in a PUT, so a missing
+      # bucket is not a race the API recovers from — it is every upload failing
+      # until someone notices. The sidecar is bounded now, so waiting for it to
+      # succeed cannot hang the stack.
+      create-bucket:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   mihomo:
@@ -119,19 +153,38 @@ services:
     command: /data
     volumes:
       - rustfs-data:/data
+    # Readiness rather than liveness: `/health` answers while the store is
+    # still initialising, and both the bucket sidecar and every upload need a
+    # store that can actually serve. The endpoints are unauthenticated on the
+    # S3 port.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
 
+  # Bounded, because the API now waits for this to succeed: an unbounded retry
+  # against a RustFS that will never serve this bucket — wrong credentials, a
+  # name another tenant holds — would hang the whole stack with no error
+  # anywhere, where thirty seconds of retries ends in a message and a non-zero
+  # exit. Thirty is generous: rustfs is already healthy when this starts.
   create-bucket:
     image: amazon/aws-cli:2.27.12
-    depends_on: [rustfs]
+    depends_on:
+      rustfs:
+        condition: service_healthy
     environment:
       AWS_ACCESS_KEY_ID: rustfsadmin
       AWS_SECRET_ACCESS_KEY: rustfsadmin
       AWS_DEFAULT_REGION: us-east-1
     entrypoint: /bin/sh
     command: >-
-      -c "until aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket mjai-raw 2>/dev/null;
-      do aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket mjai-raw 2>/dev/null || sleep 1;
-      done"
+      -c "for _ in $$(seq 30);
+      do aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket mjai-raw 2>/dev/null && exit 0;
+      aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket mjai-raw 2>/dev/null && exit 0;
+      sleep 1; done;
+      echo 'mjai-raw bucket could not be created on http://rustfs:9000'; exit 1"
 
   redpanda:
     image: redpandadata/redpanda:v25.1.3
@@ -145,8 +198,21 @@ services:
       - --node-id=0
       - --kafka-addr=internal://0.0.0.0:29092,external://0.0.0.0:9092
       - --advertise-kafka-addr=internal://redpanda:29092,external://localhost:9092
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
     volumes:
       - redpanda-data:/var/lib/redpanda/data
+      # Retention is a cluster property, and cluster properties cannot be set on
+      # the command line: `rpk redpanda start --set retention_bytes=...` writes
+      # them into redpanda.yaml, where the broker logs "Ignoring value ... use
+      # rpk cluster config edit" and keeps the default. A bootstrap file is the
+      # one way to have them in the repository rather than in someone's shell
+      # history. See that file for the sizing and for the ceiling.
+      - ./deploy/redpanda/bootstrap.yml:/etc/redpanda/.bootstrap.yaml:ro
+    restart: unless-stopped
 
 volumes:
   api-data:

@@ -35,15 +35,16 @@ use crate::{
         RegistrationStatus, UpdateUserRequest, UserView, VerifyEmailRequest,
     },
     catalog::{
-        CatalogError, Cursor, DownloadFormat, DownloadJob, DownloadRequest, IdempotencyClaim,
-        JobState, Record, RecordFilter,
+        CatalogError, Cursor, DownloadCounts, DownloadFormat, DownloadJob, DownloadRequest,
+        JobState, Record, RecordFilter, RecordStats, StorageStats,
     },
+    indexer::{self, Claimed, IngestError},
+    kafka::MAX_PRODUCE_BATCH_BYTES,
     mihomo::{MihomoAction, MihomoError, MihomoStatus, ProxySelection, SubscriptionUpdate},
-    mjai,
     watch_log::WatchLogEntry,
     watch_service::{
-        InstallModuleRequest, InstalledModule, WatchAction, WatchDashboard, WatchRuntimeStatus,
-        WatchServiceConfig, WatchServiceError, module_protocol_contract,
+        InstallModuleRequest, InstalledModule, ServicePhase, WatchAction, WatchDashboard,
+        WatchRuntimeStatus, WatchServiceConfig, WatchServiceError, module_protocol_contract,
     },
 };
 
@@ -54,7 +55,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/records/batch", post(ingest_batch))
         .route("/api/v1/records/{id}", get(get_record))
         .route("/api/v1/records/{id}/raw", get(get_raw))
-        .route("/api/v1/downloads", post(create_download))
+        .route("/api/v1/stats", get(get_stats))
+        .route(
+            "/api/v1/downloads",
+            post(create_download).get(list_downloads),
+        )
         .route("/api/v1/downloads/{id}", get(get_download))
         .route("/api/v1/downloads/{id}/file", get(download_file))
         .route("/api/v1/watch/status", get(get_watch_status))
@@ -364,6 +369,9 @@ async fn require_auth(
 #[derive(Serialize)]
 struct IngestResponse {
     id: Uuid,
+    /// `accepted`, not `indexed`: the record is durably in the topic and the
+    /// pack worker has not seen it yet, so a read of it can still answer 404
+    /// for as long as the worker takes to seal the pack it lands in.
     status: &'static str,
     duplicate: bool,
     sha256: String,
@@ -400,6 +408,13 @@ async fn ingest(
     Ok((status, Json(response)))
 }
 
+/// Validate, hash, claim, produce, `202`. Nothing here packs or indexes any
+/// more: the record is handed to the topic and the pack worker does both.
+///
+/// A batch carries one `X-Mjai-Played-At` header for tens of thousands of
+/// games, so the record's own `majsoul.start_time` is the only usable
+/// `played_at` and the header stays an override. The worker resolves that,
+/// because only it parses the record for the index row.
 async fn ingest_one(
     state: &AppState,
     idempotency_key: &str,
@@ -407,74 +422,35 @@ async fn ingest_one(
     played_at: Option<DateTime<Utc>>,
     body: &[u8],
 ) -> Result<IngestResponse, ApiError> {
-    // Reported separately from the size limit: a batch that stores nothing now
-    // answers 422, so this error string becomes the operator's whole diagnosis,
-    // and calling an empty record oversized points them at the wrong knob.
+    check_record_size(state, body)?;
+    let accepted = indexer::ingest_one(
+        &state.catalog,
+        &state.kafka,
+        source,
+        idempotency_key,
+        played_at,
+        body,
+    )
+    .await?;
+    Ok(IngestResponse {
+        id: accepted.id,
+        status: "accepted",
+        duplicate: accepted.duplicate,
+        sha256: accepted.sha256,
+    })
+}
+
+/// Reported separately from the size limit: a batch that stores nothing answers
+/// 422, so this error string becomes the operator's whole diagnosis, and
+/// calling an empty record oversized points them at the wrong knob.
+fn check_record_size(state: &AppState, body: &[u8]) -> Result<(), ApiError> {
     if body.is_empty() {
         return Err(ApiError::BadRequest("record is empty".into()));
     }
     if body.len() > state.config.max_record_bytes {
         return Err(ApiError::PayloadTooLarge(state.config.max_record_bytes));
     }
-    let metadata =
-        mjai::parse_metadata(body).map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    let sha256 = hex::encode(Sha256::digest(body));
-    let id = Uuid::new_v4();
-
-    let scoped_idempotency_key = format!("{source}\0{idempotency_key}");
-    match state
-        .catalog
-        .claim(&scoped_idempotency_key, id, &sha256)
-        .await?
-    {
-        IdempotencyClaim::Existing(record) => Ok(IngestResponse {
-            id: record.id,
-            status: "indexed",
-            duplicate: true,
-            sha256,
-        }),
-        IdempotencyClaim::New => {
-            let location = match state.packs.append(id, body) {
-                Ok(location) => location,
-                Err(error) => {
-                    // A claim left behind only costs the collector a `409` on
-                    // its next retry of this key, and reporting it would hide
-                    // the pack failure that actually stopped the ingest.
-                    if let Err(claim) = state
-                        .catalog
-                        .abandon_claim(&scoped_idempotency_key, id)
-                        .await
-                    {
-                        tracing::warn!(%claim, "could not release the idempotency claim");
-                    }
-                    return Err(ApiError::Internal(error.to_string()));
-                }
-            };
-            state
-                .catalog
-                .insert(Record {
-                    id,
-                    source: source.to_owned(),
-                    sha256: sha256.clone(),
-                    received_at: Utc::now(),
-                    // A batch carries one header for tens of thousands of games, so the record's
-                    // own majsoul.start_time is the only usable played_at; the header stays an
-                    // override.
-                    played_at: played_at.or(metadata.played_at),
-                    players: metadata.players,
-                    rule: metadata.rule,
-                    event_count: metadata.event_count,
-                    storage: location,
-                })
-                .await?;
-            Ok(IngestResponse {
-                id,
-                status: "indexed",
-                duplicate: false,
-                sha256,
-            })
-        }
-    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -512,29 +488,39 @@ async fn ingest_batch(
     let mut output = tokio::fs::File::create(&staging_path)
         .await
         .map_err(|error| ApiError::Internal(error.to_string()))?;
-    let mut received = 0usize;
-    while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|error| ApiError::BadRequest(error.to_string()))?;
-        if let Ok(data) = frame.into_data() {
-            received = received
-                .checked_add(data.len())
-                .ok_or(ApiError::PayloadTooLarge(state.config.max_batch_bytes))?;
-            if received > state.config.max_batch_bytes {
-                drop(output);
-                let _ = tokio::fs::remove_file(&staging_path).await;
-                return Err(ApiError::PayloadTooLarge(state.config.max_batch_bytes));
+    // Every exit from the upload has to take the half-written archive with it.
+    // A 400MB import whose connection resets at 300MB is the ordinary failure
+    // here — a collector retries it, and the operator may retry it several
+    // times — and nothing sweeps this directory, so a leak on that path fills
+    // the API's disk one abandoned attempt at a time until someone notices.
+    let uploaded = async {
+        let mut received = 0usize;
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|error| ApiError::BadRequest(error.to_string()))?;
+            if let Ok(data) = frame.into_data() {
+                received = received
+                    .checked_add(data.len())
+                    .ok_or(ApiError::PayloadTooLarge(state.config.max_batch_bytes))?;
+                if received > state.config.max_batch_bytes {
+                    return Err(ApiError::PayloadTooLarge(state.config.max_batch_bytes));
+                }
+                output
+                    .write_all(&data)
+                    .await
+                    .map_err(|error| ApiError::Internal(error.to_string()))?;
             }
-            output
-                .write_all(&data)
-                .await
-                .map_err(|error| ApiError::Internal(error.to_string()))?;
         }
+        output
+            .flush()
+            .await
+            .map_err(|error| ApiError::Internal(error.to_string()))
     }
-    output
-        .flush()
-        .await
-        .map_err(|error| ApiError::Internal(error.to_string()))?;
+    .await;
     drop(output);
+    if let Err(error) = uploaded {
+        let _ = tokio::fs::remove_file(&staging_path).await;
+        return Err(error);
+    }
 
     let worker_state = state.clone();
     // The tar walk stays on a blocking thread; only the catalogue calls inside
@@ -595,74 +581,147 @@ async fn process_batch_archive(
             rejected: 0,
             errors: Vec::new(),
         };
-        for (index, entry) in entries.enumerate() {
-            if index >= state.config.max_batch_records {
-                return Err(ApiError::BadRequest(format!(
-                    "batch exceeds {} records",
-                    state.config.max_batch_records
-                )));
-            }
-            let mut entry = entry
-                .map_err(|error| ApiError::BadRequest(format!("invalid tar entry: {error}")))?;
-            if !entry.header().entry_type().is_file() {
-                continue;
-            }
-            let member_path = entry
-                .path()
-                .map_err(|error| ApiError::BadRequest(error.to_string()))?
-                .to_string_lossy()
-                .into_owned();
-            let size = entry.size() as usize;
-            // Stored size, which for a gzip member is the compressed one, so this only bounds the
-            // read; the record limit is enforced against the decompressed payload below.
-            if size == 0 || size > state.config.max_record_bytes {
-                response.rejected += 1;
-                push_batch_error(
-                    &mut response.errors,
-                    format!("{member_path}: invalid size {size}"),
-                );
-                continue;
-            }
-            let mut raw = Vec::with_capacity(size);
-            if let Err(error) = entry.read_to_end(&mut raw) {
-                response.rejected += 1;
-                push_batch_error(&mut response.errors, format!("{member_path}: {error}"));
-                continue;
-            }
-            // Detected by content, not by name: the collector's files are all named `.mjson` but
-            // are gzip on disk, and decompressing 3.2GB into ~34GB to build an archive is wasted
-            // work.
-            if raw.starts_with(&[0x1f, 0x8b]) {
-                match inflate_member(&raw, state.config.max_record_bytes) {
-                    Ok(inflated) => raw = inflated,
+        let mut pending: Vec<Claimed> = Vec::new();
+        let mut pending_bytes = 0usize;
+        // Wrapped so that every exit from the walk — the record ceiling, a corrupt tar entry, an
+        // unreadable member path, a record this server could not keep, a failed flush — passes
+        // through one release of the claims still in hand. Returning straight out of the loop
+        // drops them, and a dropped claim is the one failure an import can neither report nor
+        // retry past: the record reached no topic and no index, and the retry that would resend it
+        // is told it is a duplicate.
+        let walked = async {
+            for (index, entry) in entries.enumerate() {
+                if index >= state.config.max_batch_records {
+                    return Err(ApiError::BadRequest(format!(
+                        "batch exceeds {} records",
+                        state.config.max_batch_records
+                    )));
+                }
+                let mut entry = entry
+                    .map_err(|error| ApiError::BadRequest(format!("invalid tar entry: {error}")))?;
+                if !entry.header().entry_type().is_file() {
+                    continue;
+                }
+                let member_path = entry
+                    .path()
+                    .map_err(|error| ApiError::BadRequest(error.to_string()))?
+                    .to_string_lossy()
+                    .into_owned();
+                let size = entry.size() as usize;
+                // Stored size, which for a gzip member is the compressed one, so this only bounds the
+                // read; the record limit is enforced against the decompressed payload below.
+                if size == 0 || size > state.config.max_record_bytes {
+                    response.rejected += 1;
+                    push_batch_error(
+                        &mut response.errors,
+                        format!("{member_path}: invalid size {size}"),
+                    );
+                    continue;
+                }
+                let mut raw = Vec::with_capacity(size);
+                if let Err(error) = entry.read_to_end(&mut raw) {
+                    response.rejected += 1;
+                    push_batch_error(&mut response.errors, format!("{member_path}: {error}"));
+                    continue;
+                }
+                // Detected by content, not by name: the collector's files are all named `.mjson` but
+                // are gzip on disk, and decompressing 3.2GB into ~34GB to build an archive is wasted
+                // work.
+                if raw.starts_with(&[0x1f, 0x8b]) {
+                    match inflate_member(&raw, state.config.max_record_bytes) {
+                        Ok(inflated) => raw = inflated,
+                        Err(error) => {
+                            response.rejected += 1;
+                            push_batch_error(
+                                &mut response.errors,
+                                format!("{member_path}: {error}"),
+                            );
+                            continue;
+                        }
+                    }
+                }
+                let item_key = format!("{batch_key}/{member_path}");
+                let member = match check_record_size(state, &raw) {
+                    Ok(()) => indexer::claim(
+                        &state.catalog,
+                        &state.kafka,
+                        source,
+                        &item_key,
+                        played_at,
+                        &raw,
+                    )
+                    .await
+                    .map_err(ApiError::from),
+                    Err(error) => Err(error),
+                };
+                let claimed = match member {
+                    Ok(claimed) => claimed,
+                    // Losing a record the caller handed over is not the member being bad. Counting it
+                    // as a rejection would bury a full disk — or a broker that will not take the
+                    // record — in the error list of a 202 and let a losing import look healthy.
+                    Err(ApiError::Internal(error)) => {
+                        return Err(ApiError::Internal(format!("{member_path}: {error}")));
+                    }
                     Err(error) => {
                         response.rejected += 1;
                         push_batch_error(&mut response.errors, format!("{member_path}: {error}"));
                         continue;
                     }
+                };
+                if claimed.is_duplicate() {
+                    response.duplicates += 1;
+                    continue;
                 }
+                response.accepted += 1;
+                // Produced in size-bounded chunks rather than one request at the end: a 50,000
+                // member import is gigabytes, and holding all of it to produce at once would trade
+                // the pack worker's memory bound for the API's.
+                //
+                // The bound is tested before the record joins the chunk, so a chunk stays under it
+                // and `produce_batch` sends it as a single request per partition. Pushing first
+                // and testing after would overshoot by up to one record, which splits every flush
+                // in two, and a split whose first request lands and whose second fails releases
+                // the claims of records that are already durably in the topic: the retry produces
+                // them again under fresh record ids, and `record_id` is in the sorting key, so
+                // ReplacingMergeTree cannot converge those two rows. The record in hand is not in
+                // `pending` yet and so is not covered by the walk's release, which is why the
+                // failing branch releases it explicitly rather than dropping it.
+                if pending_bytes + claimed.raw_len() > MAX_PRODUCE_BATCH_BYTES
+                    && let Err(error) =
+                        produce_batch_chunk(state, &mut pending, &mut pending_bytes).await
+                {
+                    indexer::abandon_claimed(&state.catalog, vec![claimed]).await;
+                    return Err(error);
+                }
+                pending_bytes += claimed.raw_len();
+                pending.push(claimed);
             }
-            let item_key = format!("{batch_key}/{member_path}");
-            match ingest_one(state, &item_key, source, played_at, &raw).await {
-                Ok(result) if result.duplicate => response.duplicates += 1,
-                Ok(_) => response.accepted += 1,
-                // Storage failing is this server losing a record the caller handed over, not the
-                // member being bad. Counting it as a rejection would bury a full disk in the
-                // error list of a 202 and let a losing import look healthy.
-                Err(ApiError::Internal(error)) => {
-                    return Err(ApiError::Internal(format!("{member_path}: {error}")));
-                }
-                Err(error) => {
-                    response.rejected += 1;
-                    push_batch_error(&mut response.errors, format!("{member_path}: {error}"));
-                }
-            }
+            produce_batch_chunk(state, &mut pending, &mut pending_bytes).await
+        }
+        .await;
+        if let Err(error) = walked {
+            indexer::abandon_claimed(&state.catalog, std::mem::take(&mut pending)).await;
+            return Err(error);
         }
         Ok(response)
     }
     .await;
     let _ = std::fs::remove_file(path);
     result
+}
+
+/// Hands one chunk of claimed records to the topic. A failure fails the whole
+/// import: the earlier chunks are durably produced and their claims stand, so
+/// the collector's retry finds them as duplicates and only re-sends what is
+/// actually missing.
+async fn produce_batch_chunk(
+    state: &AppState,
+    pending: &mut Vec<Claimed>,
+    pending_bytes: &mut usize,
+) -> Result<(), ApiError> {
+    *pending_bytes = 0;
+    indexer::produce_claimed(&state.catalog, &state.kafka, std::mem::take(pending)).await?;
+    Ok(())
 }
 
 /// MultiGzDecoder, not GzDecoder: concatenated gzip streams are one valid file (that is what
@@ -758,6 +817,7 @@ async fn get_raw(
     let raw = state
         .packs
         .read(&record.storage)
+        .await
         .map_err(|error| ApiError::Internal(error.to_string()))?;
     if hex::encode(Sha256::digest(&raw)) != record.sha256 {
         return Err(ApiError::Internal("record checksum mismatch".into()));
@@ -824,8 +884,14 @@ async fn write_export(
             .scan(&request.filter, cursor, EXPORT_PAGE_SIZE)
             .await?;
         for record in &page {
-            writer.append(record, state)?;
+            writer.append(record, state).await?;
             written += 1;
+        }
+        // Per page rather than per record, and reported rather than propagated:
+        // a progress number the console could not read is not worth failing an
+        // export that is otherwise writing correctly.
+        if let Err(error) = state.catalog.record_job_progress(id, written).await {
+            tracing::warn!(job = %id, %error, "could not publish export progress");
         }
         match next {
             Some(next) => cursor = Some(next),
@@ -853,10 +919,10 @@ impl ExportWriter {
         })
     }
 
-    fn append(&mut self, record: &Record, state: &AppState) -> anyhow::Result<()> {
+    async fn append(&mut self, record: &Record, state: &AppState) -> anyhow::Result<()> {
         match self {
             Self::TarGz(archive) => {
-                let raw = state.packs.read(&record.storage)?;
+                let raw = state.packs.read(&record.storage).await?;
                 let mut header = TarHeader::new_gnu();
                 header.set_size(raw.len() as u64);
                 header.set_mode(0o644);
@@ -943,6 +1009,77 @@ async fn download_file(
     Ok(response)
 }
 
+#[derive(Deserialize)]
+struct DownloadListQuery {
+    #[serde(default = "default_page_size")]
+    limit: usize,
+}
+
+#[derive(Serialize)]
+struct DownloadPage {
+    items: Vec<DownloadJob>,
+}
+
+async fn list_downloads(
+    State(state): State<AppState>,
+    Query(query): Query<DownloadListQuery>,
+) -> Result<Json<DownloadPage>, ApiError> {
+    if !(1..=1000).contains(&query.limit) {
+        return Err(ApiError::BadRequest(
+            "limit must be between 1 and 1000".into(),
+        ));
+    }
+    Ok(Json(DownloadPage {
+        items: state.catalog.recent_jobs(query.limit).await?,
+    }))
+}
+
+#[derive(Serialize)]
+struct StatsResponse {
+    records: RecordStats,
+    storage: StorageStats,
+    downloads: DownloadCounts,
+    watch: WatchStats,
+}
+
+/// The supervisor's counters without its item list, which is what
+/// `/api/v1/watch/status` is for.
+#[derive(Serialize)]
+struct WatchStats {
+    phase: ServicePhase,
+    live: u64,
+    pending: u64,
+    completed: u64,
+    failed: u64,
+}
+
+/// The console polls this. The two stores are asked at once because neither
+/// answer depends on the other, and the supervisor is asked afterwards because
+/// its dashboard is a lock and a clone rather than a query. What each aggregate
+/// costs, and which of them is deliberately approximate, is on `Catalog::stats`.
+async fn get_stats(State(state): State<AppState>) -> Result<Json<StatsResponse>, ApiError> {
+    let (index, downloads) =
+        tokio::try_join!(state.catalog.stats(), state.catalog.download_counts())?;
+    // A limit of zero: the counters are summed over every tracked game and only
+    // the item list is truncated, so this asks for none of it. Building that
+    // empty list still clones and sorts the registry, which is bounded by the
+    // 10,000 games it keeps; if this poll ever shows up in a profile the answer
+    // is a count-only path in `WatchRegistry`, not a change here.
+    let watch = state.watch_service.dashboard(None, 0);
+    Ok(Json(StatsResponse {
+        records: index.records,
+        storage: index.storage,
+        downloads,
+        watch: WatchStats {
+            phase: watch.service.phase,
+            live: watch.records.live as u64,
+            pending: watch.records.pending as u64,
+            completed: watch.records.completed as u64,
+            failed: watch.records.failed as u64,
+        },
+    }))
+}
+
 fn required_header(headers: &HeaderMap, name: &'static str) -> Result<String, ApiError> {
     optional_header(headers, name)
         .filter(|value| !value.is_empty())
@@ -979,10 +1116,29 @@ impl From<CatalogError> for ApiError {
         match error {
             CatalogError::Conflict | CatalogError::Pending => ApiError::Conflict(error.to_string()),
             CatalogError::WindowTooWide(_) => ApiError::BadRequest(error.to_string()),
-            // A `500` is what makes the collector back off, which is the point:
-            // the record is already packed, so the backlog needs ingest to stop
-            // long enough for the index to catch up, not a retry loop.
-            CatalogError::Backlogged(_) | CatalogError::Index(_) | CatalogError::Store(_) => {
+            CatalogError::Index(_) | CatalogError::Store(_) => {
+                ApiError::Internal(error.to_string())
+            }
+        }
+    }
+}
+
+impl From<IngestError> for ApiError {
+    fn from(error: IngestError) -> Self {
+        match error {
+            // The caller's record, not this server's problem: in a batch this
+            // is one rejected member inside an otherwise fine import.
+            IngestError::Malformed(_) => ApiError::BadRequest(error.to_string()),
+            IngestError::Catalog(error) => error.into(),
+            // A `500` is what makes a collector back off, which is the point in
+            // both cases. A produce that failed is a record this server was
+            // handed and did not keep, and it must never be reported as
+            // anything a `2xx` covers. A backlog past the ceiling is the same
+            // answer for the opposite reason: nothing was lost, and ingest has
+            // to stop long enough for the pack worker to drain the topic, or
+            // the topic outgrows its retention and drops records the API has
+            // already acknowledged.
+            IngestError::Produce(_) | IngestError::Backlogged(_) => {
                 ApiError::Internal(error.to_string())
             }
         }

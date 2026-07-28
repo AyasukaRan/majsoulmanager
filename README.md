@@ -12,6 +12,8 @@
 - `GET /api/v1/records`：按来源、时间、玩家筛选，使用游标分页。
 - `POST /api/v1/downloads`：创建异步批量导出任务。
 - `GET /api/v1/downloads/{job_id}`：查询导出进度和下载地址。
+- `GET /api/v1/downloads`：按创建时间倒序列出最近的导出任务。
+- `GET /api/v1/stats`：管理台概览的聚合，包含记录总量与近 24 小时增量、按来源的分布、数据包数量与体积、导出任务状态和 Watch 运行状态；计数不使用 FINAL，重放插入后的合并窗口内可能略高。
 - 内置 majsoul2mjai Watch：在线配置房间、模式、账号密钥引用、代理和轮询频率，展示 UUID 获取与转换状态。
 - 登录与 PB 获取采用版本化进程模块，安装时校验 SHA-256 和协议健康状态，可在线切换、失败回滚。
 - 集成 mihomo：网页配置订阅、刷新 provider、测试节点延迟并切换 Watch 专用节点。
@@ -25,18 +27,20 @@
 
 ## 快速启动
 
-要求 Rust 1.85+，以及可连通的 PostgreSQL 与 ClickHouse（数据库不可用时 API 会拒绝启动，
-而不是提供一个空索引）。
+要求 Rust 1.85+，以及可连通的 PostgreSQL、ClickHouse、Redpanda 和 RustFS：数据库不可用时
+API 会拒绝启动，而不是提供一个空索引；broker 或对象存储不可用时同样如此，因为采集入口在
+Kafka 确认之前不会回 `202`。
 
 ```bash
 cp .env.example .env
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres clickhouse
+make test-infra
 make install
 make dev
 ```
 
-`cargo test` 同样直接跑真实 SQL，需要上面两个容器在 `127.0.0.1` 上可达；
-CI 用 GitHub Actions 的 service container 提供。
+`cargo test` 直接跑真实 SQL、真实 broker 和真实对象存储，需要上面四个容器在 `127.0.0.1` 上
+可达，`make test-infra` 起的就是它们；CI 跑同一个 target，不再单独维护一份 service container
+定义。
 
 测试接口：
 
@@ -49,8 +53,9 @@ curl -X POST http://localhost:8000/api/v1/records \
   --data-binary @game.mjai
 ```
 
-响应 `202 Accepted` 时记录已写入 pack 并取得幂等占用，索引行随批次刷入 ClickHouse；
-进程在刷入前退出的记录会在下次启动的 pack 扫描中补建索引。生产模式将在 Kafka 确认持久化后返回。
+响应 `202 Accepted` 表示记录已取得幂等占用并被 Redpanda 确认落盘，仅此而已：它还没有进索引，
+查询要等 pack/index worker 封包、上传 RustFS、批量写 ClickHouse 之后才看得到。worker 崩溃时
+offset 没有提交，这批记录会重放并收敛到同一行，不会丢也不会变成两条。
 
 批量上传（归档内每个文件独立校验和去重）：
 

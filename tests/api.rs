@@ -11,6 +11,7 @@ use mjai_management::auth::{
     AuthError, AuthSettings, LoginRequest, RegisterRequest, UserRole, VerifyEmailRequest,
 };
 use mjai_management::catalog::{Catalog, Cursor, RecordFilter};
+use mjai_management::objects::Objects;
 use mjai_management::pack::PackStore;
 use mjai_management::watch::{WatchEvent, WatchEventKind};
 use mjai_management::{AppState, api, config::Config, recovery};
@@ -20,10 +21,12 @@ use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-/// The suite talks to the real PostgreSQL and ClickHouse; there is no in-memory
-/// mode left to fall back to, and skipping when they are absent would leave the
-/// SQL untested. `docker compose -f docker-compose.yml -f docker-compose.dev.yml
-/// up -d postgres clickhouse` provides them locally, CI uses service containers.
+/// The suite talks to the real PostgreSQL, ClickHouse, Redpanda and RustFS;
+/// there is no in-memory mode left to fall back to, and skipping when they are
+/// absent would leave the SQL, the produce path and the pack upload untested.
+/// `docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+/// postgres clickhouse redpanda rustfs create-bucket` provides them locally, CI
+/// starts the same four.
 fn test_config(data_dir: &std::path::Path, email_api_url: Option<String>) -> Config {
     Config {
         listen: "127.0.0.1:0".into(),
@@ -51,6 +54,19 @@ fn test_config(data_dir: &std::path::Path, email_api_url: Option<String>) -> Con
         email_api_url,
         email_api_token: None,
         email_from: "noreply@example.com".into(),
+        s3_endpoint_url: env_or("MJAI_S3_ENDPOINT_URL", "http://127.0.0.1:9000"),
+        s3_access_key: env_or("MJAI_S3_ACCESS_KEY", "rustfsadmin"),
+        s3_secret_key: env_or("MJAI_S3_SECRET_KEY", "rustfsadmin"),
+        s3_bucket: env_or("MJAI_S3_BUCKET", "mjai-raw"),
+        s3_region: env_or("MJAI_S3_REGION", "us-east-1"),
+        kafka_bootstrap_servers: env_or("MJAI_KAFKA_BOOTSTRAP_SERVERS", "127.0.0.1:9092"),
+        kafka_topic: env_or("MJAI_KAFKA_TOPIC", "mjai.records.raw"),
+        kafka_partitions: 1,
+        kafka_max_lag: 50_000,
+        pack_max_age_secs: 300,
+        pack_idle_secs: 30,
+        gc_grace_secs: 86_400,
+        gc_interval_secs: 3_600,
     }
 }
 
@@ -82,6 +98,26 @@ async fn test_state_with_email(email_api_url: Option<String>) -> (AppState, std:
         .await
         .unwrap();
     (state, data_dir)
+}
+
+/// Runs the pack/index worker until the topic is empty, then seals, uploads and
+/// indexes what it read. Ingest only promises the record is in the topic, so
+/// every test that reads a record back has to put this between the two.
+///
+/// Partition 0 is the whole topic at the default partition count, and the
+/// offset is shared: a worker started by one test will index records another
+/// test produced, into a pack under its own data directory. That is harmless
+/// and worth knowing — the object lands in the same bucket either way, both
+/// tests read it back through the same index, and a record indexed twice
+/// converges because `received_at` and `record_id` both travel with the
+/// message rather than being re-derived here.
+async fn index_pending(state: &AppState) {
+    mjai_management::indexer::PackWorker::start(state.clone(), 0)
+        .await
+        .unwrap()
+        .drain()
+        .await
+        .unwrap();
 }
 
 type EmailSender = Arc<Mutex<Option<tokio::sync::oneshot::Sender<Value>>>>;
@@ -148,7 +184,7 @@ async fn json_body(response: axum::response::Response) -> Value {
 async fn ingests_and_reads_one_record_without_reading_a_whole_pack() {
     let (state, data_dir) = test_state().await;
     let source = test_source(&data_dir);
-    let app = api::router(state);
+    let app = api::router(state.clone());
     let raw = r#"{"type":"start_game","names":["a","b","c","d"],"rule":"tonpu"}
 {"type":"start_kyoku","bakaze":"E","kyoku":1}"#;
 
@@ -161,6 +197,9 @@ async fn ingests_and_reads_one_record_without_reading_a_whole_pack() {
     let json: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     let id = json["id"].as_str().unwrap();
+    // The record is in the topic, not in a pack: the read below is of the pack
+    // the worker builds, and of the object it uploads it to.
+    index_pending(&state).await;
 
     let response = app
         .clone()
@@ -389,7 +428,7 @@ fn two_records() -> [(&'static str, Vec<u8>); 2] {
 async fn ingests_gzip_tar_members_with_their_own_played_at() {
     let (state, data_dir) = test_state().await;
     let source = test_source(&data_dir);
-    let app = api::router(state);
+    let app = api::router(state.clone());
     let throne_4p =
         include_bytes!("fixtures/260716-00000000-0000-4000-8000-000000000004.mjson").to_vec();
     let members = [
@@ -414,6 +453,7 @@ async fn ingests_gzip_tar_members_with_their_own_played_at() {
     assert_eq!(json["accepted"], 2);
     assert_eq!(json["rejected"], 1);
     assert!(json["errors"][0].as_str().unwrap().starts_with("oversize"));
+    index_pending(&state).await;
 
     // A batch-wide played_at would return both records or neither; only the 4p throne game
     // started inside this window (majsoul.start_time 1784207242 = 2026-07-16T13:07:22Z).
@@ -520,7 +560,7 @@ async fn names_an_empty_member_as_empty_rather_than_oversized() {
 async fn reads_every_gzip_stream_of_a_member() {
     let (state, data_dir) = test_state().await;
     let source = test_source(&data_dir);
-    let app = api::router(state);
+    let app = api::router(state.clone());
     let record = br#"{"type":"start_game","names":["a","b","c","d"]}
 {"type":"end_game"}"#;
     let (head, tail) = record.split_at(record.len() / 2);
@@ -538,19 +578,13 @@ async fn reads_every_gzip_stream_of_a_member() {
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let json = json_body(response).await;
     assert_eq!(json["accepted"], 1, "{json}");
+    index_pending(&state).await;
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/v1/records")
-                .header(header::AUTHORIZATION, "Bearer test-secret")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    // By source, because the whole suite shares one index and an unfiltered
+    // page is whatever another test ingested most recently.
+    let page = search_by_source(&app, &source).await;
     // Both events survived, so the second stream was not dropped.
-    assert_eq!(json_body(response).await["items"][0]["event_count"], 2);
+    assert_eq!(page["items"][0]["event_count"], 2, "{page}");
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 
@@ -577,16 +611,20 @@ async fn reads_every_gzip_stream_of_the_archive() {
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 
-/// Failing to write the pack is this server losing records, not the caller sending bad ones, so
-/// the batch must fail loudly instead of listing the loss as rejected members inside a 202.
+/// Failing to keep a record the caller handed over is this server losing it, not the caller
+/// sending bad ones, so the batch must fail loudly instead of listing the loss as rejected members
+/// inside a 202.
 #[tokio::test]
 async fn fails_the_batch_when_records_cannot_be_stored() {
-    let (state, data_dir) = test_state().await;
+    let data_dir = test_data_dir();
     let source = test_source(&data_dir);
-    let app = api::router(state);
-    // No pack directory, so appending cannot open a pack file: an I/O failure without needing a
-    // full disk.
-    std::fs::remove_dir_all(data_dir.join("packs")).unwrap();
+    // A backlog ceiling of zero refuses every record, which is the one way to make ingest refuse
+    // to keep a record without breaking a store the rest of the suite shares. What it stands in
+    // for is a full disk or a broker that will not take a produce: all three reach the batch as
+    // `ApiError::Internal`, which is the distinction under test.
+    let mut config = test_config(&data_dir, None);
+    config.kafka_max_lag = 0;
+    let app = api::router(AppState::local(config).await.unwrap());
 
     let response = app
         .oneshot(batch_request(
@@ -606,11 +644,50 @@ async fn fails_the_batch_when_records_cannot_be_stored() {
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 
+/// A batch that fails partway has already claimed idempotency keys for the
+/// members it got through, and those records never reached the topic. Unless
+/// the claims are released, the retry the operator is supposed to make is told
+/// they are duplicates and skips them: the records exist nowhere, and every
+/// response says the import succeeded.
+///
+/// The failure is forced with a record ceiling of one, because it is the only
+/// way to fail the walk *after* a member has been claimed — the backlog ceiling
+/// used above is checked before the claim, so it leaves nothing to release and
+/// would let this whole path be deleted with the suite still green.
+#[tokio::test]
+async fn releases_the_claims_of_a_batch_that_failed_partway() {
+    let data_dir = test_data_dir();
+    let source = test_source(&data_dir);
+    let archive = tar_of(&two_records());
+
+    let mut ceilinged = test_config(&data_dir, None);
+    ceilinged.max_batch_records = 1;
+    let response = api::router(AppState::local(ceilinged).await.unwrap())
+        .oneshot(batch_request(&source, "batch-partial", archive.clone()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // The same archive under the same key. The first member was claimed and
+    // dropped, so it has to come back as accepted; counted as a duplicate, it
+    // would be a record this server lost while reporting success.
+    let state = AppState::local(test_config(&data_dir, None)).await.unwrap();
+    let response = api::router(state)
+        .oneshot(batch_request(&source, "batch-partial", archive))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = json_body(response).await;
+    assert_eq!(body["accepted"], 2, "a released claim must re-ingest");
+    assert_eq!(body["duplicates"], 0);
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
 #[tokio::test]
 async fn creates_and_downloads_a_filtered_archive() {
     let (state, data_dir) = test_state().await;
     let source = test_source(&data_dir);
-    let app = api::router(state);
+    let app = api::router(state.clone());
     let raw = r#"{"type":"start_game","names":["a","b","c","d"]}"#;
     let response = app
         .clone()
@@ -618,6 +695,7 @@ async fn creates_and_downloads_a_filtered_archive() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
+    index_pending(&state).await;
 
     let response = app
         .clone()
@@ -697,19 +775,34 @@ async fn re_indexes_packs_the_index_never_saw() {
     // The bug this reproduces: pack bytes on disk with nothing pointing at
     // them, which is what every restart used to produce.
     let data_dir = test_data_dir();
-    let packs = PackStore::new(data_dir.join("packs"), 1024 * 1024).unwrap();
+    let config = test_config(&data_dir, None);
+    // Nothing here leaves the local pack directory, so the endpoint is only a
+    // constructor argument; a read that fell through to it would be the bug.
+    let objects = Arc::new(
+        Objects::new(
+            &config.s3_endpoint_url,
+            &config.s3_bucket,
+            &config.s3_region,
+            &config.s3_access_key,
+            &config.s3_secret_key,
+        )
+        .unwrap(),
+    );
+    let packs = PackStore::new(&data_dir, objects).unwrap();
     let raw = br#"{"type":"start_game","names":["a","b","c","d"],"rule":"tonpu"}"#;
+    // In the legacy directory, under a flat key, which is the only shape this scan will ever meet:
+    // it is the corpus collected before the pack worker existed, and the staging packs the worker
+    // fills are discarded rather than scanned.
+    let mut writer = packs.legacy_writer().unwrap();
     let orphans: Vec<Uuid> = (0..3)
         .map(|_| {
             let id = Uuid::new_v4();
-            packs.append(id, raw).unwrap();
+            writer.append(id, raw).unwrap();
             id
         })
         .collect();
 
-    let catalog = Catalog::connect(&test_config(&data_dir, None))
-        .await
-        .unwrap();
+    let catalog = Catalog::connect(&config).await.unwrap();
     assert_eq!(recovery::recover(&catalog, &packs).await.unwrap(), 3);
     // Every boot runs this, so a second pass must find nothing left to do.
     assert_eq!(recovery::recover(&catalog, &packs).await.unwrap(), 0);
@@ -718,7 +811,7 @@ async fn re_indexes_packs_the_index_never_saw() {
     assert_eq!(record.source, "recovered");
     assert_eq!(record.players, ["a", "b", "c", "d"]);
     assert_eq!(record.rule.as_deref(), Some("tonpu"));
-    assert_eq!(packs.read(&record.storage).unwrap(), raw);
+    assert_eq!(packs.read(&record.storage).await.unwrap(), raw);
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 
@@ -740,8 +833,8 @@ async fn a_second_boot_is_not_blocked_by_the_first_migration_lock() {
     .expect("the second boot blocked on the migration advisory lock");
     // Both are live at once, which is the replica case: neither may be holding
     // anything that stops the other from working.
-    second.unwrap().flush().await.unwrap();
-    first.flush().await.unwrap();
+    second.unwrap().indexed_counts().await.unwrap();
+    first.indexed_counts().await.unwrap();
 }
 
 /// A ClickHouse that accepts the connection and never answers fails no
@@ -784,13 +877,13 @@ async fn a_clickhouse_that_never_answers_gives_up_at_the_startup_deadline() {
     sink.abort();
 }
 
-/// Writes batch until something reads, and a read then sees its own write. A
-/// read gets there by flushing the buffer rather than merging it into the page:
-/// the merge had to reproduce ClickHouse's ordering and filtering in Rust, and
-/// twice did not. What batching is worth is asserted first — an insert on its
-/// own must not reach the index.
+/// The asynchrony the pipeline is built on, stated as a test. `202` means the
+/// record is durably in the topic and nothing more: it is not in the index, and
+/// no read can conjure it there. The worker is what puts it there, and once it
+/// has, the read answers out of ClickHouse and only ClickHouse — there is no
+/// buffer left to merge, which is what two rounds of lost records paid for.
 #[tokio::test]
-async fn a_read_flushes_the_buffer_and_sees_its_own_write() {
+async fn a_record_reaches_the_index_when_the_worker_packs_it_and_not_before() {
     let (state, data_dir) = test_state().await;
     let source = test_source(&data_dir);
     let config = test_config(&data_dir, None);
@@ -798,17 +891,40 @@ async fn a_read_flushes_the_buffer_and_sees_its_own_write() {
     let raw = r#"{"type":"start_game","names":["a","b","c","d"]}"#;
     let response = app
         .clone()
-        .oneshot(ingest_request(&source, "buffered-1", raw))
+        .oneshot(ingest_request(&source, "queued-1", raw))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let accepted = json_body(response).await;
+    assert_eq!(accepted["status"], "accepted");
+
+    let page = search_by_source(&app, &source).await;
+    assert!(
+        page["items"].as_array().unwrap().is_empty(),
+        "an unpacked record was answered as indexed"
+    );
+    assert_eq!(indexed_rows(&config, &source).await, 0);
+
+    index_pending(&state).await;
+
+    let page = search_by_source(&app, &source).await;
+    assert_eq!(
+        page["items"].as_array().unwrap().len(),
+        1,
+        "a packed record never reached the index"
+    );
+    assert_eq!(page["items"][0]["id"], accepted["id"]);
     assert_eq!(
         indexed_rows(&config, &source).await,
-        0,
-        "an insert reached the index before the batch was full"
+        1,
+        "the read answered from somewhere other than the index"
     );
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
 
+async fn search_by_source(app: &Router, source: &str) -> Value {
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri(format!("/api/v1/records?source={source}"))
@@ -819,58 +935,7 @@ async fn a_read_flushes_the_buffer_and_sees_its_own_write() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let page: Value =
-        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(
-        page["items"].as_array().unwrap().len(),
-        1,
-        "a read stopped seeing its own write"
-    );
-
-    assert_eq!(
-        indexed_rows(&config, &source).await,
-        1,
-        "the read answered from somewhere other than the index it flushed into"
-    );
-    std::fs::remove_dir_all(data_dir).unwrap();
-}
-
-/// A flush now sends a fixed batch at a time and, so that reads are not stuck
-/// behind it, releases the buffer lock across the insert. That is exactly the
-/// window in which another writer appends, so the flush may only retire the
-/// rows it actually sent. Concurrent writers are the point of the test: a
-/// single-threaded run cannot tell a correct flush from one that clears the
-/// whole buffer.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_flush_only_retires_the_rows_it_sent() {
-    let data_dir = test_data_dir();
-    let config = test_config(&data_dir, None);
-    let source = test_source(&data_dir);
-    let catalog = Arc::new(Catalog::connect(&config).await.unwrap());
-    let writers = 8u32;
-    let each = 500u32;
-    let mut handles = Vec::new();
-    for writer in 0..writers {
-        let catalog = Arc::clone(&catalog);
-        let source = source.clone();
-        handles.push(tokio::spawn(async move {
-            for index in 0..each {
-                catalog
-                    .insert(sample_record(&source, writer * each + index))
-                    .await
-                    .unwrap();
-            }
-        }));
-    }
-    for handle in handles {
-        handle.await.unwrap();
-    }
-    catalog.flush().await.unwrap();
-    assert_eq!(
-        indexed_rows(&config, &source).await,
-        u64::from(writers * each),
-        "a flush discarded rows that were appended while it was in flight"
-    );
+    json_body(response).await
 }
 
 fn sample_record(source: &str, index: u32) -> mjai_management::catalog::Record {
@@ -893,9 +958,8 @@ fn sample_record(source: &str, index: u32) -> mjai_management::catalog::Record {
     }
 }
 
-/// Distinct rows in the index for one source, straight from ClickHouse: what a
-/// test cannot ask the catalogue, because the catalogue answers from its
-/// buffer as well.
+/// Distinct rows in the index for one source, straight from ClickHouse, so that
+/// a test can tell an indexed record from one the API merely accepted.
 async fn indexed_rows(config: &Config, source: &str) -> u64 {
     #[derive(serde::Deserialize)]
     struct Rows {
@@ -922,7 +986,7 @@ async fn indexed_rows(config: &Config, source: &str) -> u64 {
 async fn pages_records_by_keyset_without_repeating_or_dropping_one() {
     let (state, data_dir) = test_state().await;
     let source = test_source(&data_dir);
-    let app = api::router(state);
+    let app = api::router(state.clone());
     let raw = r#"{"type":"start_game","names":["a","b","c","d"]}"#;
     for key in ["page-1", "page-2", "page-3"] {
         let response = app
@@ -932,6 +996,7 @@ async fn pages_records_by_keyset_without_repeating_or_dropping_one() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
+    index_pending(&state).await;
 
     let mut seen = Vec::new();
     let mut cursor: Option<String> = None;
@@ -990,7 +1055,7 @@ async fn pages_two_records_that_share_one_millisecond() {
     for micros in [400i64, 900] {
         let mut record = sample_record(&source, micros as u32);
         record.received_at = millisecond + TimeDelta::microseconds(micros);
-        catalog.insert(record).await.unwrap();
+        catalog.insert_batch(&[record]).await.unwrap();
     }
 
     let filter = RecordFilter {
@@ -1032,14 +1097,13 @@ async fn a_record_in_both_the_index_and_the_buffer_is_returned_once() {
     let millisecond = Utc::now().trunc_subsecs(3) - TimeDelta::seconds(1);
     let mut duplicated = sample_record(&source, 900);
     duplicated.received_at = millisecond + TimeDelta::microseconds(900);
-    catalog.insert(duplicated.clone()).await.unwrap();
-    catalog.flush().await.unwrap();
-    // The state that race leaves behind: the index holds the record, the buffer
-    // holds it again, and a third record is dated between the two copies.
-    catalog.insert(duplicated).await.unwrap();
+    catalog.insert_batch(&[duplicated.clone()]).await.unwrap();
+    // The state a replay leaves behind: the index holds the record, the batch
+    // arrives again unchanged, and a third record is dated between the two
+    // copies.
     let mut between = sample_record(&source, 400);
     between.received_at = millisecond + TimeDelta::microseconds(400);
-    catalog.insert(between).await.unwrap();
+    catalog.insert_batch(&[duplicated, between]).await.unwrap();
 
     let filter = RecordFilter {
         source: Some(source),
@@ -1088,11 +1152,8 @@ async fn pages_a_timestamp_tie_that_lives_in_the_index() {
         let mut record = sample_record(&source, index as u32);
         record.id = *id;
         record.received_at = millisecond;
-        catalog.insert(record).await.unwrap();
+        catalog.insert_batch(&[record]).await.unwrap();
     }
-    // The rows have to be in ClickHouse, not the buffer: the buffer never sees
-    // the SQL `ORDER BY` or the SQL cursor comparison that lost them.
-    catalog.flush().await.unwrap();
     assert_eq!(indexed_rows(&config, &source).await, 3);
 
     let filter = RecordFilter {
@@ -1136,25 +1197,18 @@ async fn a_sub_millisecond_bound_answers_the_same_before_and_after_a_flush() {
     let bound = millisecond + TimeDelta::microseconds(400);
     let mut record = sample_record(&source, 400);
     record.received_at = bound;
-    catalog.insert(record).await.unwrap();
+    catalog.insert_batch(&[record]).await.unwrap();
 
     let filter = RecordFilter {
         source: Some(source),
         received_from: Some(bound),
         ..RecordFilter::default()
     };
-    let (before, _) = catalog.search(&filter, None, 10).await.unwrap();
-    catalog.flush().await.unwrap();
-    let (after, _) = catalog.search(&filter, None, 10).await.unwrap();
+    let (page, _) = catalog.search(&filter, None, 10).await.unwrap();
     // One, not zero: the record is stored at the bottom of its millisecond, so
     // flooring an inclusive `from` bound to the same millisecond is the only
     // answer that does not drop it.
-    assert_eq!(after.len(), 1, "a floored bound dropped its own record");
-    assert_eq!(
-        before.len(),
-        after.len(),
-        "a sub-millisecond bound answered differently before and after a flush"
-    );
+    assert_eq!(page.len(), 1, "a floored bound dropped its own record");
 }
 
 /// The mirror of the `from` case, and the one that loses data: a record stored at the bottom of its
@@ -1169,28 +1223,24 @@ async fn an_exclusive_sub_millisecond_upper_bound_keeps_the_record_it_covers() {
     let millisecond = Utc::now().trunc_subsecs(3) - TimeDelta::seconds(1);
     let mut record = sample_record(&source, 401);
     record.received_at = millisecond + TimeDelta::microseconds(200);
-    catalog.insert(record).await.unwrap();
+    catalog.insert_batch(&[record]).await.unwrap();
 
     let filter = RecordFilter {
         source: Some(source.clone()),
         received_to: Some(millisecond + TimeDelta::microseconds(400)),
         ..RecordFilter::default()
     };
-    let (before, _) = catalog.search(&filter, None, 10).await.unwrap();
-    catalog.flush().await.unwrap();
-    let (after, _) = catalog.search(&filter, None, 10).await.unwrap();
+    let (covered, _) = catalog.search(&filter, None, 10).await.unwrap();
     assert_eq!(
-        after.len(),
+        covered.len(),
         1,
         "an exclusive upper bound dropped a record that arrived before it"
     );
-    assert_eq!(before.len(), after.len());
 
     // The bound still excludes: a record in the NEXT millisecond is out of range.
     let mut later = sample_record(&source, 402);
     later.received_at = millisecond + TimeDelta::milliseconds(1);
-    catalog.insert(later).await.unwrap();
-    catalog.flush().await.unwrap();
+    catalog.insert_batch(&[later]).await.unwrap();
     let (page, _) = catalog.search(&filter, None, 10).await.unwrap();
     assert_eq!(
         page.len(),
@@ -1268,6 +1318,157 @@ async fn reports_watch_uuid_and_conversion_transitions() {
     assert_eq!(json["completed"], 1);
     assert_eq!(json["items"][0]["uuid_state"], "fetched");
     assert_eq!(json["items"][0]["conversion_state"], "completed");
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+/// The console's overview. Everything but the watch block is an aggregate over
+/// the index and the job table the whole suite shares, so the exact assertions
+/// are the ones a shared store can carry — this run's own source in the
+/// breakdown, and floors on the totals it contributed to. The watch counters
+/// are a per-process registry, so those are exact.
+#[tokio::test]
+async fn reports_index_storage_download_and_watch_totals() {
+    let (state, data_dir) = test_state().await;
+    let source = test_source(&data_dir);
+    let app = api::router(state.clone());
+    let raw = r#"{"type":"start_game","names":["a","b","c","d"]}"#;
+    for key in ["stats-1", "stats-2"] {
+        let response = app
+            .clone()
+            .oneshot(ingest_request(&source, key, raw))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+    // The aggregates read the index, so an accepted record counts for nothing
+    // until the worker has packed it.
+    index_pending(&state).await;
+    state
+        .watch
+        .apply(WatchEvent {
+            uuid: "260727-abcdef01-2345-6789-abcd-ef0123456789".into(),
+            event: WatchEventKind::Live,
+            mode_id: Some(16),
+            started_at: None,
+            message: None,
+            record_id: None,
+        })
+        .unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/stats")
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let stats = json_body(response).await;
+
+    let mine = stats["records"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["source"] == source.as_str())
+        .unwrap_or_else(|| panic!("the source breakdown never mentioned {source}: {stats}"));
+    assert_eq!(mine["records"], 2);
+    assert!(stats["records"]["total"].as_u64().unwrap() >= 2, "{stats}");
+    assert!(
+        stats["records"]["last_24h"].as_u64().unwrap() >= 2,
+        "{stats}"
+    );
+    assert!(stats["storage"]["packs"].as_u64().unwrap() >= 1, "{stats}");
+    assert!(
+        stats["storage"]["raw_bytes"].as_u64().unwrap() >= 2 * raw.len() as u64,
+        "{stats}"
+    );
+    assert!(
+        stats["storage"]["compressed_bytes"].as_u64().unwrap() >= 1,
+        "{stats}"
+    );
+    assert!(stats["downloads"]["queued"].is_u64(), "{stats}");
+    assert_eq!(stats["watch"]["phase"], "stopped");
+    assert_eq!(stats["watch"]["live"], 1);
+    assert_eq!(stats["watch"]["completed"], 0);
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+/// The export page's list. The job table is shared too, so this asserts its own
+/// job is in the page and that the page is ordered newest first, not how long
+/// the page is.
+#[tokio::test]
+async fn lists_the_newest_download_jobs() {
+    let (state, data_dir) = test_state().await;
+    let source = test_source(&data_dir);
+    let app = api::router(state);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/downloads")
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"filter":{{"source":"{source}"}},"format":"manifest.jsonl"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let created = json_body(response).await;
+    let job_id = created["id"].as_str().unwrap().to_owned();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/downloads?limit=1000")
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = json_body(response).await;
+    let items = page["items"].as_array().unwrap();
+    let mine = items
+        .iter()
+        .find(|item| item["id"] == job_id.as_str())
+        .unwrap_or_else(|| panic!("the job list never mentioned {job_id}"));
+    // The same shape `GET /api/v1/downloads/{id}` answers with, because it is
+    // the same type.
+    assert!(mine["state"].is_string(), "{mine}");
+    assert!(mine["record_count"].is_u64(), "{mine}");
+    // Parsed rather than compared as strings: chrono drops a whole second's
+    // empty fraction, so two RFC 3339 timestamps do not always sort in their
+    // own order lexicographically and the check would fail once in a million
+    // runs for the wrong reason.
+    let created_at: Vec<chrono::DateTime<Utc>> = items
+        .iter()
+        .map(|item| item["created_at"].as_str().unwrap().parse().unwrap())
+        .collect();
+    let mut newest_first = created_at.clone();
+    newest_first.sort_unstable_by(|left, right| right.cmp(left));
+    assert_eq!(created_at, newest_first, "the page was not newest first");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/downloads?limit=0")
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 

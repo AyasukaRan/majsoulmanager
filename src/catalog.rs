@@ -9,7 +9,6 @@ use chrono::{DateTime, NaiveDateTime, SubsecRound, TimeDelta, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use sqlx::{Row, postgres::PgPoolOptions};
 use thiserror::Error;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
@@ -30,18 +29,6 @@ const RECORDS_TABLE: &str = "mjai.records";
 const RECORD_COLUMNS: &str = "record_id, source, sha256, received_at, played_at, players, rule, \
                               event_count, pack_key, pack_offset, compressed_size, raw_size";
 
-/// A flush turns the whole buffer into one MergeTree part, so the batch size
-/// trades insert amplification against how many packed-but-unindexed records a
-/// crash leaves behind. Both ends are safe: the pack file is written first, and
-/// the startup scan re-indexes anything the index is missing.
-const INSERT_BATCH_ROWS: usize = 1_000;
-
-/// A flush that fails leaves its rows buffered, so a ClickHouse outage under
-/// sustained ingest grows the buffer without limit. This caps it at a hundred
-/// batches — tens of megabytes — after which ingest is refused rather than the
-/// process being killed for the memory.
-const MAX_PENDING_ROWS: usize = 100 * INSERT_BATCH_ROWS;
-
 /// docs/architecture.md line 76 — a query either carries a time range or is
 /// bounded by a server-side maximum window.
 const MAX_QUERY_WINDOW_DAYS: i64 = 90;
@@ -56,6 +43,10 @@ const DOWNLOAD_JOB_RETENTION_DAYS: i32 = 7;
 
 /// Arbitrary but stable: "mjai" as ASCII.
 const MIGRATION_LOCK: i64 = 0x6D6A_6169;
+
+/// The overview names the busiest collectors, not every value that has ever
+/// appeared in an `X-Mjai-Source` header.
+const MAX_REPORTED_SOURCES: usize = 100;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Record {
@@ -153,10 +144,6 @@ pub enum CatalogError {
     Pending,
     #[error("received_at range must not exceed {0} days")]
     WindowTooWide(i64),
-    #[error(
-        "{0} records are waiting to be indexed; the packed records will be indexed at the next start"
-    )]
-    Backlogged(usize),
     #[error("record index is unavailable: {0}")]
     Index(#[from] ClickHouseError),
     #[error("idempotency store is unavailable: {0}")]
@@ -165,22 +152,17 @@ pub enum CatalogError {
 
 pub enum IdempotencyClaim {
     New,
-    Existing(Record),
+    /// The record id the first request with this key was given. Only the id,
+    /// never the indexed row: under the Kafka pipeline a duplicate routinely
+    /// arrives before the worker has indexed the first copy, and reading the
+    /// row back to prove the claim would answer `Pending` — a `409` — for every
+    /// one of them, turning an ordinary re-import into a wall of conflicts.
+    Existing(Uuid),
 }
 
 pub struct Catalog {
     index: ClickHouse,
     postgres: sqlx::PgPool,
-    /// Records packed and claimed but not yet in a ClickHouse part. `get` reads
-    /// it directly — an id match needs no ordering and no filter, so it cannot
-    /// disagree with the index — while `page` flushes it and reads only the
-    /// index. This lock is never held across a ClickHouse call: one slow insert
-    /// would otherwise block every read behind it.
-    pending: Mutex<Vec<Record>>,
-    /// Held for the whole of a flush, so two concurrent flushes cannot send and
-    /// then discard the same rows. Separate from `pending` precisely because it
-    /// is the one that spans the network call.
-    flushing: Mutex<()>,
 }
 
 impl Catalog {
@@ -193,9 +175,9 @@ impl Catalog {
         )?;
         let dsn = config.postgres_dsn.as_str();
         let postgres = wait_ready("PostgreSQL", deadline, || {
-            // PostgreSQL only sees one small statement per ingest and the pack
-            // writer serialises ingest anyway, so a wide pool would buy
-            // nothing and the test suite opens one pool per case.
+            // PostgreSQL sees one small statement per ingested record and one
+            // more per sealed pack, so a wide pool would buy nothing and the
+            // test suite opens one pool per case.
             PgPoolOptions::new()
                 .max_connections(4)
                 .acquire_timeout(Duration::from_secs(5))
@@ -262,12 +244,7 @@ impl Catalog {
         }
         migration.commit().await?;
 
-        let catalog = Self {
-            index,
-            postgres,
-            pending: Mutex::new(Vec::new()),
-            flushing: Mutex::new(()),
-        };
+        let catalog = Self { index, postgres };
         catalog.prune().await?;
         Ok(catalog)
     }
@@ -295,7 +272,8 @@ impl Catalog {
 
     /// The `INSERT ... ON CONFLICT DO NOTHING` is the whole check-and-set: two
     /// concurrent requests with the same key reach PostgreSQL, exactly one gets
-    /// a row back and packs the record, the other falls through to the lookup.
+    /// a row back and produces the record, the other falls through to the
+    /// lookup.
     pub async fn claim(
         &self,
         key: &str,
@@ -331,10 +309,7 @@ impl Catalog {
         if row.try_get::<String, _>("content_sha256")? != sha256 {
             return Err(CatalogError::Conflict);
         }
-        self.get(row.try_get("record_id")?)
-            .await?
-            .map(IdempotencyClaim::Existing)
-            .ok_or(CatalogError::Pending)
+        Ok(IdempotencyClaim::Existing(row.try_get("record_id")?))
     }
 
     pub async fn abandon_claim(&self, key: &str, id: Uuid) -> Result<(), CatalogError> {
@@ -348,74 +323,41 @@ impl Catalog {
         Ok(())
     }
 
-    pub async fn insert(&self, mut record: Record) -> Result<(), CatalogError> {
-        // Milliseconds are the resolution the index and the cursor both have:
-        // the columns are DateTime64(3) and a cursor token is epoch millis.
-        // Truncating on the way in means a record `get` answers out of the
-        // buffer carries the timestamp the index will hand back once it is
-        // flushed, so a caller reading twice either side of a flush does not see
-        // it move. Every producer of a `Record` reaches the buffer through here,
-        // so this is the only place it needs doing.
-        record.received_at = record.received_at.trunc_subsecs(3);
-        record.played_at = record.played_at.map(|at| at.trunc_subsecs(3));
-        let full = {
-            let mut pending = self.pending.lock().await;
-            if pending.len() >= MAX_PENDING_ROWS {
-                // The pack file was written before this call, so refusing here
-                // costs visibility until the next boot re-indexes the pack, not
-                // the record. Accepting without bound would trade that for an
-                // out-of-memory kill, which loses the whole buffer instead.
-                return Err(CatalogError::Backlogged(pending.len()));
-            }
-            pending.push(record);
-            pending.len() >= INSERT_BATCH_ROWS
-        };
-        if full {
-            self.flush().await?;
+    /// One sealed pack's rows, in one statement and therefore one MergeTree
+    /// part. The batch is whatever the pack worker sealed, which at the 256MB
+    /// pack target and the measured record sizes is 2,500 to 23,000 rows and a
+    /// few megabytes of JSON — well inside what one HTTP insert carries, and
+    /// the ceiling only moves if `MJAI_PACK_TARGET_BYTES` is raised by orders
+    /// of magnitude, at which point the worker would chunk this call.
+    ///
+    /// Called only after the pack is durably in the bucket, and the Kafka
+    /// offset is committed only after this returns, which is the ordering the
+    /// whole pipeline's failure story rests on: a crash here replays the batch
+    /// and the replay converges through ReplacingMergeTree.
+    pub async fn insert_batch(&self, records: &[Record]) -> Result<(), CatalogError> {
+        if records.is_empty() {
+            return Ok(());
         }
+        // Milliseconds are the resolution the index and the cursor both have:
+        // the columns are DateTime64(3) and a cursor token is epoch millis. A
+        // replay must land on the byte-identical sorting key, so truncating
+        // here rather than at the call site keeps every producer of a `Record`
+        // — the worker and the recovery scan alike — on one resolution.
+        let rows: Vec<String> = records
+            .iter()
+            .map(|record| {
+                record_json(
+                    record,
+                    record.received_at.trunc_subsecs(3),
+                    record.played_at.map(|at| at.trunc_subsecs(3)),
+                )
+            })
+            .collect();
+        self.index.insert(RECORDS_TABLE, rows.join("\n")).await?;
         Ok(())
     }
 
-    /// Drains the buffer one batch at a time. A failed batch stays buffered and
-    /// the error propagates, so the caller sees a `500` and backs off; the next
-    /// flush retries from the front and a retry that lands twice converges
-    /// through ReplacingMergeTree.
-    pub async fn flush(&self) -> Result<(), CatalogError> {
-        let _flushing = self.flushing.lock().await;
-        loop {
-            // Only ever a batch's worth is serialised, never the whole buffer:
-            // with ClickHouse down the backlog grows, and rebuilding all of it
-            // on every insert would make the work per insert grow with it.
-            let batch: Vec<String> = {
-                let pending = self.pending.lock().await;
-                pending
-                    .iter()
-                    .take(INSERT_BATCH_ROWS)
-                    .map(record_json)
-                    .collect()
-            };
-            if batch.is_empty() {
-                return Ok(());
-            }
-            let sent = batch.len();
-            self.index.insert(RECORDS_TABLE, batch.join("\n")).await?;
-            // Rows are only ever appended, and `flushing` admits one flush at a
-            // time, so the rows just sent are still the front of the buffer.
-            self.pending.lock().await.drain(..sent);
-        }
-    }
-
     pub async fn get(&self, id: Uuid) -> Result<Option<Record>, CatalogError> {
-        if let Some(record) = self
-            .pending
-            .lock()
-            .await
-            .iter()
-            .rev()
-            .find(|record| record.id == id)
-        {
-            return Ok(Some(record.clone()));
-        }
         // `record_id` is last in the sorting key, so this leans on the bloom
         // filter added for it; `ORDER BY indexed_at` picks the newest of any
         // replayed rows without paying for FINAL.
@@ -464,18 +406,19 @@ impl Catalog {
         cursor: Option<Cursor>,
         limit: usize,
     ) -> Result<(Vec<Record>, Option<Cursor>), CatalogError> {
-        // A page is ordered by `(received_at DESC, record_id DESC)`, so a
-        // timestamp tie rests the whole order on the collation of `record_id` —
-        // and ClickHouse compares a UUID as (low 64 bits, high 64 bits) while
-        // `Uuid: Ord` compares the sixteen bytes big-endian. Merging the buffer
-        // in Rust therefore needs Rust to reproduce ClickHouse's collation for
-        // every column the cursor touches, and the buffer-side filter to
-        // reproduce every `WHERE` clause built below. Two attempts at that lost
-        // records; flushing first leaves one sort, one filter and one collation,
-        // all of them ClickHouse's, with nothing to reconcile. It costs one
-        // insert round-trip on the first read after a write, and nothing at all
-        // on a read that follows one — an empty flush never leaves the process.
-        self.flush().await?;
+        // Every row this answers with comes from ClickHouse and nowhere else,
+        // and nothing may ever merge a second source into it again. A page is
+        // ordered by `(received_at DESC, record_id DESC)`, so a timestamp tie
+        // rests the whole order on the collation of `record_id` — and
+        // ClickHouse compares a UUID as (low 64 bits, high 64 bits) while
+        // `Uuid: Ord` compares the sixteen bytes big-endian. Merging an
+        // in-memory buffer in Rust therefore needed Rust to reproduce
+        // ClickHouse's collation for every column the cursor touches and its
+        // filter to reproduce every `WHERE` clause built below. Two rounds of
+        // that lost records. The buffer is gone with the inline ingest path
+        // that needed it — rows now reach the index in one batch per sealed
+        // pack — which leaves one sort, one filter and one collation, all of
+        // them ClickHouse's, with nothing to reconcile.
 
         // FINAL collapses rows a replayed insert batch duplicated;
         // ReplacingMergeTree otherwise only dedups within a merged part.
@@ -605,6 +548,14 @@ impl Catalog {
         Ok(rows.into_iter().map(|row| row.record_id).collect())
     }
 
+    /// The Kafka offset table lives in the same database, and the pack worker
+    /// commits into it on the same connection pool this already sizes and waits
+    /// for at boot. Handing out the pool keeps `src/kafka.rs` owning its own
+    /// statements rather than growing a second set of query methods here.
+    pub fn postgres(&self) -> &sqlx::PgPool {
+        &self.postgres
+    }
+
     pub async fn create_job(&self, request: &DownloadRequest) -> Result<DownloadJob, CatalogError> {
         let id = Uuid::new_v4();
         let created_at = Utc::now();
@@ -636,19 +587,40 @@ impl Catalog {
         Ok(())
     }
 
+    /// Publishes how far a running export has got. Without it `record_count`
+    /// stays at its default until the job finishes, so the console shows a job
+    /// that has been writing for hours as `导出中 / 0` — indistinguishable from
+    /// one that is wedged. One statement per page of a thousand records is
+    /// cheap enough that the alternative is only worth it if exports ever get
+    /// small enough for the count not to matter, at which point nobody is
+    /// watching the number anyway.
+    pub async fn record_job_progress(&self, id: Uuid, written: usize) -> Result<(), CatalogError> {
+        sqlx::query("UPDATE download_jobs SET record_count = $2 WHERE id = $1")
+            .bind(id)
+            .bind(written as i64)
+            .execute(&self.postgres)
+            .await?;
+        Ok(())
+    }
+
     pub async fn finish_job(
         &self,
         id: Uuid,
         outcome: Result<(usize, String), String>,
     ) -> Result<(), CatalogError> {
         let (state, count, object_key, error) = match outcome {
-            Ok((count, object_key)) => ("completed", count as i64, Some(object_key), None),
-            Err(error) => ("failed", 0, None, Some(error)),
+            Ok((count, object_key)) => ("completed", Some(count as i64), Some(object_key), None),
+            // The count is left as `record_job_progress` last published it
+            // rather than zeroed. Overwriting it here would make a job that
+            // died on its last page read exactly like one that died on its
+            // first, which is the ambiguity that publishing progress at all was
+            // meant to remove.
+            Err(error) => ("failed", None, None, Some(error)),
         };
         sqlx::query(
             "UPDATE download_jobs
-             SET state = $2, record_count = $3, result_object_key = $4, error = $5,
-                 completed_at = now()
+             SET state = $2, record_count = coalesce($3, record_count),
+                 result_object_key = $4, error = $5, completed_at = now()
              WHERE id = $1",
         )
         .bind(id)
@@ -662,37 +634,151 @@ impl Catalog {
     }
 
     pub async fn get_job(&self, id: Uuid) -> Result<Option<DownloadJob>, CatalogError> {
-        let row = sqlx::query(
-            "SELECT id, state, record_count, result_object_key, error, created_at
-             FROM download_jobs WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_optional(&self.postgres)
-        .await?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let state: String = row.try_get("state")?;
-        Ok(Some(DownloadJob {
-            id,
-            state: JobState::from_column(&state),
-            created_at: row.try_get("created_at")?,
-            record_count: row.try_get::<i64, _>("record_count")?.max(0) as usize,
-            download_url: row
-                .try_get::<Option<String>, _>("result_object_key")?
-                .map(|_| format!("/api/v1/downloads/{id}/file")),
-            error: row.try_get("error")?,
-        }))
+        let row = sqlx::query(&format!("{JOB_COLUMNS} WHERE id = $1"))
+            .bind(id)
+            .fetch_optional(&self.postgres)
+            .await?;
+        Ok(row.as_ref().map(job_from_row).transpose()?)
+    }
+
+    /// The newest jobs first. A sort with no index behind it, deliberately:
+    /// `prune` deletes everything past `DOWNLOAD_JOB_RETENTION_DAYS`, so this
+    /// orders a few days of exports rather than a history, and the partial
+    /// index the schema does carry covers only the unfinished ones. It wants a
+    /// `created_at` index the day exports become frequent enough that a week of
+    /// them stops being a small table.
+    pub async fn recent_jobs(&self, limit: usize) -> Result<Vec<DownloadJob>, CatalogError> {
+        let rows = sqlx::query(&format!("{JOB_COLUMNS} ORDER BY created_at DESC LIMIT $1"))
+            .bind(limit as i64)
+            .fetch_all(&self.postgres)
+            .await?;
+        Ok(rows.iter().map(job_from_row).collect::<Result<_, _>>()?)
+    }
+
+    /// Grouped rather than counted four times, over the same few days of rows
+    /// `recent_jobs` orders; a state with no jobs is simply absent from the
+    /// answer and keeps its zero.
+    pub async fn download_counts(&self) -> Result<DownloadCounts, CatalogError> {
+        let rows = sqlx::query("SELECT state, count(*) AS jobs FROM download_jobs GROUP BY state")
+            .fetch_all(&self.postgres)
+            .await?;
+        let mut counts = DownloadCounts::default();
+        for row in rows {
+            let jobs = row.try_get::<i64, _>("jobs")?.max(0) as u64;
+            match JobState::from_column(&row.try_get::<String, _>("state")?) {
+                JobState::Queued => counts.queued = jobs,
+                JobState::Running => counts.running = jobs,
+                JobState::Completed => counts.completed = jobs,
+                JobState::Failed => counts.failed = jobs,
+            }
+        }
+        Ok(counts)
+    }
+
+    /// The console's overview, polled. Three statements rather than one because
+    /// they cost wildly different amounts and folding them together would drag
+    /// the cheap ones up to the price of the dear one; issued together because
+    /// they are independent and the poll waits for all three anyway.
+    ///
+    /// None of them uses FINAL, and none of them counts distinct record ids. A
+    /// replayed insert batch leaves a second row for a record until the parts
+    /// merge, so every count here can read a few rows high inside that window.
+    /// That is the trade: `uniqExact(record_id)` would be exact and would build
+    /// a hash set of every id in a table sized for hundreds of millions of
+    /// them, on every poll, which is not a price an overview may charge.
+    pub async fn stats(&self) -> Result<IndexStats, CatalogError> {
+        #[derive(Default, Deserialize)]
+        struct Totals {
+            total: u64,
+            packs: u64,
+            raw_bytes: u64,
+            compressed_bytes: u64,
+        }
+        #[derive(Default, Deserialize)]
+        struct Recent {
+            last_24h: u64,
+        }
+        // The dear one. `count()` on its own would be answered out of part
+        // metadata without reading a column at all, but the two sums read eight
+        // bytes per row whatever else the statement does, so the count rides
+        // along free; `uniqExact(pack_key)` accumulates one entry per 256MB
+        // pack rather than one per record, which is what makes it affordable
+        // here where `uniqExact(record_id)` is not. This is the statement to
+        // replace with an AggregatingMergeTree rollup maintained on insert if
+        // the overview ever becomes the slowest thing the console does.
+        let totals_sql = format!(
+            "SELECT count() AS total, uniqExact(pack_key) AS packs, \
+             sum(raw_size) AS raw_bytes, sum(compressed_size) AS compressed_bytes \
+             FROM {RECORDS_TABLE}"
+        );
+        // Cheap: `toYYYYMM(received_at)` is the partition key and
+        // `toDate(received_at)` leads the sorting key, so a lower bound on
+        // `received_at` reaches both and the scan is one day of granules.
+        let recent_sql = format!(
+            "SELECT count() AS last_24h FROM {RECORDS_TABLE} \
+             WHERE received_at >= now() - toIntervalDay(1)"
+        );
+        // `source` is LowCardinality, so grouping by it reads a dictionary-coded
+        // column that compresses to a rounding error beside the table. Capped
+        // because the value arrives in a collector's header: nothing stops an
+        // authenticated collector from inventing a source per request, and an
+        // overview answering with an unbounded array is the wrong place to find
+        // that out.
+        let sources_sql = format!(
+            "SELECT source, count() AS records FROM {RECORDS_TABLE} \
+             GROUP BY source ORDER BY records DESC LIMIT {MAX_REPORTED_SOURCES}"
+        );
+        let (totals, recent, sources) = tokio::try_join!(
+            self.index.query::<Totals>(&totals_sql, &[]),
+            self.index.query::<Recent>(&recent_sql, &[]),
+            self.index.query::<SourceCount>(&sources_sql, &[]),
+        )?;
+        let totals = totals.into_iter().next().unwrap_or_default();
+        Ok(IndexStats {
+            records: RecordStats {
+                total: totals.total,
+                last_24h: recent.into_iter().next().unwrap_or_default().last_24h,
+                sources,
+            },
+            storage: StorageStats {
+                packs: totals.packs,
+                raw_bytes: totals.raw_bytes,
+                compressed_bytes: totals.compressed_bytes,
+            },
+        })
     }
 }
 
-fn record_json(record: &Record) -> String {
+/// Every column a `DownloadJob` is built from, in the one place both readers of
+/// the table select them.
+const JOB_COLUMNS: &str = "SELECT id, state, record_count, result_object_key, error, created_at \
+                           FROM download_jobs";
+
+fn job_from_row(row: &sqlx::postgres::PgRow) -> Result<DownloadJob, sqlx::Error> {
+    let id: Uuid = row.try_get("id")?;
+    Ok(DownloadJob {
+        id,
+        state: JobState::from_column(&row.try_get::<String, _>("state")?),
+        created_at: row.try_get("created_at")?,
+        record_count: row.try_get::<i64, _>("record_count")?.max(0) as usize,
+        download_url: row
+            .try_get::<Option<String>, _>("result_object_key")?
+            .map(|_| format!("/api/v1/downloads/{id}/file")),
+        error: row.try_get("error")?,
+    })
+}
+
+fn record_json(
+    record: &Record,
+    received_at: DateTime<Utc>,
+    played_at: Option<DateTime<Utc>>,
+) -> String {
     serde_json::json!({
         "record_id": record.id,
         "source": record.source,
         "sha256": record.sha256,
-        "received_at": clickhouse_timestamp(record.received_at),
-        "played_at": record.played_at.map(clickhouse_timestamp),
+        "received_at": clickhouse_timestamp(received_at),
+        "played_at": played_at.map(clickhouse_timestamp),
         "players": record.players,
         // LowCardinality(String) is not nullable; no mjai `start_game.rule` is
         // an empty string, so "" round-trips back to None.
@@ -860,6 +946,46 @@ impl JobState {
             _ => Self::Queued,
         }
     }
+}
+
+/// What the console's overview asks the index for. `records.total` is a row
+/// count, not a distinct record count, and `storage` is what the index says the
+/// packs hold rather than what the bucket bills for; both are documented on
+/// `Catalog::stats`, which is where the reasons are.
+#[derive(Clone, Debug, Serialize)]
+pub struct IndexStats {
+    pub records: RecordStats,
+    pub storage: StorageStats,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RecordStats {
+    pub total: u64,
+    pub last_24h: u64,
+    /// The busiest `MAX_REPORTED_SOURCES`, so this does not have to sum to
+    /// `total`.
+    pub sources: Vec<SourceCount>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SourceCount {
+    pub source: String,
+    pub records: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct StorageStats {
+    pub packs: u64,
+    pub raw_bytes: u64,
+    pub compressed_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct DownloadCounts {
+    pub queued: u64,
+    pub running: u64,
+    pub completed: u64,
+    pub failed: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]

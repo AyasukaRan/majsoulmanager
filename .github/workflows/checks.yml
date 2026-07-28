@@ -12,45 +12,29 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
-    # tests/api.rs drives the real record index and idempotency store; without
-    # these the SQL would only ever be checked by hand.
-    services:
-      postgres:
-        image: postgres:17-alpine
-        env:
-          POSTGRES_USER: mjai
-          POSTGRES_PASSWORD: mjai
-          POSTGRES_DB: mjai
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U mjai"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 20
-
-      clickhouse:
-        image: clickhouse/clickhouse-server:25.3-alpine
-        env:
-          CLICKHOUSE_USER: mjai
-          CLICKHOUSE_PASSWORD: mjai
-        ports:
-          - 8123:8123
-        options: >-
-          --health-cmd "wget --spider -q http://127.0.0.1:8123/ping"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 20
-
+    # No `services:` block. tests/api.rs needs four containers now, and three of
+    # them — the schema mounts, the Redpanda command line, the bucket sidecar —
+    # are already described in the repository's own Compose files. A service
+    # container block would be a second copy of image tags, ports, credentials
+    # and flags that nobody updates when Compose changes, so CI starts the same
+    # stack a developer starts, through the same Makefile target.
     env:
       MJAI_POSTGRES_DSN: postgres://mjai:mjai@127.0.0.1:5432/mjai
       MJAI_CLICKHOUSE_URL: http://127.0.0.1:8123
       MJAI_CLICKHOUSE_USER: mjai
       MJAI_CLICKHOUSE_PASSWORD: mjai
+      MJAI_KAFKA_BOOTSTRAP_SERVERS: 127.0.0.1:9092
+      MJAI_S3_ENDPOINT_URL: http://127.0.0.1:9000
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+
+      # The target waits for every health check and for the bucket, so nothing
+      # here has to poll: a half-started broker or a missing bucket fails this
+      # step rather than one arbitrary test.
+      - name: Start the test infrastructure
+        run: make test-infra
 
       - name: Install Rust 1.95
         run: |
@@ -58,7 +42,7 @@ jobs:
           rustup default 1.95.0
 
       - name: Cache Cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -87,10 +71,10 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22.13.0
           cache: npm
