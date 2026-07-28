@@ -34,7 +34,32 @@ const PROGRESS_EVERY: usize = 20_000;
 struct Progress {
     scanned: usize,
     rewritten: usize,
-    skipped: usize,
+    /// Rows whose bytes could not be read. Counted apart from `unparsable`
+    /// because only this one is usually about the object store rather than
+    /// about the record.
+    unreadable: usize,
+    unparsable: usize,
+}
+
+impl Progress {
+    /// Whether this pass earned the right to write the one-shot marker.
+    ///
+    /// A row whose bytes could not be read was never examined, and the reason is
+    /// far more often an object store that is unreachable or misconfigured than
+    /// a record that is gone — a state that ends. Marking the pass done from
+    /// inside one of those boots would spend the marker on a pass that rewrote
+    /// nothing, leave the corpus stale permanently, and leave one info line as
+    /// the only trace. A row that could not be *parsed* is the opposite: those
+    /// bytes will not parse on the next boot either, so waiting for them would
+    /// mean never finishing.
+    ///
+    /// Being strict costs a full re-scan on every boot for as long as a pack is
+    /// genuinely unreadable, and that is the intended pressure: an indexed row
+    /// pointing at bytes nobody can fetch is an incident, not a rounding error.
+    /// The message that reports this names the one statement that accepts it.
+    fn is_complete(&self) -> bool {
+        self.unreadable == 0
+    }
 }
 
 /// The row to write back for one already-indexed record, or `None` when the
@@ -116,6 +141,24 @@ pub async fn rewrite_record_metadata(state: AppState) {
             return;
         }
     };
+    // A pass that read nothing is not a pass that finished. `scan` deliberately
+    // never fails on a row it could not read, so a boot with the object store
+    // unreachable walks the whole index, rewrites nothing, and returns `Ok` —
+    // and writing the marker there would end the rewrite for good on the one
+    // boot where it did no work.
+    if !progress.is_complete() {
+        report(
+            &state,
+            WatchLogLevel::Error,
+            format!(
+                "索引元数据改写未完成：{} 条记录读不到字节（共扫描 {} 条，改写 {} 条，解析失败 {} 条）。\
+                 下次启动会重跑；若确认这些 pack 已永久丢失，执行 \
+                 INSERT INTO completed_backfills (name) VALUES ('{NAME}') 可以结束重跑",
+                progress.unreadable, progress.scanned, progress.rewritten, progress.unparsable
+            ),
+        );
+        return;
+    }
     // The marker is written only here, so a pass that died partway runs again
     // from the beginning on the next boot. That is why the pass has to be
     // idempotent rather than resumable: a row it already rewrote derives the
@@ -133,8 +176,8 @@ pub async fn rewrite_record_metadata(state: AppState) {
         &state,
         WatchLogLevel::Info,
         format!(
-            "索引元数据改写完成：共扫描 {} 条，改写 {} 条，跳过 {} 条",
-            progress.scanned, progress.rewritten, progress.skipped
+            "索引元数据改写完成：共扫描 {} 条，改写 {} 条，解析失败跳过 {} 条",
+            progress.scanned, progress.rewritten, progress.unparsable
         ),
     );
 }
@@ -173,7 +216,7 @@ async fn scan(state: &AppState) -> anyhow::Result<Progress> {
                     // unreachable pack is thousands of lines, and the buffer
                     // holds 500 of them.
                     tracing::warn!(record = %row.id, %error, "跳过一条读不到字节的记录");
-                    progress.skipped += 1;
+                    progress.unreadable += 1;
                     continue;
                 }
             };
@@ -181,7 +224,7 @@ async fn scan(state: &AppState) -> anyhow::Result<Progress> {
                 Ok(metadata) => metadata,
                 Err(error) => {
                     tracing::warn!(record = %row.id, %error, "跳过一条解析不了的记录");
-                    progress.skipped += 1;
+                    progress.unparsable += 1;
                     continue;
                 }
             };
@@ -201,8 +244,8 @@ async fn scan(state: &AppState) -> anyhow::Result<Progress> {
                 state,
                 WatchLogLevel::Info,
                 format!(
-                    "索引元数据改写中：已扫描 {} 条，改写 {} 条，跳过 {} 条",
-                    progress.scanned, progress.rewritten, progress.skipped
+                    "索引元数据改写中：已扫描 {} 条，改写 {} 条，读不到 {} 条，解析失败 {} 条",
+                    progress.scanned, progress.rewritten, progress.unreadable, progress.unparsable
                 ),
             );
         }
@@ -349,6 +392,46 @@ mod tests {
             .expect("the real start time still had to be written");
         assert_eq!(rewritten.rule.as_deref(), Some("tonpu"));
         assert_eq!(rewritten.played_at, Some(at(START)));
+    }
+
+    /// The marker is one-shot, so the pass gets exactly one chance to spend it.
+    /// A boot with the object store unreachable walks every row, fails every
+    /// read, rewrites nothing and still returns `Ok` — spending the marker there
+    /// would leave the corpus stale for good with an info line as the only
+    /// trace. An unparsable record is the opposite: waiting for bytes that will
+    /// never parse means never finishing at all.
+    #[test]
+    fn only_a_pass_that_could_read_its_records_may_be_marked_done() {
+        assert!(Progress::default().is_complete(), "an empty index is done");
+        assert!(
+            Progress {
+                scanned: 641_475,
+                rewritten: 641_400,
+                unparsable: 75,
+                unreadable: 0,
+            }
+            .is_complete()
+        );
+        assert!(
+            !Progress {
+                scanned: 641_475,
+                rewritten: 0,
+                unparsable: 0,
+                unreadable: 641_475,
+            }
+            .is_complete(),
+            "an object store outage must not consume the one-shot marker"
+        );
+        assert!(
+            !Progress {
+                scanned: 641_475,
+                rewritten: 641_474,
+                unparsable: 0,
+                unreadable: 1,
+            }
+            .is_complete(),
+            "a single unreadable pack is an incident, not a rounding error"
+        );
     }
 
     /// `majsoul.start_time` 1784211956 of the anonymised 3p fixture.
