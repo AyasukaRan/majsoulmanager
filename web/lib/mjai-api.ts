@@ -23,10 +23,11 @@ export type RecordPage = {
   next_cursor: string | null;
 };
 
-/** The six fields an export job stores as its snapshot; timestamps are RFC 3339. */
+/** The seven fields an export job stores as its snapshot; timestamps are RFC 3339. */
 export type RecordFilter = {
   source?: string;
   player?: string;
+  rule?: string;
   received_from?: string;
   received_to?: string;
   played_from?: string;

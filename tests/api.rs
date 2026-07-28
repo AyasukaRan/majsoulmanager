@@ -1249,6 +1249,48 @@ async fn an_exclusive_sub_millisecond_upper_bound_keeps_the_record_it_covers() {
     );
 }
 
+/// docs/architecture.md lists `rule` among the filter fields, and choosing a
+/// composite token for it is only worth anything if a page can be narrowed to
+/// one. Three records under this test's own source, of which exactly one is the
+/// mode being asked for; the source is part of every filter here because the
+/// index is shared and durable, so a page filtered on the rule alone would also
+/// answer with whatever every other run has left behind.
+#[tokio::test]
+async fn filters_a_page_down_to_one_rule() {
+    let data_dir = test_data_dir();
+    let config = test_config(&data_dir, None);
+    let source = test_source(&data_dir);
+    let catalog = Catalog::connect(&config).await.unwrap();
+    for (index, rule) in [Some("3p-jade-south"), Some("4p-throne-east"), None]
+        .into_iter()
+        .enumerate()
+    {
+        let mut record = sample_record(&source, index as u32);
+        record.rule = rule.map(str::to_owned);
+        catalog.insert_batch(&[record]).await.unwrap();
+    }
+
+    let filter = RecordFilter {
+        source: Some(source.clone()),
+        rule: Some("3p-jade-south".into()),
+        ..RecordFilter::default()
+    };
+    let (page, _) = catalog.search(&filter, None, 10).await.unwrap();
+    assert_eq!(page.len(), 1, "the rule filter did not narrow the page");
+    assert_eq!(page[0].rule.as_deref(), Some("3p-jade-south"));
+
+    // The console picks the value from a fixed list, but the API takes it from a
+    // query string, so the statement has to survive a quote. An interpolated
+    // rule would end the string literal here and either fail the query or match
+    // every row this source has.
+    let injected = RecordFilter {
+        rule: Some("' OR 1 = 1 --".into()),
+        ..filter
+    };
+    let (page, _) = catalog.search(&injected, None, 10).await.unwrap();
+    assert!(page.is_empty(), "a quoted rule changed the statement");
+}
+
 #[tokio::test]
 async fn rejects_a_reused_idempotency_key_with_different_content() {
     let (state, data_dir) = test_state().await;

@@ -9,7 +9,7 @@ import {
   type MjaiRecord,
   type RecordPage,
 } from "@/lib/mjai-api";
-import { dayEnd, dayStart, formatDateTime } from "@/lib/utils";
+import { dayEnd, dayStart, formatDateTime, selectClass } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -31,9 +31,33 @@ import {
 
 const PAGE_SIZE = 50;
 
+/**
+ * The rule the indexer derives is `{players}p-{room}-{game_length}`, a filter
+ * token rather than something to read, so the table and the dropdown both spell
+ * it out here in the wording the watch panel already uses beside a mode id.
+ * Twelve values is the whole domain, which is why the filter is a dropdown; a
+ * value outside it still renders as itself, because a rule the console does not
+ * recognise is exactly the one worth seeing.
+ */
+const RULE_LABELS: Record<string, string> = {
+  "4p-gold-east": "金之间·东风",
+  "4p-gold-south": "金之间·东南",
+  "4p-jade-east": "玉之间·东风",
+  "4p-jade-south": "玉之间·东南",
+  "4p-throne-east": "王座之间·东风",
+  "4p-throne-south": "王座之间·东南",
+  "3p-gold-east": "三麻金·东风",
+  "3p-gold-south": "三麻金·东南",
+  "3p-jade-east": "三麻玉·东风",
+  "3p-jade-south": "三麻玉·东南",
+  "3p-throne-east": "三麻王座·东风",
+  "3p-throne-south": "三麻王座·东南",
+};
+
 type Filters = {
   source: string;
   player: string;
+  rule: string;
   received_from: string;
   received_to: string;
 };
@@ -41,6 +65,7 @@ type Filters = {
 const EMPTY_FILTERS: Filters = {
   source: "",
   player: "",
+  rule: "",
   received_from: "",
   received_to: "",
 };
@@ -54,6 +79,7 @@ function searchUrl(filters: Filters, cursor: string | null) {
   return buildRecordSearch({
     source: filters.source.trim(),
     player: filters.player.trim(),
+    rule: filters.rule,
     received_from: dayStart(filters.received_from),
     received_to: dayEnd(filters.received_to),
     limit: PAGE_SIZE,
@@ -120,11 +146,11 @@ export function RecordIndex() {
       <CardHeader className="border-b">
         <CardTitle>索引记录</CardTitle>
         <CardDescription>
-          按来源、玩家和入库时间筛选；未指定时间时后端只返回最近 90
+          按来源、玩家、规则和入库时间筛选；未指定时间时后端只返回最近 90
           天，跨度超过 90 天会被拒绝。
         </CardDescription>
         <form
-          className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-5"
+          className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-6"
           onSubmit={(event) => {
             event.preventDefault();
             void load(filters);
@@ -149,6 +175,23 @@ export function RecordIndex() {
                 setFilters({ ...filters, player: event.target.value })
               }
             />
+          </label>
+          <label className="space-y-1.5 text-xs font-medium">
+            规则
+            <select
+              className={selectClass}
+              value={filters.rule}
+              onChange={(event) =>
+                setFilters({ ...filters, rule: event.target.value })
+              }
+            >
+              <option value="">全部</option>
+              {Object.entries(RULE_LABELS).map(([rule, label]) => (
+                <option key={rule} value={rule}>
+                  {label}
+                </option>
+              ))}
+            </select>
           </label>
           <label className="space-y-1.5 text-xs font-medium">
             入库起始
@@ -225,7 +268,7 @@ export function RecordIndex() {
                     {record.players.join(" / ")}
                   </TableCell>
                   <TableCell className="whitespace-nowrap text-xs">
-                    {record.rule ?? "—"}
+                    {record.rule ? (RULE_LABELS[record.rule] ?? record.rule) : "—"}
                   </TableCell>
                   <TableCell className="text-right font-mono text-xs">
                     {record.event_count.toLocaleString("zh-CN")}
