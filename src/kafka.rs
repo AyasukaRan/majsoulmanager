@@ -213,12 +213,28 @@ impl IngestMessage {
     }
 }
 
-/// One `PartitionClient` per partition, each holding its own TCP connection to
+/// Two `PartitionClient`s per partition, each holding its own TCP connection to
 /// the leader — rskafka pools nothing — so these are built once at boot and
 /// shared, never per message.
+///
+/// Two rather than one because a broker mutes a connection while a request is
+/// in flight on it and does not read the next one until it has answered. The
+/// pack worker keeps a fetch parked on its connection for up to
+/// `FETCH_MAX_WAIT_MS`, so a producer sharing that connection has its produce
+/// sit unread in the socket for the whole poll — including, absurdly, when the
+/// produce carries exactly the records that would have satisfied the fetch. The
+/// two ends then pace each other: measured on the historical import, a produce
+/// of twelve records took 405ms while the broker reported handling it in 0.3ms,
+/// and ingest was pinned at 30 records a second with every downstream component
+/// idle. Splitting the clients costs one socket per partition and takes the
+/// produce path out from behind the poll entirely.
 pub struct Kafka {
     topic: String,
-    partitions: Vec<Arc<PartitionClient>>,
+    producers: Vec<Arc<PartitionClient>>,
+    /// Used by the pack workers, and by `sample_lag` — its `get_offset` is a
+    /// request like any other, and putting it on the producer's connection
+    /// would reintroduce a smaller version of what the split is for.
+    consumers: Vec<Arc<PartitionClient>>,
     /// The backlog per partition as of the last sample. See `lag`.
     lag: Vec<AtomicI64>,
     max_lag: i64,
@@ -290,27 +306,35 @@ impl Kafka {
             Err(error) => return Err(error),
         }
 
-        let mut partitions = Vec::with_capacity(config.kafka_partitions as usize);
+        let mut producers = Vec::with_capacity(config.kafka_partitions as usize);
+        let mut consumers = Vec::with_capacity(config.kafka_partitions as usize);
         for partition in 0..config.kafka_partitions {
-            // `Error` rather than `Retry`: the topic was just ensured, so a
-            // partition that is still unknown means the configuration and the
-            // cluster disagree, and retrying that only hides it.
-            partitions.push(Arc::new(
-                bounded(
-                    CONTROL_TIMEOUT,
-                    client.partition_client(
-                        config.kafka_topic.clone(),
-                        partition,
-                        UnknownTopicHandling::Error,
-                    ),
-                )
-                .await?,
-            ));
+            // Twice per partition, and the two must stay separate objects: one
+            // `PartitionClient` is one connection, so cloning the handle here
+            // instead would put both ends back on one socket. See the note on
+            // `Kafka`.
+            for clients in [&mut producers, &mut consumers] {
+                // `Error` rather than `Retry`: the topic was just ensured, so a
+                // partition that is still unknown means the configuration and
+                // the cluster disagree, and retrying that only hides it.
+                clients.push(Arc::new(
+                    bounded(
+                        CONTROL_TIMEOUT,
+                        client.partition_client(
+                            config.kafka_topic.clone(),
+                            partition,
+                            UnknownTopicHandling::Error,
+                        ),
+                    )
+                    .await?,
+                ));
+            }
         }
         Ok(Self {
             topic: config.kafka_topic.clone(),
-            lag: (0..partitions.len()).map(|_| AtomicI64::new(0)).collect(),
-            partitions,
+            lag: (0..producers.len()).map(|_| AtomicI64::new(0)).collect(),
+            producers,
+            consumers,
             max_lag: config.kafka_max_lag,
         })
     }
@@ -327,7 +351,7 @@ impl Kafka {
     }
 
     pub fn partition_count(&self) -> i32 {
-        self.partitions.len() as i32
+        self.producers.len() as i32
     }
 
     /// Nothing else produces to this topic, so this is not Kafka's murmur2
@@ -335,7 +359,7 @@ impl Kafka {
     /// is that a given record id always lands in the same partition, so that a
     /// replay of the same record stays in the same offset stream.
     fn partition_for(&self, record_id: Uuid) -> usize {
-        (record_id.as_u128() % self.partitions.len() as u128) as usize
+        (record_id.as_u128() % self.producers.len() as u128) as usize
     }
 
     /// Produces one record and returns once the broker has acknowledged it,
@@ -354,7 +378,7 @@ impl Kafka {
     /// and let the idempotency claims sort out the retry rather than assume
     /// nothing landed.
     pub async fn produce_batch(&self, messages: Vec<IngestMessage>) -> Result<(), KafkaError> {
-        let mut routed: Vec<Vec<Record>> = vec![Vec::new(); self.partitions.len()];
+        let mut routed: Vec<Vec<Record>> = vec![Vec::new(); self.producers.len()];
         for message in messages {
             routed[self.partition_for(message.record_id)].push(message.into_record());
         }
@@ -362,7 +386,7 @@ impl Kafka {
             for chunk in produce_chunks(records) {
                 bounded(
                     PRODUCE_TIMEOUT,
-                    self.partitions[partition].produce(chunk, Compression::Zstd),
+                    self.producers[partition].produce(chunk, Compression::Zstd),
                 )
                 .await?;
             }
@@ -373,7 +397,7 @@ impl Kafka {
     pub fn consumer(&self, partition: i32) -> Option<PartitionConsumer> {
         let index = usize::try_from(partition).ok()?;
         Some(PartitionConsumer {
-            client: Arc::clone(self.partitions.get(index)?),
+            client: Arc::clone(self.consumers.get(index)?),
             partition,
         })
     }
@@ -397,7 +421,7 @@ impl Kafka {
     /// refused. It is never overestimated into refusing work that a healthy
     /// worker is keeping up with, which is the direction that would matter.
     pub async fn sample_lag(&self, pool: &PgPool) -> Result<i64, KafkaError> {
-        for (index, client) in self.partitions.iter().enumerate() {
+        for (index, client) in self.consumers.iter().enumerate() {
             let partition = index as i32;
             let high_watermark =
                 bounded(CONTROL_TIMEOUT, client.get_offset(OffsetAt::Latest)).await?;

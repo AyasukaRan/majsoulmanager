@@ -18,6 +18,7 @@ use mjai_management::{AppState, api, config::Config, recovery};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -229,6 +230,65 @@ async fn ingests_and_reads_one_record_without_reading_a_whole_pack() {
     assert_eq!(duplicate_json["duplicate"], true);
 
     std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+/// A broker mutes a connection while a request is in flight on it and does not
+/// read the next one until it has answered. The pack worker keeps a fetch parked
+/// on its connection for up to a second waiting for a record, so a producer
+/// sharing that connection has its produce sit unread in the socket for the
+/// whole poll — including when the produce carries exactly the record that would
+/// have satisfied the fetch. Measured on the historical import, that paced
+/// ingest at 30 records a second with the broker answering each produce in
+/// 0.3ms, the API on 0.6 of 16 cores and the pack worker caught up.
+///
+/// So the producer and the consumer must not share a `PartitionClient`: one of
+/// those is one connection. Collapsing the two back into one — which reads like
+/// an obvious simplification — costs an order of magnitude and nothing fails.
+///
+/// Its own topic, because the suite's shared one has other tests producing to
+/// it, and any one of their records would end the parked fetch early and let
+/// this pass whatever the connections are doing.
+#[tokio::test]
+async fn a_produce_does_not_queue_behind_the_pack_workers_long_poll() {
+    let data_dir = test_data_dir();
+    let mut config = test_config(&data_dir, None);
+    config.kafka_topic = format!("mjai.produce-behind-poll.{}", Uuid::new_v4());
+    let kafka = mjai_management::kafka::Kafka::connect(&config)
+        .await
+        .unwrap();
+
+    // Offset 0 of an empty log is the end of the log, so nothing satisfies this
+    // and it stays in flight for the full `FETCH_MAX_WAIT_MS`.
+    let consumer = kafka.consumer(0).unwrap();
+    let parked = tokio::spawn(async move { consumer.fetch(0).await });
+    // Long enough for the fetch to be on the wire, short against the poll it is
+    // parked in.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let started = Instant::now();
+    kafka
+        .produce(mjai_management::kafka::IngestMessage::new(
+            Uuid::new_v4(),
+            "produce-behind-poll",
+            None,
+            br#"{"type":"start_game","names":["a","b","c","d"]}"#.to_vec(),
+        ))
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    // The record makes the fetch satisfiable, so this returns rather than
+    // running out the poll — and a failure to await it would leave the task
+    // holding a connection past the end of the test.
+    parked.await.unwrap().unwrap();
+
+    // Half the poll: a produce on its own connection takes single-digit
+    // milliseconds, and one queued behind the poll cannot come back before the
+    // remaining ~900ms of it have elapsed. Nothing lands between those.
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "the produce waited {elapsed:?}, which is the length of the pack worker's \
+         long poll rather than the length of a produce: the two are sharing a connection"
+    );
 }
 
 #[tokio::test]
