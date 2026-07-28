@@ -9,6 +9,10 @@ pub struct Metadata {
     pub event_count: u32,
     /// From `majsoul.start_time`; absent for mjai logs that carry no majsoul header.
     pub played_at: Option<DateTime<Utc>>,
+    /// From `majsoul.uuid`: the game's own identity, which is what ingest
+    /// deduplicates on whatever source presented the record. Absent for mjai
+    /// logs that carry no majsoul header.
+    pub majsoul_uuid: Option<String>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -94,11 +98,27 @@ pub fn parse_metadata(payload: &[u8]) -> Result<Metadata, ParseError> {
         .and_then(Value::as_i64)
         .and_then(|seconds| DateTime::from_timestamp(seconds, 0));
 
+    // Dropped rather than truncated when it is too long, which is the opposite
+    // of what the names above do, because this one decides what counts as the
+    // same game: two distinct uuids cut to a shared prefix would be one
+    // idempotency key, and the second game to arrive would be answered as a
+    // duplicate of the first and never stored. Falling back to the caller's own
+    // key costs at worst a record that is not deduplicated globally. An empty
+    // string is refused for the same reason — it would collapse every record
+    // carrying one onto a single claim. A real uuid is 43 characters.
+    let majsoul_uuid = majsoul
+        .and_then(|majsoul| majsoul.get("uuid"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|uuid| !uuid.is_empty() && uuid.len() <= 128)
+        .map(str::to_owned);
+
     Ok(Metadata {
         players,
         rule,
         event_count: events.len().try_into().unwrap_or(u32::MAX),
         played_at,
+        majsoul_uuid,
     })
 }
 
@@ -167,6 +187,37 @@ mod tests {
     fn an_explicit_rule_beats_the_majsoul_header() {
         let raw = br#"{"majsoul":{"room":"jade","game_length":"south","players":3},"names":["p0","p1","p2"],"rule":"tonpu","type":"start_game"}"#;
         assert_eq!(parse_metadata(raw).unwrap().rule.as_deref(), Some("tonpu"));
+    }
+
+    /// The uuid is what two ingests of one game are collapsed onto, so a value
+    /// that could make two games share one — or every game share one — has to
+    /// be refused outright rather than repaired into something plausible.
+    #[test]
+    fn reads_the_game_uuid_and_refuses_one_that_could_collide() {
+        let with = br#"{"majsoul":{"uuid":"260716-00000000-0000-4000-8000-000000000004"},"names":["a","b","c","d"],"type":"start_game"}"#;
+        assert_eq!(
+            parse_metadata(with).unwrap().majsoul_uuid.as_deref(),
+            Some("260716-00000000-0000-4000-8000-000000000004")
+        );
+
+        let without = br#"{"type":"start_game","names":["a","b","c","d"],"rule":"tonpu"}"#;
+        assert_eq!(parse_metadata(without).unwrap().majsoul_uuid, None);
+
+        let empty = br#"{"majsoul":{"uuid":"   "},"names":["a"],"type":"start_game"}"#;
+        assert_eq!(parse_metadata(empty).unwrap().majsoul_uuid, None);
+
+        let overlong = format!(
+            r#"{{"majsoul":{{"uuid":"{}"}},"names":["a"],"type":"start_game"}}"#,
+            "u".repeat(129)
+        );
+        assert_eq!(
+            parse_metadata(overlong.as_bytes()).unwrap().majsoul_uuid,
+            None,
+            "an oversized uuid must not be cut down to a prefix another game could share"
+        );
+
+        let wrong_type = br#"{"majsoul":{"uuid":12345},"names":["a"],"type":"start_game"}"#;
+        assert_eq!(parse_metadata(wrong_type).unwrap().majsoul_uuid, None);
     }
 
     #[test]

@@ -328,6 +328,7 @@ mod tests {
             rule: rule.map(str::to_owned),
             event_count: 300,
             played_at: played_at.map(at),
+            majsoul_uuid: None,
         }
     }
 

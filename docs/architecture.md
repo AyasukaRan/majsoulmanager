@@ -63,7 +63,11 @@ ClickHouse 的 `pack_offset` 指向 Zstandard frame 起点，而不是 entry hea
 - 批次响应区分三种结局：有记录被接收就是 `202`（坏 member 记在 `errors` 里）；一条都没被接收且存在被拒 member 时是 `422`，避免整批格式不对的导入连着几小时都返回成功；记录写不进 Kafka、或积压超过 `MJAI_KAFKA_MAX_LAG` 时是服务端留不住这条记录而不是 member 有问题，整批以 `5xx` 结束。
 - API 只在 Kafka 已确认写入后返回 `202`。消费者上传不可变 pack、批量写 ClickHouse，最后提交 Kafka offset。
 
-幂等 ID 应由 `source + Idempotency-Key` 确定，或由服务端生成 UUIDv5。内容 SHA-256 不同却复用同一幂等键时返回 `409`。PostgreSQL 的幂等表只保留业务允许重试的时间窗口（例如 7–30 天），不要永久保存数亿行。
+幂等作用域由记录本身决定，而不是由调用方决定。带 `majsoul.uuid` 的记录一律按 `majsoul-watch\0{对局 uuid}` 认领：同一局无论是采集器实时抓的、归档里导入的，还是换了 batch key 重导的，都是同一条记录。这个字符串是历史包袱也是硬约束——采集器已有的认领就存成这个形状，改字面量等于全部认不出来、整个语料按新 record_id 重入一遍。
+
+没有 `majsoul.uuid` 的记录（普通 mjai 日志）退回 `source + Idempotency-Key`，此时幂等键是调用方对内容的承诺，内容 SHA-256 不同却复用同一键时返回 `409`。对局 uuid 作用域下不做这个检查：同一局的两次转换字节可能不同，那仍然是同一局。
+
+PostgreSQL 的幂等表只保留业务允许重试的时间窗口（例如 7–30 天），不要永久保存数亿行。
 
 ## 索引与筛选
 

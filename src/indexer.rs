@@ -48,6 +48,18 @@ const RETRY_DELAY: Duration = Duration::from_secs(2);
 /// within about a minute.
 const MAX_SEAL_BACKOFF: Duration = Duration::from_secs(64);
 
+/// The namespace every record carrying a Majsoul game uuid is claimed in,
+/// whatever source presented it.
+///
+/// The literal is the live collector's source name, and it has to stay that
+/// exact string. The collector's claims are already in PostgreSQL as
+/// `sha256("majsoul-watch\0{game uuid}")`, and this is what reproduces them byte
+/// for byte: rename it and every one of those claims is missed, the whole live
+/// corpus is re-ingested under fresh record ids, and `record_id` is in the
+/// sorting key, so nothing collapses the two copies afterwards. It names a
+/// namespace now rather than a collector; do not tidy it into matching one.
+const MAJSOUL_GAME_SCOPE: &str = "majsoul-watch";
+
 #[derive(Debug, Error)]
 pub enum IngestError {
     /// The caller's record is bad. Nothing was claimed and nothing was
@@ -103,11 +115,19 @@ pub struct Accepted {
 
 /// Validates, hashes and claims one record, returning the message to produce.
 ///
-/// The idempotency key is scoped by source here rather than by the caller, and
-/// the scoping is `{source}\0{key}`: the live collector's claims are stored as
-/// `sha256("majsoul-watch\0{game uuid}")`, so any other separator or order
-/// would miss every existing claim and re-ingest the whole corpus under new
-/// record ids.
+/// The idempotency key is built here rather than by the caller, because what a
+/// record is a duplicate *of* is a property of the record and not of whoever
+/// handed it over. A game has one identity — `majsoul.uuid`, which `start_game`
+/// carries — and two ingests of it are one record whether they arrived from the
+/// live collector, from an archive, or from the same archive re-imported under
+/// a different batch key. Scoping by source instead, which is what this used to
+/// do, made that depend entirely on the caller happening to pick the same source
+/// and the same key: a game both collected and archived became two rows, counted
+/// twice in every aggregate and returned twice by every filter that matched it.
+///
+/// A record with no such identity keeps the old `{source}\0{key}` scoping, which
+/// is all a plain mjai log can be deduplicated by, and there the key stays a
+/// promise about the content.
 ///
 /// `played_at` is the caller's explicit override and nothing else. The record's
 /// own `majsoul.start_time` is read by the worker out of the raw bytes, so it
@@ -129,14 +149,18 @@ pub async fn claim(
     if lag >= kafka.max_lag() {
         return Err(IngestError::Backlogged(lag));
     }
-    // Parsed for validation only: a record that is not mjai must be refused
-    // while the caller is still holding it, not discovered by the worker after
-    // the API has promised to keep it.
-    mjai::parse_metadata(raw)?;
+    // Parsed to refuse a record that is not mjai while the caller is still
+    // holding it, rather than have the worker discover it after the API has
+    // promised to keep it — and, now, to read the identity the claim is scoped
+    // by out of the record itself.
+    let metadata = mjai::parse_metadata(raw)?;
     let sha256 = hex::encode(Sha256::digest(raw));
     let id = Uuid::new_v4();
-    let key = format!("{source}\0{idempotency_key}");
-    match catalog.claim(&key, id, &sha256).await? {
+    let (key, content_must_match) = match metadata.majsoul_uuid {
+        Some(uuid) => (format!("{MAJSOUL_GAME_SCOPE}\0{uuid}"), false),
+        None => (format!("{source}\0{idempotency_key}"), true),
+    };
+    match catalog.claim(&key, id, &sha256, content_must_match).await? {
         IdempotencyClaim::Existing(id) => Ok(Claimed {
             id,
             sha256,
