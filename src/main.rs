@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use clap::Parser;
-use mjai_management::{AppState, api, config::Config, gc, indexer};
+use mjai_management::{AppState, api, backfill, config::Config, gc, indexer};
 use tokio::{net::TcpListener, sync::watch};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -31,13 +31,15 @@ async fn main() -> anyhow::Result<()> {
     let listen = config.listen.clone();
     let state = AppState::local(config).await?;
     state.watch_service.start_if_enabled().await?;
-    // Both of these run behind the listener rather than in front of it: the
-    // legacy upload moves hundreds of megabytes and the collector waits on
-    // ClickHouse, and an API that will not answer until either finishes looks
-    // like an outage. Neither can therefore report by failing to start, so both
-    // log at error level — the only other symptom of a broken upload is a
+    // All three of these run behind the listener rather than in front of it: the
+    // legacy upload moves hundreds of megabytes, the metadata backfill reads the
+    // bytes of every record in the index, and the collector waits on ClickHouse,
+    // and an API that will not answer until one of them finishes looks like an
+    // outage. None of them can therefore report by failing to start, so all
+    // three log at error level — the only other symptom of a broken upload is a
     // bucket that quietly stays empty.
     tokio::spawn(upload_legacy_packs(state.clone()));
+    tokio::spawn(backfill::rewrite_record_metadata(state.clone()));
     tokio::spawn(collect_orphans(state.clone()));
     // What the ingest path's backlog ceiling reads. Nothing samples it in the
     // test suite, which is why an unsampled reading of zero has to mean "no

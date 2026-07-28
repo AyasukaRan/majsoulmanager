@@ -1,5 +1,6 @@
 pub mod api;
 pub mod auth;
+pub mod backfill;
 pub mod catalog;
 pub mod clickhouse;
 pub mod config;

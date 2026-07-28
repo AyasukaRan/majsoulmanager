@@ -43,6 +43,18 @@ CREATE TABLE IF NOT EXISTS kafka_offsets (
     PRIMARY KEY (topic, partition_id)
 );
 
+-- One row per one-off data fix that has already been run to completion. The
+-- fixes themselves are applied by the API at startup, the same way this file is,
+-- and without a marker each of them would re-scan the whole index on every boot:
+-- the metadata rewrite reads the bytes of every record ever collected, which on
+-- the historical corpus is hours of object reads to discover there is nothing
+-- left to do. A row appears only after the pass finished, so a pass that died
+-- partway runs again.
+CREATE TABLE IF NOT EXISTS completed_backfills (
+    name text PRIMARY KEY,
+    completed_at timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS api_keys (
     id uuid PRIMARY KEY,
     name text NOT NULL,
