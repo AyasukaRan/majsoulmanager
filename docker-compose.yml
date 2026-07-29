@@ -205,14 +205,60 @@ services:
       retries: 20
     volumes:
       - redpanda-data:/var/lib/redpanda/data
-      # Retention is a cluster property, and cluster properties cannot be set on
-      # the command line: `rpk redpanda start --set retention_bytes=...` writes
-      # them into redpanda.yaml, where the broker logs "Ignoring value ... use
-      # rpk cluster config edit" and keeps the default. A bootstrap file is the
-      # one way to have them in the repository rather than in someone's shell
-      # history. See that file for the sizing and for the ceiling.
-      - ./deploy/redpanda/bootstrap.yml:/etc/redpanda/.bootstrap.yaml:ro
     restart: unless-stopped
+
+  # Retention is a cluster property, and cluster properties have exactly two ways
+  # in: `.bootstrap.yaml`, which the broker reads only while forming a cluster
+  # for the first time, and the admin API. The command line is not one of them —
+  # `rpk redpanda start --set retention_bytes=...` writes into redpanda.yaml,
+  # where the broker logs "Ignoring value ... use rpk cluster config edit" and
+  # keeps the default.
+  #
+  # A bootstrap file was not enough, and this deployment is why. Its Redpanda
+  # volume was created at 09:35 on 2026-07-27; the bootstrap mount was added to
+  # this file at 22:20 the same evening. The cluster had already formed, so the
+  # file was never read, and for the month that followed the repository said the
+  # topic was capped at 40GiB and trimmed only by size while the broker was
+  # actually running unlimited-by-size and seven-day-by-age — the exact opposite
+  # of the intent, with nothing anywhere reporting the difference.
+  #
+  # So it is applied on every boot instead, the same shape as create-bucket above
+  # and for the same reason: state that has to be true whatever a volume already
+  # contains does not belong in a file that is read once. `cluster config set` is
+  # idempotent, so this is a no-op on every boot after the first that needs it.
+  #
+  # retention_bytes is per partition and MJAI_KAFKA_PARTITIONS is 1, so this is
+  # the topic. 40GiB sits above the whole historical import — 641,475 games at
+  # the measured p50 of 53,668 uncompressed bytes is about 34.4GB — so an import
+  # can run for days behind a stopped worker without the topic dropping records
+  # the API has already answered 202 for. Real use is far under it because the
+  # producer compresses batches with zstd: 150,114 collected records measured
+  # 510MB on disk. Retention is only enforced when a segment rotates, so actual
+  # disk use overshoots by up to one segment (128MiB) per partition; size the
+  # volume for that plus storage_min_free_bytes, not for the number below.
+  #
+  # log_retention_ms=-1 means never trim by age. A bulk import that takes a week
+  # must not lose its head because the records at the front got old while it ran.
+  # The default that was silently in force here was seven days.
+  #
+  # Deliberately not a `depends_on` of the api. create-bucket is, because every
+  # upload fails without the bucket; retention being momentarily default costs
+  # nothing, and blocking ingest on this sidecar would be worse than the problem
+  # it fixes. A failure shows up as a non-zero exit in `docker compose ps`.
+  redpanda-config:
+    image: redpandadata/redpanda:v25.1.3
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: /bin/sh
+    # `key=value` rather than two arguments, because `set log_retention_ms -1`
+    # has rpk read the value as a flag; its own help uses this form for exactly
+    # that case. `--no-confirm` because `set` otherwise waits for a prompt that
+    # a container with no terminal will never answer. Both of those fail the
+    # sidecar rather than the stack, which is to say silently.
+    command: >-
+      -c "rpk -X admin.hosts=redpanda:9644 cluster config set --no-confirm retention_bytes=42949672960 &&
+      rpk -X admin.hosts=redpanda:9644 cluster config set --no-confirm log_retention_ms=-1"
 
 volumes:
   api-data:
