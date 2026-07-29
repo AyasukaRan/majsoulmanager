@@ -35,6 +35,12 @@ test:
 test-infra:
 	$(DEV_COMPOSE) up -d --wait postgres clickhouse redpanda
 	$(DEV_COMPOSE) run --rm create-bucket
+	# Not needed by the suite — retention has no bearing on a test that produces
+	# a handful of records. It runs here so that CI executes the sidecar on every
+	# build: its admin host flag, its `key=value` form and its `--no-confirm` are
+	# each the kind of mistake that fails this one container and nothing else,
+	# which on a deployment means the topic quietly keeps whatever it had.
+	$(DEV_COMPOSE) run --rm redpanda-config
 
 lint:
 	cargo fmt --check
