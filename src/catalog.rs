@@ -285,6 +285,20 @@ impl Catalog {
     /// collector's and an archive's, are still the one record we already have.
     /// Refusing that pair would turn the deduplication this scoping exists for
     /// into a rejected member in the middle of an import.
+    ///
+    /// **This is a retry guard, not an index-level constraint, and it expires.**
+    /// `prune_expired` deletes claims older than `IDEMPOTENCY_RETENTION_DAYS`,
+    /// so "one game is one record" holds for thirty days after that game was
+    /// first ingested and not a day longer. Re-import an archive of older games
+    /// and every one of them is stored again: a fresh `record_id`, a fresh
+    /// `received_at`, and nothing downstream that collapses the pair —
+    /// ReplacingMergeTree cannot, because a re-ingest differs in every column of
+    /// the sorting key except the date. Treating this table as a permanent
+    /// deduplication index is the mistake it invites, and the cost of making
+    /// that mistake is silent: both rows are valid, both are returned by every
+    /// filter that matches them, and nothing fails. Permanent deduplication
+    /// would have to live in the index — see the issue linked from
+    /// docs/architecture.md.
     pub async fn claim(
         &self,
         key: &str,
