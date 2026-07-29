@@ -108,7 +108,7 @@ fn rewritten(row: &Record, metadata: &Metadata) -> Option<Record> {
 /// failing to start either, so every outcome is logged and a failure is logged
 /// loudly.
 pub async fn rewrite_record_metadata(state: AppState) {
-    match already_done(&state).await {
+    match already_done(&state, NAME).await {
         Ok(true) => return,
         Ok(false) => {}
         // Running the pass a second time is harmless — it would find nothing to
@@ -164,7 +164,7 @@ pub async fn rewrite_record_metadata(state: AppState) {
     // idempotent rather than resumable: a row it already rewrote derives the
     // same metadata a second time and is skipped, so a rerun costs the reads and
     // writes nothing.
-    if let Err(error) = mark_done(&state).await {
+    if let Err(error) = mark_done(&state, NAME).await {
         report(
             &state,
             WatchLogLevel::Error,
@@ -257,10 +257,189 @@ async fn scan(state: &AppState) -> anyhow::Result<Progress> {
     Ok(progress)
 }
 
-async fn already_done(state: &AppState) -> Result<bool, sqlx::Error> {
+/// Names the pass that gives every record already in the index a claim under the
+/// scope ingest computes today.
+///
+/// Deduplication is keyed on the game's own uuid, and the claim carrying that
+/// key is the only place the uuid appears at all — the index has no column for
+/// it. So a record indexed before that scoping existed has no such claim, and
+/// nothing would recognise it if the same game arrived again. Worse, the claims
+/// the live collector did leave under this key were written as expiring ones,
+/// so without this pass the entire collected corpus loses its identity thirty
+/// days after it was gathered and quietly starts accepting itself as new.
+pub const GAME_CLAIMS_NAME: &str = "game_scoped_claims";
+
+/// How many record reads are in flight at once.
+///
+/// The metadata pass reads a page's rows one at a time, which was fine for the
+/// 61,934 rows it met. This one meets every row in the corpus, and once a pack
+/// has been uploaded its local copy is gone, so a row is a Range GET: 810,004 of
+/// them taken one at a time is over an hour of boot-time reads competing with
+/// live ingest. Bounded rather than unbounded because the point is to finish,
+/// not to saturate the object store the pack worker is also writing to.
+const READ_CONCURRENCY: usize = 16;
+
+/// Gives every already-indexed record a permanent claim under its game uuid.
+///
+/// Spawned behind the listener like the metadata rewrite, and for the same
+/// reason: it reads the bytes of every record ever collected. It writes nothing
+/// to the index and cannot damage a record — the worst a failure costs is that
+/// the pass runs again next boot.
+pub async fn write_game_scoped_claims(state: AppState) {
+    match already_done(&state, GAME_CLAIMS_NAME).await {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            report(
+                &state,
+                WatchLogLevel::Error,
+                format!("读不到对局幂等认领回填的完成标记，本次启动不回填：{error}"),
+            );
+            return;
+        }
+    }
+
+    report(
+        &state,
+        WatchLogLevel::Info,
+        "开始为索引中已有的记录补写按对局 uuid 的幂等认领".to_owned(),
+    );
+    let progress = match scan_game_claims(&state).await {
+        Ok(progress) => progress,
+        Err(error) => {
+            report(
+                &state,
+                WatchLogLevel::Error,
+                format!("对局幂等认领回填失败，已写入的部分仍然有效，下次启动会重跑：{error}"),
+            );
+            return;
+        }
+    };
+    // The same rule the metadata pass follows, and for a sharper reason: a row
+    // this pass could not read is a game whose identity is not recorded
+    // anywhere, and marking the pass done would leave it that way permanently
+    // while reporting success.
+    if !progress.is_complete() {
+        report(
+            &state,
+            WatchLogLevel::Error,
+            format!(
+                "对局幂等认领回填未完成：{} 条记录读不到字节（共扫描 {} 条，写入认领 {} 条，解析失败 {} 条）。\
+                 下次启动会重跑；这些对局在补上之前不受全局去重保护",
+                progress.unreadable, progress.scanned, progress.rewritten, progress.unparsable
+            ),
+        );
+        return;
+    }
+    if let Err(error) = mark_done(&state, GAME_CLAIMS_NAME).await {
+        report(
+            &state,
+            WatchLogLevel::Error,
+            format!("对局幂等认领已补写完成，但完成标记没有写入，下次启动会重跑：{error}"),
+        );
+        return;
+    }
+    report(
+        &state,
+        WatchLogLevel::Info,
+        format!(
+            "对局幂等认领回填完成：共扫描 {} 条，写入认领 {} 条，无 majsoul 头跳过 {} 条",
+            progress.scanned, progress.rewritten, progress.unparsable
+        ),
+    );
+}
+
+async fn scan_game_claims(state: &AppState) -> anyhow::Result<Progress> {
+    use futures_util::StreamExt;
+    use std::collections::HashSet;
+
+    let mut progress = Progress::default();
+    let mut cursor = None;
+    let mut reported = 0usize;
+    loop {
+        // Paged newest-first like the metadata pass, and safe beside live
+        // ingest for the same reason: a row written while the walk is in flight
+        // either sorts above the cursor and is never read, or is read like any
+        // other. Either way ingest has already written that row's claim itself,
+        // so this pass has nothing to add for it.
+        let (page, next) = state
+            .catalog
+            .scan(&RecordFilter::default(), cursor, PAGE_SIZE)
+            .await?;
+        // The location is cloned out of the row before the read is spawned
+        // rather than borrowed from it: a closure returning a future that
+        // borrows its own argument cannot be proven general enough over
+        // lifetimes, and the resulting error surfaces at the `tokio::spawn` in
+        // `main` rather than here.
+        let locations: Vec<_> = page
+            .iter()
+            .enumerate()
+            .map(|(index, row)| (index, row.storage.clone()))
+            .collect();
+        let read = futures_util::stream::iter(locations)
+            .map(|(index, storage)| async move { (index, state.packs.read(&storage).await) })
+            .buffer_unordered(READ_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+
+        let mut claims = Vec::with_capacity(read.len());
+        let mut seen = HashSet::with_capacity(read.len());
+        for (index, bytes) in read {
+            let row = &page[index];
+            let raw = match bytes {
+                Ok(raw) => raw,
+                Err(error) => {
+                    tracing::warn!(record = %row.id, %error, "跳过一条读不到字节的记录");
+                    progress.unreadable += 1;
+                    continue;
+                }
+            };
+            // A record with no majsoul header has no game identity to record,
+            // and its caller-scoped claim is all it can ever be deduplicated by.
+            // Counted apart from an unreadable row because it is an outcome and
+            // not a failure: it must not hold the completion marker hostage.
+            let Some(uuid) = mjai::parse_metadata(&raw)
+                .ok()
+                .and_then(|metadata| metadata.majsoul_uuid)
+            else {
+                progress.unparsable += 1;
+                continue;
+            };
+            let key = crate::indexer::game_scope_key(&uuid);
+            // Two index rows carrying one game is exactly the duplication this
+            // scoping exists to stop, and it is also the state PostgreSQL
+            // refuses to let one statement update twice. The first row wins,
+            // which is the same rule the ingest path follows.
+            if seen.insert(key.clone()) {
+                claims.push((key, row.id, row.sha256.clone()));
+            }
+        }
+        progress.scanned += page.len();
+        progress.rewritten += claims.len();
+        state.catalog.adopt_game_claims(&claims).await?;
+        if progress.scanned - reported >= PROGRESS_EVERY {
+            reported = progress.scanned;
+            report(
+                state,
+                WatchLogLevel::Info,
+                format!(
+                    "对局幂等认领回填中：已扫描 {} 条，写入认领 {} 条，读不到 {} 条",
+                    progress.scanned, progress.rewritten, progress.unreadable
+                ),
+            );
+        }
+        match next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    Ok(progress)
+}
+
+async fn already_done(state: &AppState, name: &str) -> Result<bool, sqlx::Error> {
     Ok(
         sqlx::query("SELECT 1 FROM completed_backfills WHERE name = $1")
-            .bind(NAME)
+            .bind(name)
             .fetch_optional(state.catalog.postgres())
             .await?
             .is_some(),
@@ -270,9 +449,9 @@ async fn already_done(state: &AppState) -> Result<bool, sqlx::Error> {
 /// `ON CONFLICT DO NOTHING` because two API replicas boot against one database
 /// and both would run the pass; the second finishing is not an error, and the
 /// first completion is the one worth keeping.
-async fn mark_done(state: &AppState) -> Result<(), sqlx::Error> {
+async fn mark_done(state: &AppState, name: &str) -> Result<(), sqlx::Error> {
     sqlx::query("INSERT INTO completed_backfills (name) VALUES ($1) ON CONFLICT DO NOTHING")
-        .bind(NAME)
+        .bind(name)
         .execute(state.catalog.postgres())
         .await?;
     Ok(())

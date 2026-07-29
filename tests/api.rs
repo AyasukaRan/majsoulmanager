@@ -383,6 +383,135 @@ async fn a_produce_does_not_queue_behind_the_pack_workers_long_poll() {
     );
 }
 
+/// The whole point of splitting the scopes. A caller-supplied key is a retry
+/// guard and expires with the retry window; a key derived from the game is the
+/// only record anywhere that the game has been stored, because the uuid is not a
+/// column of the index. Pruning that one does not free a guard, it discards the
+/// answer, and the next import of an archive holding the game stores it again
+/// under a record id nothing can collapse onto the original.
+#[tokio::test]
+async fn the_prune_keeps_game_claims_and_drops_caller_claims() {
+    let (state, data_dir) = test_state().await;
+    let source = test_source(&data_dir);
+    let app = api::router(state.clone());
+    let game = format!("260716-{}", Uuid::new_v4());
+    let caller_key = format!("prune-probe-{}", Uuid::new_v4());
+    let with_a_game = format!(
+        r#"{{"type":"start_game","names":["a","b","c","d"],"majsoul":{{"uuid":"{game}","start_time":1784178000}}}}"#
+    );
+
+    for request in [
+        ingest_request(&source, &game, &with_a_game),
+        ingest_request(
+            &source,
+            &caller_key,
+            r#"{"type":"start_game","names":["e","f","g","h"]}"#,
+        ),
+    ] {
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    // Both claims older than the retention window, which is the state a boot a
+    // month from now would meet. Only these two rows: the suite shares this
+    // table and backdating all of it would prune other cases out from under
+    // themselves.
+    let game_scope = format!("majsoul-watch\0{game}");
+    let caller_scope = format!("{source}\0{caller_key}");
+    sqlx::query(
+        "UPDATE ingest_idempotency SET created_at = now() - interval '31 days'
+         WHERE key_hash IN (sha256($1), sha256($2))",
+    )
+    .bind(game_scope.as_bytes())
+    .bind(caller_scope.as_bytes())
+    .execute(state.catalog.postgres())
+    .await
+    .unwrap();
+
+    // Connecting prunes, which is the only way this runs.
+    Catalog::connect(&test_config(&data_dir, None))
+        .await
+        .unwrap();
+
+    let survived = |key: String| {
+        let pool = state.catalog.postgres().clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM ingest_idempotency WHERE key_hash = sha256($1)",
+            )
+            .bind(key.into_bytes())
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(
+        survived(game_scope).await,
+        1,
+        "the claim naming a game must outlive the retry window; it is the only \
+         thing that knows the game was ever stored"
+    );
+    assert_eq!(
+        survived(caller_scope).await,
+        0,
+        "a caller-supplied key is a retry guard and must still be pruned, or the \
+         table grows without bound for keys nothing can re-derive"
+    );
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+/// Ingest cannot reach backwards. Records indexed before the game scope existed
+/// carry no claim under it, and the ones the collector did leave under that key
+/// were written as expiring — so without this pass the collected corpus loses
+/// its identity thirty days after it was gathered and quietly begins accepting
+/// itself as new.
+#[tokio::test]
+async fn the_backfill_makes_an_already_indexed_game_permanent() {
+    let (state, data_dir) = test_state().await;
+    let source = test_source(&data_dir);
+    let app = api::router(state.clone());
+    let game = format!("260716-{}", Uuid::new_v4());
+    let raw = format!(
+        r#"{{"type":"start_game","names":["a","b","c","d"],"majsoul":{{"uuid":"{game}","start_time":1784178000}}}}"#
+    );
+    let response = app
+        .oneshot(ingest_request(&source, &game, &raw))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    index_pending(&state).await;
+
+    let key = format!("majsoul-watch\0{game}");
+    // The state every claim written before this change is in.
+    sqlx::query("UPDATE ingest_idempotency SET expires = true WHERE key_hash = sha256($1)")
+        .bind(key.as_bytes())
+        .execute(state.catalog.postgres())
+        .await
+        .unwrap();
+    // The marker lives in the shared database, so without this a second run of
+    // the suite would find the pass done and assert nothing.
+    sqlx::query("DELETE FROM completed_backfills WHERE name = $1")
+        .bind(mjai_management::backfill::GAME_CLAIMS_NAME)
+        .execute(state.catalog.postgres())
+        .await
+        .unwrap();
+
+    mjai_management::backfill::write_game_scoped_claims(state.clone()).await;
+
+    let expires: bool =
+        sqlx::query_scalar("SELECT expires FROM ingest_idempotency WHERE key_hash = sha256($1)")
+            .bind(key.as_bytes())
+            .fetch_one(state.catalog.postgres())
+            .await
+            .unwrap();
+    assert!(
+        !expires,
+        "the pass has to upgrade the claim it finds, not skip it: ON CONFLICT DO \
+         NOTHING here would leave the whole collected corpus due for deletion"
+    );
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
 #[tokio::test]
 async fn rejects_unauthenticated_collection() {
     let (state, data_dir) = test_state().await;

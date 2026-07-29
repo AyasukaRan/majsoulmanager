@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
-    catalog::{Catalog, CatalogError, IdempotencyClaim, Record},
+    catalog::{Catalog, CatalogError, IdempotencyClaim, KeyScope, Record},
     kafka::{IngestMessage, Kafka, KafkaError, PartitionConsumer, commit_offset, load_offset},
     mjai,
     objects::ObjectError,
@@ -59,6 +59,13 @@ const MAX_SEAL_BACKOFF: Duration = Duration::from_secs(64);
 /// sorting key, so nothing collapses the two copies afterwards. It names a
 /// namespace now rather than a collector; do not tidy it into matching one.
 const MAJSOUL_GAME_SCOPE: &str = "majsoul-watch";
+
+/// The one place that string is joined to a uuid, so the backfill that writes
+/// claims for records already in the index and the ingest path that reads them
+/// cannot drift into two spellings of the same key.
+pub fn game_scope_key(majsoul_uuid: &str) -> String {
+    format!("{MAJSOUL_GAME_SCOPE}\0{majsoul_uuid}")
+}
 
 #[derive(Debug, Error)]
 pub enum IngestError {
@@ -156,11 +163,11 @@ pub async fn claim(
     let metadata = mjai::parse_metadata(raw)?;
     let sha256 = hex::encode(Sha256::digest(raw));
     let id = Uuid::new_v4();
-    let (key, content_must_match) = match metadata.majsoul_uuid {
-        Some(uuid) => (format!("{MAJSOUL_GAME_SCOPE}\0{uuid}"), false),
-        None => (format!("{source}\0{idempotency_key}"), true),
+    let (key, scope) = match metadata.majsoul_uuid {
+        Some(uuid) => (game_scope_key(&uuid), KeyScope::Game),
+        None => (format!("{source}\0{idempotency_key}"), KeyScope::Caller),
     };
-    match catalog.claim(&key, id, &sha256, content_must_match).await? {
+    match catalog.claim(&key, id, &sha256, scope).await? {
         IdempotencyClaim::Existing(id) => Ok(Claimed {
             id,
             sha256,

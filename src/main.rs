@@ -31,15 +31,21 @@ async fn main() -> anyhow::Result<()> {
     let listen = config.listen.clone();
     let state = AppState::local(config).await?;
     state.watch_service.start_if_enabled().await?;
-    // All three of these run behind the listener rather than in front of it: the
-    // legacy upload moves hundreds of megabytes, the metadata backfill reads the
-    // bytes of every record in the index, and the collector waits on ClickHouse,
-    // and an API that will not answer until one of them finishes looks like an
-    // outage. None of them can therefore report by failing to start, so all
-    // three log at error level — the only other symptom of a broken upload is a
-    // bucket that quietly stays empty.
+    // All of these run behind the listener rather than in front of it: the
+    // legacy upload moves hundreds of megabytes, both backfills read the bytes
+    // of every record in the index, and the collector waits on ClickHouse, and
+    // an API that will not answer until one of them finishes looks like an
+    // outage. None of them can therefore report by failing to start, so they all
+    // log at error level — the only other symptom of a broken upload is a bucket
+    // that quietly stays empty.
+    //
+    // The two backfills are spawned together rather than chained because each is
+    // a no-op once its marker is written, and on the one boot where both have
+    // work they are reading the same pages of the same index a moment apart,
+    // which the object store serves from the same place either way.
     tokio::spawn(upload_legacy_packs(state.clone()));
     tokio::spawn(backfill::rewrite_record_metadata(state.clone()));
+    tokio::spawn(backfill::write_game_scoped_claims(state.clone()));
     tokio::spawn(collect_orphans(state.clone()));
     // What the ingest path's backlog ceiling reads. Nothing samples it in the
     // test suite, which is why an unsampled reading of zero has to mean "no
