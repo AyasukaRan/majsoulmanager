@@ -102,11 +102,16 @@
   --border: oklch(1 0 0 / 10%);
   --input: oklch(1 0 0 / 15%);
   --ring: oklch(0.556 0 0);
-  --chart-1: oklch(0.87 0 0);
-  --chart-2: oklch(0.556 0 0);
-  --chart-3: oklch(0.439 0 0);
-  --chart-4: oklch(0.371 0 0);
-  --chart-5: oklch(0.269 0 0);
+  /* The theme shipped a greyscale ramp here, which is fine for a palette
+     nothing reads and wrong for one a chart does: two series drawn from it were
+     the same grey, and `--chart-3` downwards sat within 0.17 lightness of the
+     card behind them. These are the light hues lifted to read on a dark card,
+     so a legend swatch still names one line rather than one shade. */
+  --chart-1: oklch(0.7 0.16 252);
+  --chart-2: oklch(0.78 0.14 190);
+  --chart-3: oklch(0.82 0.15 95);
+  --chart-4: oklch(0.72 0.18 315);
+  --chart-5: oklch(0.74 0.18 25);
   --sidebar: oklch(0.205 0 0);
   --sidebar-foreground: oklch(0.985 0 0);
   --sidebar-primary: oklch(0.488 0.243 264.376);
