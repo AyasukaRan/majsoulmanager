@@ -98,6 +98,13 @@ test("the trend page charts without a charting dependency", async () => {
   );
   assert.match(chart, /<svg/);
   assert.match(chart, /viewBox=/);
+  // Drawn at device pixels. The first version put a 760-unit viewBox under
+  // `w-full`, so the card's width scaled the labels to 17px and the strokes to
+  // 3px — measuring the container is what keeps a 10px label 10px.
+  assert.match(chart, /new ResizeObserver/);
+  // The byte axis rounds its step inside the unit the labels use. Without it a
+  // storage axis reads 7.45 GiB / 14.90 GiB / 22.35 GiB.
+  assert.match(chart, /1024 \*\*/);
 
   // Both series, both columns. `games` reading `received_at` is the one bug
   // that would leave the chart looking entirely plausible, so the wording that
@@ -118,6 +125,35 @@ test("the trend page charts without a charting dependency", async () => {
   assert.match(chart, /tabIndex=\{0\}/);
   assert.match(chart, /ArrowLeft/);
   assert.match(chart, /aria-live="polite"/);
+});
+
+/**
+ * The theme shipped `--chart-1..5` as a greyscale ramp in dark mode, which is
+ * invisible as a design decision right up until something plots two series with
+ * it: both were the same grey, and the swatch in the legend named a shade
+ * rather than a line. Nothing but the charts reads these tokens, so this pins
+ * that the dark ones carry colour.
+ */
+test("the dark theme gives the chart palette actual colours", async () => {
+  const css = await readFile(new URL("app/globals.css", projectRoot), "utf8");
+  const dark = css.slice(css.indexOf(".dark {"));
+  assert.notEqual(dark.indexOf(".dark {"), -1);
+  for (let token = 1; token <= 5; token += 1) {
+    const declared = new RegExp(
+      `--chart-${token}:\\s*oklch\\(([\\d.]+)\\s+([\\d.]+)`,
+    ).exec(dark);
+    assert.ok(declared, `--chart-${token} is not an oklch() in the dark theme`);
+    const [, lightness, chroma] = declared;
+    assert.ok(
+      Number(chroma) > 0.05,
+      `--chart-${token} has chroma ${chroma} in the dark theme, i.e. it is grey`,
+    );
+    // The dark card sits at 0.205; a series drawn below that disappears into it.
+    assert.ok(
+      Number(lightness) > 0.5,
+      `--chart-${token} at lightness ${lightness} is too dark for the card`,
+    );
+  }
 });
 
 /**
