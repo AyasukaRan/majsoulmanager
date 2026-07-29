@@ -5,7 +5,7 @@ use axum::{
     http::{Request, StatusCode, header},
     routing::post,
 };
-use chrono::{SubsecRound, TimeDelta, Utc};
+use chrono::{NaiveDate, SubsecRound, TimeDelta, Utc};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use mjai_management::auth::{
     AuthError, AuthSettings, CreateUserRequest, LoginRequest, RegisterRequest, UserRole,
@@ -1835,6 +1835,142 @@ async fn reports_index_storage_download_and_watch_totals() {
     assert_eq!(stats["watch"]["phase"], "stopped");
     assert_eq!(stats["watch"]["live"], 1);
     assert_eq!(stats["watch"]["completed"], 0);
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+/// The trends page's daily buckets. The index is shared with the rest of the
+/// suite *and* with every earlier run of it, so nothing here may assert an
+/// absolute count: another test can move any bucket, and because `daily`
+/// counts without FINAL, a ReplacingMergeTree merge landing between two reads
+/// can move one *downwards* — a record another test wrote twice over one
+/// sorting key collapses to one row with no warning. Today's bucket therefore
+/// carries no delta at all; it is the one every other test writes into.
+///
+/// The claim that matters is that the two series read different columns, and it
+/// is made on a day nothing else can reach: a record ingested now, played 300
+/// days ago. Nothing in the suite is received that long ago and no fixture is
+/// played then, so that bucket holds this test's rows and no others — which is
+/// what lets `games` be asserted to move and `records` to stay exactly put.
+/// `received_at` is stamped by the server at ingest and cannot land 300 days
+/// back, so a `games` reading it could not move that day at all.
+#[tokio::test]
+async fn buckets_ingest_by_arrival_and_games_by_when_they_were_played() {
+    let (state, data_dir) = test_state().await;
+    let source = test_source(&data_dir);
+    let app = api::router(state.clone());
+    // One clock read for the whole test. The server derives its window from its
+    // own `Utc::now()`, so a second read here could disagree by a day about
+    // where the window ends, which is a midnight crossing rather than a defect.
+    let now = Utc::now();
+    let today = now.date_naive().to_string();
+    let played_at = now - TimeDelta::days(300);
+    let played_day = played_at.date_naive().to_string();
+
+    let fetch = |query: &str| {
+        let app = app.clone();
+        let uri = format!("/api/v1/stats/daily{query}");
+        async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, "Bearer test-secret")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            json_body(response).await
+        }
+    };
+    let on = |trend: &Value, day: &str, field: &str| {
+        trend["days"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|point| point["day"] == day)
+            .unwrap_or_else(|| panic!("{day} is not in the window: {trend}"))[field]
+            .as_u64()
+            .unwrap()
+    };
+
+    // 365 rather than 7, because the probe below is played 300 days back and
+    // has to be inside the window that carries it.
+    let before = fetch("?days=365").await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/records")
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .header(header::CONTENT_TYPE, "application/x-ndjson")
+                .header("idempotency-key", "daily-1")
+                .header("x-mjai-source", &source)
+                .header("x-mjai-played-at", played_at.to_rfc3339())
+                .body(Body::from(
+                    r#"{"type":"start_game","names":["a","b","c","d"]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    // The buckets read the index, so an accepted record counts for nothing
+    // until the worker has packed it.
+    index_pending(&state).await;
+    let after = fetch("?days=365").await;
+
+    assert!(
+        on(&after, &played_day, "games") > on(&before, &played_day, "games"),
+        "the game did not reach {played_day}: {before} -> {after}"
+    );
+    // Exactly equal, not merely "did not grow much": this is the assertion that
+    // `records` is not quietly the same query as `games`. It survives the shared
+    // index only because the bucket is 300 days old — nothing was received then,
+    // so there is nothing there to insert, duplicate or collapse.
+    assert_eq!(
+        on(&after, &played_day, "records"),
+        on(&before, &played_day, "records"),
+        "arrival was counted under the day the game was played: {before} -> {after}"
+    );
+    // A floor, deliberately: today is the bucket every other test writes into,
+    // and the merge above can take it down as easily as an insert takes it up.
+    assert!(on(&after, &today, "records") >= 1, "{after}");
+
+    let shape = fetch("?days=7").await;
+    let points = shape["days"].as_array().unwrap();
+    assert_eq!(points.len(), 7, "{shape}");
+    // Read back out of the response rather than recomputed from the clock: a run
+    // that straddles midnight UTC would otherwise fail on a one-day disagreement
+    // that is not a defect. It still has to be a day this test recognises.
+    let last = points[6]["day"].as_str().unwrap();
+    let last_day = NaiveDate::parse_from_str(last, "%Y-%m-%d").unwrap();
+    assert!(
+        last == today || last_day == now.date_naive() + TimeDelta::days(1),
+        "the window ends on neither today nor the day after: {shape}"
+    );
+    // Gap-filled and consecutive, oldest first: the console draws these straight
+    // onto an axis and cannot tell a missing entry from a quiet day.
+    for (offset, point) in points.iter().enumerate() {
+        assert_eq!(
+            point["day"],
+            (last_day - TimeDelta::days(6 - offset as i64)).to_string(),
+            "{shape}"
+        );
+        for field in ["records", "games", "raw_bytes", "compressed_bytes"] {
+            assert!(point[field].is_u64(), "{field} missing from {point}");
+        }
+    }
+
+    // Clamped rather than refused, and the length of the array is how a caller
+    // sees that it was: a year of daily points is the widest chart drawn.
+    let clamped = fetch("?days=100000").await;
+    assert_eq!(clamped["days"].as_array().unwrap().len(), 365, "{clamped}");
+    // No `days` at all is the console's default window, not an error.
+    let default = fetch("").await;
+    assert_eq!(default["days"].as_array().unwrap().len(), 30, "{default}");
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 

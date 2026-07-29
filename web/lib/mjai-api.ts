@@ -89,6 +89,25 @@ export type StatsSummary = {
   };
 };
 
+/**
+ * One day of the trend charts. `records` and the byte sums count what arrived
+ * that day, `games` counts what was *played* that day — an import moves the
+ * first three without moving the last.
+ */
+export type DailyPoint = {
+  /** `YYYY-MM-DD`, UTC. */
+  day: string;
+  records: number;
+  games: number;
+  raw_bytes: number;
+  compressed_bytes: number;
+};
+
+/** Gap-filled by the API: always one entry per day in the window, oldest first. */
+export type DailyStats = {
+  days: DailyPoint[];
+};
+
 export type WatchUuidState =
   | "live"
   | "pending"

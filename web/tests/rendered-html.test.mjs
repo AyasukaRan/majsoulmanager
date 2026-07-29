@@ -64,10 +64,60 @@ test("dashboard pages read from the API instead of literals", async () => {
   await Promise.all(
     [
       "app/api/stats/route.ts",
+      "app/api/stats/daily/route.ts",
       "app/api/records/[[...path]]/route.ts",
       "app/api/downloads/[[...path]]/route.ts",
     ].map((route) => access(new URL(route, projectRoot))),
   );
+});
+
+/**
+ * The charts are drawn in SVG by hand. That is a decision worth pinning: the
+ * smallest charting library that draws four daily lines is larger than the rest
+ * of the console's runtime put together, and it would arrive to replace about a
+ * hundred lines of path building. This fails the day one is added anyway.
+ */
+test("the trend page charts without a charting dependency", async () => {
+  const [page, chart, shell, packageJson] = await Promise.all(
+    [
+      "app/(dashboard)/trends/page.tsx",
+      "components/stats-trends.tsx",
+      "components/app-shell.tsx",
+      "package.json",
+    ].map((file) => readFile(new URL(file, projectRoot), "utf8")),
+  );
+
+  assert.match(page, /<StatsTrends \/>/);
+  assert.match(shell, /href: "\/trends"/);
+  // No admin flag: the charts are aggregates of the same index every member can
+  // already search, and the endpoint behind them changes nothing.
+  assert.doesNotMatch(shell, /href: "\/trends".+admin: true/);
+  assert.doesNotMatch(
+    packageJson,
+    /recharts|chart\.js|apexcharts|echarts|victory|nivo|visx|d3-shape/,
+  );
+  assert.match(chart, /<svg/);
+  assert.match(chart, /viewBox=/);
+
+  // Both series, both columns. `games` reading `received_at` is the one bug
+  // that would leave the chart looking entirely plausible, so the wording that
+  // tells the two apart is part of the page rather than a comment.
+  assert.match(chart, /key: "records"/);
+  assert.match(chart, /key: "games"/);
+  assert.match(chart, /导入/);
+
+  // A window switch swaps 365 points for 7 under a chart that keeps its hover
+  // index, and an unclamped index reads past the end of the array.
+  assert.match(chart, /Math\.min\(hovered, points\.length - 1\)/);
+
+  // The readout has to be reachable without a pointer, and the chart has to let
+  // the page scroll: `touch-action: none` on something this tall means a finger
+  // landing on it scrolls nothing at all.
+  assert.match(chart, /touch-pan-y/);
+  assert.doesNotMatch(chart, /touch-none/);
+  assert.match(chart, /tabIndex=\{0\}/);
+  assert.match(chart, /ArrowLeft/);
+  assert.match(chart, /aria-live="polite"/);
 });
 
 /**

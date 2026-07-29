@@ -35,8 +35,8 @@ use crate::{
         RegistrationStatus, UpdateUserRequest, UserView, VerifyEmailRequest,
     },
     catalog::{
-        CatalogError, Cursor, DownloadCounts, DownloadFormat, DownloadJob, DownloadRequest,
-        JobState, Record, RecordFilter, RecordStats, StorageStats,
+        CatalogError, Cursor, DEFAULT_TREND_DAYS, DailyPoint, DownloadCounts, DownloadFormat,
+        DownloadJob, DownloadRequest, JobState, Record, RecordFilter, RecordStats, StorageStats,
     },
     indexer::{self, Claimed, IngestError},
     kafka::MAX_PRODUCE_BATCH_BYTES,
@@ -77,6 +77,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/records/{id}", get(get_record))
         .route("/api/v1/records/{id}/raw", get(get_raw))
         .route("/api/v1/stats", get(get_stats))
+        .route("/api/v1/stats/daily", get(get_daily_stats))
         .route(
             "/api/v1/downloads",
             post(create_download).get(list_downloads),
@@ -1089,6 +1090,14 @@ struct StatsResponse {
     watch: WatchStats,
 }
 
+/// Wrapped in an object rather than answered as a bare array, so a later field
+/// — a rollup's freshness, a note that the window was clamped — does not have
+/// to break every reader.
+#[derive(Serialize)]
+struct DailyStats {
+    days: Vec<DailyPoint>,
+}
+
 /// The supervisor's counters without its item list, which is what
 /// `/api/v1/watch/status` is for.
 #[derive(Serialize)]
@@ -1125,6 +1134,26 @@ async fn get_stats(State(state): State<AppState>) -> Result<Json<StatsResponse>,
             failed: watch.records.failed as u64,
         },
     }))
+}
+
+#[derive(Deserialize)]
+struct TrendQuery {
+    days: Option<u32>,
+}
+
+/// The daily buckets behind the trends page. The window is clamped rather than
+/// rejected — `Catalog::daily` always answers with exactly as many points as it
+/// covered, so a caller asking for a decade gets the year it is allowed and can
+/// see from the array that it did.
+async fn get_daily_stats(
+    State(state): State<AppState>,
+    Query(query): Query<TrendQuery>,
+) -> Result<Json<DailyStats>, ApiError> {
+    let days = state
+        .catalog
+        .daily(query.days.unwrap_or(DEFAULT_TREND_DAYS))
+        .await?;
+    Ok(Json(DailyStats { days }))
 }
 
 fn required_header(headers: &HeaderMap, name: &'static str) -> Result<String, ApiError> {
