@@ -6,8 +6,9 @@ export default async function SettingsPage() {
   const user = await requireSessionUser();
   // Guarded like 用户管理, and for a stronger reason: this page takes a proxy
   // subscription and the account secret refs, and a single save stops and
-  // restarts a live collection. The backend route behind it still only asks for
-  // a session, so this is the console drawing the line, not authorisation.
+  // restarts a live collection. This is only about what is worth rendering —
+  // the API refuses every one of those writes without an administrator session,
+  // whatever reaches it.
   if (user.role !== "admin") redirect("/");
   return (
     <div className="space-y-6">

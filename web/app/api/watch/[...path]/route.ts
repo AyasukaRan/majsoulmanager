@@ -1,4 +1,4 @@
-import { getSessionUser } from "@/lib/session";
+import { getSessionToken, getSessionUser } from "@/lib/session";
 
 const DEFAULT_API_BASE_URL = "http://localhost:8000";
 
@@ -9,7 +9,8 @@ type RouteContext = {
 };
 
 async function forward(request: Request, context: RouteContext) {
-  if (!(await getSessionUser())) {
+  const token = await getSessionToken();
+  if (!token || !(await getSessionUser())) {
     return Response.json({ error: "unauthorized" }, { status: 401 });
   }
   const { path } = await context.params;
@@ -21,6 +22,11 @@ async function forward(request: Request, context: RouteContext) {
   try {
     const headers: HeadersInit = {
       authorization: `Bearer ${process.env.MJAI_API_KEY ?? "change-me"}`,
+      // The key says the request came from this console, which is true of every
+      // request any member makes through it. Only the session says who, and the
+      // backend refuses to start, stop or reconfigure collection without one
+      // that belongs to an administrator.
+      "x-mjai-user-session": token,
     };
     const contentType = request.headers.get("content-type");
     if (contentType) {
