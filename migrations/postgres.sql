@@ -7,8 +7,32 @@ CREATE TABLE IF NOT EXISTS ingest_idempotency (
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS ingest_idempotency_created_at_idx
-    ON ingest_idempotency (created_at);
+-- Whether this claim is a retry guard or the record of a game's identity.
+--
+-- A caller-supplied key expires with the window in which a collector may retry.
+-- A key derived from the record's own game uuid does not: it is the only thing
+-- anywhere that says this game has already been stored, because the uuid is not
+-- a column of the index, and deleting it is what makes a later re-import store
+-- the game a second time under a fresh record id that nothing can collapse.
+-- One row per game, forever, is the price of deduplication that does not expire,
+-- and it is the cheapest form of it — the 810,004 games collected so far are
+-- about 130MB here, against 25GiB of records they protect.
+--
+-- Non-volatile default, so this is a catalogue update rather than a rewrite of
+-- every existing row. Existing claims stay expiring, which is correct for the
+-- caller-scoped ones and is repaired for the game-scoped ones by the
+-- `game_scoped_claims` backfill.
+ALTER TABLE ingest_idempotency
+    ADD COLUMN IF NOT EXISTS expires boolean NOT NULL DEFAULT true;
+
+-- Partial, because the prune only ever looks at expiring claims and at the
+-- scale this is sized for the permanent ones outnumber them by orders of
+-- magnitude: a full index on created_at would have every boot walk all of them
+-- to find the handful that are due.
+CREATE INDEX IF NOT EXISTS ingest_idempotency_expiring_idx
+    ON ingest_idempotency (created_at) WHERE expires;
+
+DROP INDEX IF EXISTS ingest_idempotency_created_at_idx;
 
 CREATE TABLE IF NOT EXISTS download_jobs (
     id uuid PRIMARY KEY,

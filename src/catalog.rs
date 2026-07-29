@@ -151,6 +151,42 @@ pub enum CatalogError {
     Store(#[from] sqlx::Error),
 }
 
+/// Where an idempotency key came from, which decides both what a repeat of it
+/// means and how long the claim outlives the request that made it. The two
+/// always move together — they are the same question asked twice — so they
+/// travel as one value rather than as two booleans a call site could disagree
+/// with itself about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyScope {
+    /// Derived from the record's own `majsoul.uuid`. It names the game and
+    /// promises nothing about bytes, so two renderings of one game are the one
+    /// record we already have rather than a conflict.
+    ///
+    /// The claim never expires, because it is the only thing anywhere that
+    /// records that this game has been stored: the uuid is not a column of the
+    /// index, so nothing else can be asked. Pruning it does not lose a retry
+    /// guard, it loses the answer — and the next import of an archive holding
+    /// that game stores it again under a fresh `record_id`, which lands beside
+    /// the original rather than on it.
+    Game,
+    /// Supplied by the caller, scoped by its source. It is a promise that this
+    /// key names this content, so a repeat over different bytes is the caller
+    /// contradicting itself and earns a `409`. It expires with the window in
+    /// which a collector may retry, which is all a key nobody can re-derive
+    /// from a record is good for.
+    Caller,
+}
+
+impl KeyScope {
+    fn content_must_match(self) -> bool {
+        matches!(self, Self::Caller)
+    }
+
+    fn expires(self) -> bool {
+        matches!(self, Self::Caller)
+    }
+}
+
 pub enum IdempotencyClaim {
     New,
     /// The record id the first request with this key was given. Only the id,
@@ -254,8 +290,13 @@ impl Catalog {
     /// Runs at boot rather than on a timer: the tables only grow while the
     /// process is up, and one deploy per day is plenty for a 30 day window.
     async fn prune(&self) -> Result<(), sqlx::Error> {
+        // `expires` is what keeps this from being the thing that silently ends
+        // deduplication: a game-scoped claim is the only record anywhere that a
+        // game has been stored, so deleting it does not free a retry guard, it
+        // discards the answer. See `KeyScope`.
         let idempotency = sqlx::query(
-            "DELETE FROM ingest_idempotency WHERE created_at < now() - make_interval(days => $1)",
+            "DELETE FROM ingest_idempotency
+             WHERE expires AND created_at < now() - make_interval(days => $1)",
         )
         .bind(IDEMPOTENCY_RETENTION_DAYS)
         .execute(&self.postgres)
@@ -276,31 +317,31 @@ impl Catalog {
     /// a row back and produces the record, the other falls through to the
     /// lookup.
     ///
-    /// `content_must_match` says what a second claim on an existing key with
-    /// different bytes means, which depends on where the key came from. A
-    /// caller-supplied key is a promise that it names this content, so the same
-    /// key over different content is the caller contradicting itself and worth
-    /// refusing. A key derived from the record's own game uuid promises nothing
-    /// about bytes — it names the game — and two renderings of one game, the
-    /// collector's and an archive's, are still the one record we already have.
-    /// Refusing that pair would turn the deduplication this scoping exists for
-    /// into a rejected member in the middle of an import.
+    /// `scope` says where the key came from, which decides both what a repeat of
+    /// it means and whether the claim ever expires. See `KeyScope`.
+    ///
+    /// A `Game`-scoped claim is not a retry guard. It is the record that this
+    /// game has been stored, and the only one there is, because the uuid is not
+    /// a column of the index and so nothing else can be asked. That is why
+    /// `prune` leaves it alone, and it is the whole of what makes "one game is
+    /// one record" outlive the retry window.
     pub async fn claim(
         &self,
         key: &str,
         id: Uuid,
         sha256: &str,
-        content_must_match: bool,
+        scope: KeyScope,
     ) -> Result<IdempotencyClaim, CatalogError> {
         let claimed = sqlx::query(
-            "INSERT INTO ingest_idempotency (key_hash, record_id, content_sha256, state)
-             VALUES (sha256($1), $2, decode($3, 'hex'), 'accepted')
+            "INSERT INTO ingest_idempotency (key_hash, record_id, content_sha256, state, expires)
+             VALUES (sha256($1), $2, decode($3, 'hex'), 'accepted', $4)
              ON CONFLICT (key_hash) DO NOTHING
              RETURNING record_id",
         )
         .bind(key.as_bytes())
         .bind(id)
         .bind(sha256)
+        .bind(scope.expires())
         .fetch_optional(&self.postgres)
         .await?;
         if claimed.is_some() {
@@ -318,10 +359,50 @@ impl Catalog {
         // it as pending costs the caller one retry; taking the claim here would
         // need the insert repeated in a loop for no practical gain.
         .ok_or(CatalogError::Pending)?;
-        if content_must_match && row.try_get::<String, _>("content_sha256")? != sha256 {
+        if scope.content_must_match() && row.try_get::<String, _>("content_sha256")? != sha256 {
             return Err(CatalogError::Conflict);
         }
         Ok(IdempotencyClaim::Existing(row.try_get("record_id")?))
+    }
+
+    /// Writes permanent game-scoped claims for records that are already in the
+    /// index, which is what the `game_scoped_claims` backfill is made of.
+    ///
+    /// `DO UPDATE` rather than `DO NOTHING`, and that is the point of the whole
+    /// pass: the live collector's claims are already stored under exactly these
+    /// keys, but as expiring ones, so ignoring the conflict would leave the
+    /// entire collected corpus scheduled for deletion thirty days after it was
+    /// gathered. The existing `record_id` is deliberately left alone — whichever
+    /// request stored the game first is the one that owns it, and a second row
+    /// for one game means the index already holds a duplicate this pass is not
+    /// there to resolve.
+    ///
+    /// Keys are deduplicated by the caller, because PostgreSQL refuses a
+    /// statement whose `ON CONFLICT DO UPDATE` would touch one row twice, and
+    /// two rows in the index carrying one game is exactly the state that
+    /// happens in.
+    pub async fn adopt_game_claims(
+        &self,
+        claims: &[(String, Uuid, String)],
+    ) -> Result<u64, CatalogError> {
+        if claims.is_empty() {
+            return Ok(0);
+        }
+        let keys: Vec<&[u8]> = claims.iter().map(|(key, _, _)| key.as_bytes()).collect();
+        let ids: Vec<Uuid> = claims.iter().map(|(_, id, _)| *id).collect();
+        let hashes: Vec<&str> = claims.iter().map(|(_, _, sha)| sha.as_str()).collect();
+        let written = sqlx::query(
+            "INSERT INTO ingest_idempotency (key_hash, record_id, content_sha256, state, expires)
+             SELECT sha256(k), r, decode(c, 'hex'), 'indexed', false
+             FROM unnest($1::bytea[], $2::uuid[], $3::text[]) AS t(k, r, c)
+             ON CONFLICT (key_hash) DO UPDATE SET expires = false, updated_at = now()",
+        )
+        .bind(&keys)
+        .bind(&ids)
+        .bind(&hashes)
+        .execute(&self.postgres)
+        .await?;
+        Ok(written.rows_affected())
     }
 
     pub async fn abandon_claim(&self, key: &str, id: Uuid) -> Result<(), CatalogError> {
