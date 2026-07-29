@@ -133,7 +133,7 @@ async fn capture_email(
     StatusCode::OK
 }
 
-fn ingest_request(source: &str, key: &str, body: &'static str) -> Request<Body> {
+fn ingest_request(source: &str, key: &str, body: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri("/api/v1/records")
@@ -141,7 +141,7 @@ fn ingest_request(source: &str, key: &str, body: &'static str) -> Request<Body> 
         .header(header::CONTENT_TYPE, "application/x-ndjson")
         .header("idempotency-key", key)
         .header("x-mjai-source", source)
-        .body(Body::from(body))
+        .body(Body::from(body.to_owned()))
         .unwrap()
 }
 
@@ -220,6 +220,7 @@ async fn ingests_and_reads_one_record_without_reading_a_whole_pack() {
     );
 
     let duplicate = app
+        .clone()
         .oneshot(ingest_request(&source, "game-1", raw))
         .await
         .unwrap();
@@ -228,6 +229,96 @@ async fn ingests_and_reads_one_record_without_reading_a_whole_pack() {
         serde_json::from_slice(&to_bytes(duplicate.into_body(), usize::MAX).await.unwrap())
             .unwrap();
     assert_eq!(duplicate_json["duplicate"], true);
+
+    // A record with no game of its own is still deduplicated by the key the
+    // caller chose, and there the key is a promise that it names this content.
+    // Reusing it for different bytes is the caller contradicting itself, and
+    // has to stay a refusal rather than quietly resolving to the first record —
+    // which is what a game-scoped claim deliberately does, and what this proves
+    // was not turned on for everything.
+    let contradicted = app
+        .oneshot(ingest_request(
+            &source,
+            "game-1",
+            r#"{"type":"start_game","names":["w","x","y","z"]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(contradicted.status(), StatusCode::CONFLICT);
+
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+/// A game has one identity and two ingests of it are one record, whatever
+/// source presented them. Deduplication used to be scoped by the caller's
+/// source, so a game the collector had already stored came back out of an
+/// archive as a second record — two ids, two rows, counted twice in every
+/// aggregate and returned twice by every filter that matched it — and
+/// re-importing one archive under a different batch key re-ingested all of it.
+///
+/// The first request here is byte for byte what the live collector sends, which
+/// is the other half of what this has to get right: the claims already in
+/// PostgreSQL were written by that path, and the scope has to keep reproducing
+/// them or the whole collected corpus is re-ingested under fresh record ids.
+#[tokio::test]
+async fn collapses_one_game_ingested_from_two_sources() {
+    let (state, data_dir) = test_state().await;
+    let app = api::router(state.clone());
+    // Unique per run: the scope no longer contains the source, and the suite's
+    // PostgreSQL outlives a run, so a fixed uuid would be claimed once and
+    // answered as a duplicate for every run after it.
+    let game = format!("260716-{}", Uuid::new_v4());
+    // 2026-07-16T05:00:00Z, kept well clear of the 13:00–14:00 window
+    // `ingests_gzip_tar_members_with_their_own_played_at` asserts holds exactly
+    // one record. The suite shares one index, so a `played_at` is as much a
+    // shared namespace as a source is, and copying one out of a fixture is
+    // enough to break a test that never mentions this one.
+    let collected = format!(
+        r#"{{"type":"start_game","names":["a","b","c","d"],"majsoul":{{"uuid":"{game}","start_time":1784178000,"room":"throne","game_length":"south","players":4}}}}
+{{"type":"start_kyoku","bakaze":"E","kyoku":1}}"#
+    );
+
+    let response = app
+        .clone()
+        // The collector's own source and its own key, which is the game uuid.
+        .oneshot(ingest_request("majsoul-watch", &game, &collected))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let first = json_body(response).await;
+
+    // The same game out of an archive: a different source, a key built from a
+    // batch and a member path, and bytes that do not match — a second
+    // conversion of one game renders it slightly differently, and that is still
+    // the game we already have rather than a caller reusing a key for unrelated
+    // content. The copy in hand is dropped; first writer wins.
+    let response = app
+        .oneshot(ingest_request(
+            &test_source(&data_dir),
+            "archive-2026-07/260716.mjson",
+            &format!("{collected}\n{{\"type\":\"end_game\"}}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let second = json_body(response).await;
+    assert_eq!(second["duplicate"], true, "{second}");
+    assert_eq!(second["id"], first["id"], "one game must be one record");
+
+    // The stored shape, spelled out, because the two assertions above hold for
+    // any scope both requests agree on and this is the one thing about it that
+    // cannot be re-derived: the claims of every game collected so far are
+    // already in this table under `sha256("majsoul-watch\0{uuid}")`. A scope
+    // that stopped reproducing that string would still pass everything above,
+    // and would re-ingest the entire live corpus under fresh record ids the
+    // moment it shipped.
+    let claimed: Uuid =
+        sqlx::query_scalar("SELECT record_id FROM ingest_idempotency WHERE key_hash = sha256($1)")
+            .bind(format!("majsoul-watch\0{game}").into_bytes())
+            .fetch_one(state.catalog.postgres())
+            .await
+            .unwrap();
+    assert_eq!(claimed.to_string(), first["id"].as_str().unwrap());
 
     std::fs::remove_dir_all(data_dir).unwrap();
 }

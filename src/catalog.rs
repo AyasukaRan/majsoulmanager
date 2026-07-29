@@ -275,11 +275,22 @@ impl Catalog {
     /// concurrent requests with the same key reach PostgreSQL, exactly one gets
     /// a row back and produces the record, the other falls through to the
     /// lookup.
+    ///
+    /// `content_must_match` says what a second claim on an existing key with
+    /// different bytes means, which depends on where the key came from. A
+    /// caller-supplied key is a promise that it names this content, so the same
+    /// key over different content is the caller contradicting itself and worth
+    /// refusing. A key derived from the record's own game uuid promises nothing
+    /// about bytes — it names the game — and two renderings of one game, the
+    /// collector's and an archive's, are still the one record we already have.
+    /// Refusing that pair would turn the deduplication this scoping exists for
+    /// into a rejected member in the middle of an import.
     pub async fn claim(
         &self,
         key: &str,
         id: Uuid,
         sha256: &str,
+        content_must_match: bool,
     ) -> Result<IdempotencyClaim, CatalogError> {
         let claimed = sqlx::query(
             "INSERT INTO ingest_idempotency (key_hash, record_id, content_sha256, state)
@@ -307,7 +318,7 @@ impl Catalog {
         // it as pending costs the caller one retry; taking the claim here would
         // need the insert repeated in a loop for no practical gain.
         .ok_or(CatalogError::Pending)?;
-        if row.try_get::<String, _>("content_sha256")? != sha256 {
+        if content_must_match && row.try_get::<String, _>("content_sha256")? != sha256 {
             return Err(CatalogError::Conflict);
         }
         Ok(IdempotencyClaim::Existing(row.try_get("record_id")?))

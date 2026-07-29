@@ -877,11 +877,12 @@ async fn watch_session(
 /// than keeping a second copy of it: the two drifted apart once already, and a
 /// change that only fixed `src/api.rs` would leave production on the old one.
 ///
-/// The source and the key have to survive that unification exactly, because the
-/// live PostgreSQL table and the live index both depend on them: the source is
-/// `majsoul-watch` and the key is the game uuid, which `indexer::claim` scopes
-/// as `majsoul-watch\0{uuid}` — byte for byte what this used to build itself,
-/// so every existing claim is still found.
+/// The key it passes no longer decides anything: `indexer::claim` reads the game
+/// uuid out of the record and claims `majsoul-watch\0{uuid}` whatever it is
+/// given, which is byte for byte what this path has always produced. The uuid is
+/// still passed because it is the right fallback if a record ever reaches here
+/// without a Majsoul header, and `majsoul-watch` is still the source because
+/// that is the provenance every row it has ever written carries.
 ///
 /// No `played_at` override travels with the record. This path used to derive one
 /// from the uuid's `yymmdd` prefix, at midnight UTC, and that beat the record's
