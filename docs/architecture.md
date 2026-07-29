@@ -92,6 +92,8 @@ ClickHouse 是记录级索引的事实来源，表定义见 `migrations/clickhou
 
 查询必须包含时间范围或受服务端最大时间窗限制，并使用 `(received_at, record_id)` keyset cursor；禁止深度 `OFFSET`。玩家数组使用 bloom filter 跳数索引。实际数据上线后通过 `EXPLAIN indexes = 1` 和真实分布决定是否增加 projection 或物化列。
 
+聚合查询同样受最大时间窗限制，但那是另一个数：`GET /api/v1/stats/daily` 上限 365 天（`MAX_TREND_DAYS`），比记录查询的 90 天（`MAX_QUERY_WINDOW_DAYS`）宽。两者限制的不是同一件事——记录查询每命中一行就要传一行，聚合查询每天只回一行、读三列把它算出来，所以一年的代价在扫描上而不在传输上。它按 `toDate(received_at)` 分桶，那是排序键的第一项，界能剪枝；`played_at` 那一半不在任何键里，因为一局什么时候打的和它什么时候进的库无关，这既是这条曲线值得画的原因，也是它必须整列扫的原因。真到了扛不住的那天，答案是插入时维护的 rollup，不是把窗口调窄。
+
 ## 单条与批量下载
 
 单条读取只发一次 RustFS Range GET。批量导出是异步任务：

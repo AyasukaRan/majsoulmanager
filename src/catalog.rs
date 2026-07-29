@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt,
     future::Future,
     str::FromStr,
@@ -47,6 +48,21 @@ const MIGRATION_LOCK: i64 = 0x6D6A_6169;
 /// The overview names the busiest collectors, not every value that has ever
 /// appeared in an `X-Mjai-Source` header.
 const MAX_REPORTED_SOURCES: usize = 100;
+
+/// The server-side ceiling docs/architecture.md 索引与筛选 asks for, applied to
+/// the trend buckets. Cited by section rather than by line: the neighbouring
+/// constants point at line numbers that the file has since moved out from
+/// under them. Wider than `MAX_QUERY_WINDOW_DAYS` on purpose: that one
+/// bounds a query that returns a row per record, this one returns a row per day
+/// and reads three columns to build them, so a year costs the scan and not the
+/// transfer. It is also the number of points a chart can still draw as a line
+/// rather than a smear.
+const MAX_TREND_DAYS: u32 = 365;
+
+/// What the trends page asks for when the URL says nothing: long enough to show
+/// a collector that stopped a fortnight ago, short enough that every point is a
+/// visible day.
+pub const DEFAULT_TREND_DAYS: u32 = 30;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Record {
@@ -848,6 +864,96 @@ impl Catalog {
             },
         })
     }
+
+    /// One row per day for the console's trend charts, gap-filled so a caller
+    /// never has to do date arithmetic to tell "collected nothing" from "no
+    /// bucket". Always exactly `days` points, oldest first, ending today.
+    ///
+    /// Two groupings rather than one, because the two questions have different
+    /// answers: `records` and the byte sums bucket by `received_at` — when the
+    /// index learned of a record — while `games` buckets by `played_at`, when
+    /// the hand was actually dealt. The historical import is why both are here
+    /// and neither can stand in for the other: it landed six days of play in a
+    /// single afternoon, so a chart drawn on `received_at` alone is one spike
+    /// with nothing either side of it, and one drawn on `played_at` alone never
+    /// shows that an import happened at all.
+    pub async fn daily(&self, days: u32) -> Result<Vec<DailyPoint>, CatalogError> {
+        let days = days.clamp(1, MAX_TREND_DAYS);
+        #[derive(Deserialize)]
+        struct ReceivedBucket {
+            day: String,
+            records: u64,
+            raw_bytes: u64,
+            compressed_bytes: u64,
+        }
+        #[derive(Deserialize)]
+        struct PlayedBucket {
+            day: String,
+            games: u64,
+        }
+        // The window is computed once here and sent to both statements rather
+        // than letting each call `now()`: two evaluations either side of
+        // midnight UTC would bucket into two different day ranges, and the
+        // merge below would silently drop the day they disagreed about.
+        let first = Utc::now().date_naive() - TimeDelta::days(i64::from(days) - 1);
+        let params = [("start", first.to_string())];
+        // Compared as `toDate(...)` on both sides rather than against a
+        // timestamp: the column is `DateTime64(3, 'UTC')` and the bound is a
+        // bare date, and this is the one form where the two cannot disagree
+        // about the hour. It costs nothing here — `toDate(received_at)` leads
+        // the sorting key, so the bound still prunes.
+        let received_sql = format!(
+            "SELECT toString(toDate(received_at)) AS day, count() AS records, \
+             sum(raw_size) AS raw_bytes, sum(compressed_size) AS compressed_bytes \
+             FROM {RECORDS_TABLE} WHERE toDate(received_at) >= toDate({{start:String}}) \
+             GROUP BY day"
+        );
+        // `played_at` is in no key, so this reads one column of every part —
+        // a game played inside the window may have been received at any time,
+        // which is exactly what makes the chart worth drawing and also what
+        // stops the partition key from helping. Eight bytes a row against a
+        // corpus measured in tens of gigabytes; if it ever matters, the answer
+        // is a rollup maintained on insert, not a narrower window. NULL
+        // compares as NULL and drops out, which is the same rows a record
+        // without a start time contributes to a chart of play times: none.
+        let played_sql = format!(
+            "SELECT toString(toDate(played_at)) AS day, count() AS games \
+             FROM {RECORDS_TABLE} WHERE toDate(played_at) >= toDate({{start:String}}) \
+             GROUP BY day"
+        );
+        // Counted without FINAL, like `stats` and for the same reason: a
+        // replayed insert batch is double-counted only until the parts merge,
+        // and a chart is the wrong place to pay for a collapse of the whole
+        // table on every poll.
+        let (received, played) = tokio::try_join!(
+            self.index.query::<ReceivedBucket>(&received_sql, &params),
+            self.index.query::<PlayedBucket>(&played_sql, &params),
+        )?;
+        let received: HashMap<String, ReceivedBucket> = received
+            .into_iter()
+            .map(|bucket| (bucket.day.clone(), bucket))
+            .collect();
+        let played: HashMap<String, u64> = played
+            .into_iter()
+            .map(|bucket| (bucket.day, bucket.games))
+            .collect();
+        // Keyed by the day string on both sides, not zipped: the two statements
+        // return only the days they have rows for, so position means nothing
+        // and a zip would shift one series against the other.
+        Ok((0..days)
+            .map(|offset| {
+                let day = (first + TimeDelta::days(i64::from(offset))).to_string();
+                let bucket = received.get(&day);
+                DailyPoint {
+                    records: bucket.map_or(0, |bucket| bucket.records),
+                    raw_bytes: bucket.map_or(0, |bucket| bucket.raw_bytes),
+                    compressed_bytes: bucket.map_or(0, |bucket| bucket.compressed_bytes),
+                    games: played.get(&day).copied().unwrap_or(0),
+                    day,
+                }
+            })
+            .collect())
+    }
 }
 
 /// Every column a `DownloadJob` is built from, in the one place both readers of
@@ -1077,6 +1183,19 @@ pub struct SourceCount {
 #[derive(Clone, Debug, Serialize)]
 pub struct StorageStats {
     pub packs: u64,
+    pub raw_bytes: u64,
+    pub compressed_bytes: u64,
+}
+
+/// One day of the console's trend charts. `records` and the byte sums are what
+/// arrived that day, `games` is what was played that day; see `Catalog::daily`
+/// for why those are not the same series.
+#[derive(Clone, Debug, Serialize)]
+pub struct DailyPoint {
+    /// `YYYY-MM-DD`, UTC, the same calendar the index buckets on.
+    pub day: String,
+    pub records: u64,
+    pub games: u64,
     pub raw_bytes: u64,
     pub compressed_bytes: u64,
 }
