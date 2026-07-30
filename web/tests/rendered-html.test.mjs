@@ -64,7 +64,7 @@ test("dashboard pages read from the API instead of literals", async () => {
   await Promise.all(
     [
       "app/api/stats/route.ts",
-      "app/api/stats/daily/route.ts",
+      "app/api/stats/series/route.ts",
       "app/api/records/[[...path]]/route.ts",
       "app/api/downloads/[[...path]]/route.ts",
     ].map((route) => access(new URL(route, projectRoot))),
@@ -112,6 +112,17 @@ test("the trend page charts without a charting dependency", async () => {
   assert.match(chart, /key: "records"/);
   assert.match(chart, /key: "games"/);
   assert.match(chart, /导入/);
+
+  // The shortest window is hours, not days: "did the collector stop this
+  // afternoon" is a question a day of daily buckets answers with one bar.
+  assert.match(chart, /unit: "hour", span: 24/);
+  // Hourly buckets arrive as UTC instants and are rendered in the reader's own
+  // timezone; daily ones are bare dates and must never be parsed as instants,
+  // which would shift them across midnight west of Greenwich.
+  assert.match(chart, /if \(unit === "day"\) \{\n    return point\.at;/);
+  // The mode breakdown reads the shared label map rather than the raw token.
+  assert.match(chart, /ruleLabel/);
+  assert.match(chart, /from "@\/lib\/rules"/);
 
   // A window switch swaps 365 points for 7 under a chart that keeps its hover
   // index, and an unclamped index reads past the end of the array.
@@ -164,9 +175,10 @@ test("the dark theme gives the chart palette actual colours", async () => {
  * mode silently makes that mode unfilterable.
  */
 test("the record index filters on the twelve rules and names them in Chinese", async () => {
-  const source = await readFile(
-    new URL("../components/record-index.tsx", import.meta.url),
-    "utf8",
+  const [source, rules] = await Promise.all(
+    ["components/record-index.tsx", "lib/rules.ts"].map((file) =>
+      readFile(new URL(file, projectRoot), "utf8"),
+    ),
   );
   const modes = ["gold", "jade", "throne"].flatMap((room) =>
     ["east", "south"].flatMap((length) =>
@@ -175,8 +187,11 @@ test("the record index filters on the twelve rules and names them in Chinese", a
   );
   for (const mode of modes) {
     const labelled = new RegExp(`"${mode}": "[^"]*[\\u4e00-\\u9fff][^"]*"`);
-    assert.match(source, labelled, `${mode} has no Chinese label`);
+    assert.match(rules, labelled, `${mode} has no Chinese label`);
   }
+  // One map, two readers. The trends breakdown names the same tokens, and a
+  // second copy would drift the day Majsoul adds a room.
+  assert.match(source, /from "@\/lib\/rules"/);
   // The token itself, not another dash: an unrecognised rule has to stay legible.
   assert.match(source, /RULE_LABELS\[record\.rule\] \?\? record\.rule/);
   // The dropdown is fed from that same map, so it cannot drift out of it.

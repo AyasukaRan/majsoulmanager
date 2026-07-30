@@ -14,7 +14,7 @@
 - `GET /api/v1/downloads/{job_id}`：查询导出进度和下载地址。
 - `GET /api/v1/downloads`：按创建时间倒序列出最近的导出任务。
 - `GET /api/v1/stats`：管理台概览的聚合，包含记录总量与近 24 小时增量、按来源的分布、数据包数量与体积、导出任务状态和 Watch 运行状态；计数不使用 FINAL，重放插入后的合并窗口内可能略高。
-- `GET /api/v1/stats/daily?days=N`：管理台趋势页的逐日分桶，缺口补零，永远返回窗口长度那么多个点、最后一个是今天（UTC）。`records` 与两个字节数按 `received_at`（进索引的时间）分桶，`games` 按 `played_at`（这局牌开打的时间）分桶——一次历史导入会抬高前者而不动后者。窗口上限 365 天，超出的请求被截断而不是拒绝；计数同样不使用 FINAL。
+- `GET /api/v1/stats/series?unit=hour|day&span=N`：管理台趋势页的分桶，缺口补零，永远返回窗口长度那么多个点、最后一个是当前那个桶。`records` 与两个字节数按 `received_at`（进索引的时间）分桶，`games` 按 `played_at`（这局牌开打的时间）分桶——一次历史导入会抬高前者而不动后者。小时桶的 `at` 是 RFC 3339（UTC），天桶是裸日期。上限 `hour` 168、`day` 365，超出的请求被截断而不是拒绝；`unit` 认不出来才是 400。同时返回 `rules`：窗口内开打的对局按 `rule` 分组、局数降序，最多 24 项，与 `points[].games` 是同一批记录。计数同样不使用 FINAL。
 - 内置 majsoul2mjai Watch：在线配置房间、模式、账号密钥引用、代理和轮询频率，展示 UUID 获取与转换状态。
 - 登录与 PB 获取采用版本化进程模块，安装时校验 SHA-256 和协议健康状态，可在线切换、失败回滚。
 - 集成 mihomo：网页配置订阅、刷新 provider、测试节点延迟并切换 Watch 专用节点。
