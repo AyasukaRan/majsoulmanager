@@ -10,6 +10,7 @@ import {
   type RecordPage,
 } from "@/lib/mjai-api";
 import { dayEnd, dayStart, formatDateTime, selectClass } from "@/lib/utils";
+import { RULE_LABELS } from "@/lib/rules";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -39,20 +40,6 @@ const PAGE_SIZE = 50;
  * value outside it still renders as itself, because a rule the console does not
  * recognise is exactly the one worth seeing.
  */
-const RULE_LABELS: Record<string, string> = {
-  "4p-gold-east": "金之间·东风",
-  "4p-gold-south": "金之间·东南",
-  "4p-jade-east": "玉之间·东风",
-  "4p-jade-south": "玉之间·东南",
-  "4p-throne-east": "王座之间·东风",
-  "4p-throne-south": "王座之间·东南",
-  "3p-gold-east": "三麻金·东风",
-  "3p-gold-south": "三麻金·东南",
-  "3p-jade-east": "三麻玉·东风",
-  "3p-jade-south": "三麻玉·东南",
-  "3p-throne-east": "三麻王座·东风",
-  "3p-throne-south": "三麻王座·东南",
-};
 
 type Filters = {
   source: string;

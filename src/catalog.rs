@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::{DateTime, NaiveDateTime, SubsecRound, TimeDelta, Utc};
+use chrono::{DateTime, NaiveDateTime, SubsecRound, TimeDelta, Timelike, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use sqlx::{Row, postgres::PgPoolOptions};
 use thiserror::Error;
@@ -50,19 +50,26 @@ const MIGRATION_LOCK: i64 = 0x6D6A_6169;
 const MAX_REPORTED_SOURCES: usize = 100;
 
 /// The server-side ceiling docs/architecture.md 索引与筛选 asks for, applied to
-/// the trend buckets. Cited by section rather than by line: the neighbouring
-/// constants point at line numbers that the file has since moved out from
-/// under them. Wider than `MAX_QUERY_WINDOW_DAYS` on purpose: that one
-/// bounds a query that returns a row per record, this one returns a row per day
-/// and reads three columns to build them, so a year costs the scan and not the
-/// transfer. It is also the number of points a chart can still draw as a line
-/// rather than a smear.
+/// the daily trend buckets. Cited by section rather than by line: the
+/// neighbouring constants point at line numbers that the file has since moved
+/// out from under them. Wider than `MAX_QUERY_WINDOW_DAYS` on purpose: that one
+/// bounds a query that returns a row per record, this one returns a row per
+/// bucket and reads three columns to build them, so a year costs the scan and
+/// not the transfer.
 const MAX_TREND_DAYS: u32 = 365;
 
-/// What the trends page asks for when the URL says nothing: long enough to show
-/// a collector that stopped a fortnight ago, short enough that every point is a
-/// visible day.
-pub const DEFAULT_TREND_DAYS: u32 = 30;
+/// A week of hourly buckets. The ceiling is the chart rather than the query:
+/// past about this many bars a bucket is thinner than the gap beside it, and a
+/// window that wide is asking a question about days anyway.
+const MAX_TREND_HOURS: u32 = 168;
+
+/// What a caller gets for asking without saying how much.
+pub const DEFAULT_TREND_SPAN: u32 = 30;
+
+/// The parser derives twelve `{players}p-{room}-{length}` tokens, but `rule` is
+/// whatever a collector's own converter wrote into the header, so the panel that
+/// reports it is bounded like the source breakdown beside it.
+const MAX_REPORTED_RULES: usize = 24;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Record {
@@ -877,82 +884,100 @@ impl Catalog {
     /// single afternoon, so a chart drawn on `received_at` alone is one spike
     /// with nothing either side of it, and one drawn on `played_at` alone never
     /// shows that an import happened at all.
-    pub async fn daily(&self, days: u32) -> Result<Vec<DailyPoint>, CatalogError> {
-        let days = days.clamp(1, MAX_TREND_DAYS);
+    pub async fn series(&self, unit: SeriesUnit, span: u32) -> Result<Series, CatalogError> {
+        let span = span.clamp(1, unit.max_span());
         #[derive(Deserialize)]
         struct ReceivedBucket {
-            day: String,
+            bucket: String,
             records: u64,
             raw_bytes: u64,
             compressed_bytes: u64,
         }
         #[derive(Deserialize)]
         struct PlayedBucket {
-            day: String,
+            bucket: String,
             games: u64,
         }
-        // The window is computed once here and sent to both statements rather
-        // than letting each call `now()`: two evaluations either side of
-        // midnight UTC would bucket into two different day ranges, and the
-        // merge below would silently drop the day they disagreed about.
-        let first = Utc::now().date_naive() - TimeDelta::days(i64::from(days) - 1);
-        let params = [("start", first.to_string())];
-        // Compared as `toDate(...)` on both sides rather than against a
-        // timestamp: the column is `DateTime64(3, 'UTC')` and the bound is a
-        // bare date, and this is the one form where the two cannot disagree
-        // about the hour. It costs nothing here — `toDate(received_at)` leads
-        // the sorting key, so the bound still prunes.
+        // The window is computed once here and sent to all three statements
+        // rather than letting each call `now()`: two evaluations either side of
+        // a bucket boundary would cover two different ranges, and the merge
+        // below would silently drop the bucket they disagreed about.
+        let last = unit.truncate(Utc::now());
+        let first = last - unit.step() * (span as i32 - 1);
+        let params = [("start", unit.key(first))];
+        let bucket = unit.clickhouse_fn();
+        // Bounded by the timestamp rather than by the date, because an hourly
+        // window is not a whole number of days. `toDate(received_at)` leads the
+        // sorting key and is monotonic in it, so a bound on `received_at` still
+        // prunes to the days it can touch.
         let received_sql = format!(
-            "SELECT toString(toDate(received_at)) AS day, count() AS records, \
+            "SELECT toString({bucket}(received_at)) AS bucket, count() AS records, \
              sum(raw_size) AS raw_bytes, sum(compressed_size) AS compressed_bytes \
-             FROM {RECORDS_TABLE} WHERE toDate(received_at) >= toDate({{start:String}}) \
-             GROUP BY day"
+             FROM {RECORDS_TABLE} WHERE received_at >= toDateTime({{start:String}}, 'UTC') \
+             GROUP BY bucket"
         );
-        // `played_at` is in no key, so this reads one column of every part —
+        // `played_at` is in no key, so these two read one column of every part —
         // a game played inside the window may have been received at any time,
         // which is exactly what makes the chart worth drawing and also what
         // stops the partition key from helping. Eight bytes a row against a
         // corpus measured in tens of gigabytes; if it ever matters, the answer
-        // is a rollup maintained on insert, not a narrower window. NULL
-        // compares as NULL and drops out, which is the same rows a record
-        // without a start time contributes to a chart of play times: none.
+        // is a rollup maintained on insert, not a narrower window. NULL compares
+        // as NULL and drops out, which is what a record with no start time
+        // contributes to a chart of play times: nothing.
         let played_sql = format!(
-            "SELECT toString(toDate(played_at)) AS day, count() AS games \
-             FROM {RECORDS_TABLE} WHERE toDate(played_at) >= toDate({{start:String}}) \
-             GROUP BY day"
+            "SELECT toString({bucket}(played_at)) AS bucket, count() AS games \
+             FROM {RECORDS_TABLE} WHERE played_at >= toDateTime({{start:String}}, 'UTC') \
+             GROUP BY bucket"
+        );
+        // Grouped on the same rows as `games`, so the breakdown sums to the
+        // series beside it. `rule` is LowCardinality, so this groups over a
+        // dictionary rather than over the strings; the empty rule is kept rather
+        // than filtered, because a panel that silently drops the records whose
+        // mode the converter could not name is a panel whose total is wrong.
+        let rules_sql = format!(
+            "SELECT rule, count() AS games FROM {RECORDS_TABLE} \
+             WHERE played_at >= toDateTime({{start:String}}, 'UTC') \
+             GROUP BY rule ORDER BY games DESC LIMIT {MAX_REPORTED_RULES}"
         );
         // Counted without FINAL, like `stats` and for the same reason: a
         // replayed insert batch is double-counted only until the parts merge,
         // and a chart is the wrong place to pay for a collapse of the whole
         // table on every poll.
-        let (received, played) = tokio::try_join!(
+        let (received, played, rules) = tokio::try_join!(
             self.index.query::<ReceivedBucket>(&received_sql, &params),
             self.index.query::<PlayedBucket>(&played_sql, &params),
+            self.index.query::<RuleCount>(&rules_sql, &params),
         )?;
         let received: HashMap<String, ReceivedBucket> = received
             .into_iter()
-            .map(|bucket| (bucket.day.clone(), bucket))
+            .map(|bucket| (bucket.bucket.clone(), bucket))
             .collect();
         let played: HashMap<String, u64> = played
             .into_iter()
-            .map(|bucket| (bucket.day, bucket.games))
+            .map(|bucket| (bucket.bucket, bucket.games))
             .collect();
-        // Keyed by the day string on both sides, not zipped: the two statements
-        // return only the days they have rows for, so position means nothing
+        // Keyed by the bucket string on both sides, not zipped: the statements
+        // return only the buckets they have rows for, so position means nothing
         // and a zip would shift one series against the other.
-        Ok((0..days)
+        let points = (0..span)
             .map(|offset| {
-                let day = (first + TimeDelta::days(i64::from(offset))).to_string();
-                let bucket = received.get(&day);
-                DailyPoint {
+                let at = first + unit.step() * offset as i32;
+                let key = unit.key(at);
+                let bucket = received.get(&key);
+                SeriesPoint {
+                    at: unit.label(at),
                     records: bucket.map_or(0, |bucket| bucket.records),
                     raw_bytes: bucket.map_or(0, |bucket| bucket.raw_bytes),
                     compressed_bytes: bucket.map_or(0, |bucket| bucket.compressed_bytes),
-                    games: played.get(&day).copied().unwrap_or(0),
-                    day,
+                    games: played.get(&key).copied().unwrap_or(0),
                 }
             })
-            .collect())
+            .collect();
+        Ok(Series {
+            unit,
+            points,
+            rules,
+        })
     }
 }
 
@@ -1187,17 +1212,108 @@ pub struct StorageStats {
     pub compressed_bytes: u64,
 }
 
-/// One day of the console's trend charts. `records` and the byte sums are what
-/// arrived that day, `games` is what was played that day; see `Catalog::daily`
+/// How wide one point of a trend chart is. Everything that differs between the
+/// two granularities lives on this type rather than in `if` arms scattered
+/// through the query: the ceiling, the ClickHouse bucketing function, the string
+/// the two sides join on, and the string the console is handed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SeriesUnit {
+    Hour,
+    Day,
+}
+
+impl SeriesUnit {
+    fn max_span(self) -> u32 {
+        match self {
+            Self::Hour => MAX_TREND_HOURS,
+            Self::Day => MAX_TREND_DAYS,
+        }
+    }
+
+    fn step(self) -> TimeDelta {
+        match self {
+            Self::Hour => TimeDelta::hours(1),
+            Self::Day => TimeDelta::days(1),
+        }
+    }
+
+    fn clickhouse_fn(self) -> &'static str {
+        match self {
+            Self::Hour => "toStartOfHour",
+            Self::Day => "toDate",
+        }
+    }
+
+    /// The start of the bucket `at` falls in. Every window ends on a whole
+    /// bucket, so the last bar is the one still being filled rather than a
+    /// sliver of one.
+    fn truncate(self, at: DateTime<Utc>) -> DateTime<Utc> {
+        match self {
+            Self::Hour => at
+                .with_minute(0)
+                .and_then(|at| at.with_second(0))
+                .unwrap_or(at),
+            Self::Day => at
+                .date_naive()
+                .and_hms_opt(0, 0, 0)
+                .map_or(at, |at| at.and_utc()),
+        }
+        .trunc_subsecs(0)
+    }
+
+    /// What ClickHouse prints for `toString(bucket(column))`, and therefore the
+    /// only string the merge may join on. Rust has to reproduce it exactly: a
+    /// format that differs by so much as the `T` would leave every bucket
+    /// looking empty, with no error anywhere.
+    fn key(self, at: DateTime<Utc>) -> String {
+        match self {
+            Self::Hour => at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            Self::Day => at.format("%Y-%m-%d").to_string(),
+        }
+    }
+
+    /// What the console gets. RFC 3339 for an hour so the browser can render it
+    /// in the reader's own timezone — a bar labelled 05:00 to someone whose
+    /// clock says 13:00 is worse than no label. A day stays a bare date,
+    /// because parsing that as an instant is what shifts it across midnight.
+    fn label(self, at: DateTime<Utc>) -> String {
+        match self {
+            Self::Hour => at.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            Self::Day => at.format("%Y-%m-%d").to_string(),
+        }
+    }
+}
+
+/// One bucket of the console's trend charts. `records` and the byte sums are
+/// what arrived in it, `games` is what was played in it; see `Catalog::series`
 /// for why those are not the same series.
 #[derive(Clone, Debug, Serialize)]
-pub struct DailyPoint {
-    /// `YYYY-MM-DD`, UTC, the same calendar the index buckets on.
-    pub day: String,
+pub struct SeriesPoint {
+    /// `YYYY-MM-DD` for a day, RFC 3339 for an hour. UTC either way.
+    pub at: String,
     pub records: u64,
     pub games: u64,
     pub raw_bytes: u64,
     pub compressed_bytes: u64,
+}
+
+/// Games in the window by the mode they were played in, busiest first.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RuleCount {
+    /// One of the twelve `{players}p-{room}-{length}` tokens, or empty where the
+    /// converter left no mode on the record.
+    pub rule: String,
+    pub games: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Series {
+    pub unit: SeriesUnit,
+    /// Gap-filled: always exactly `span` entries, oldest first.
+    pub points: Vec<SeriesPoint>,
+    /// Counted over the same rows as `points[].games`, so the two agree.
+    pub rules: Vec<RuleCount>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]

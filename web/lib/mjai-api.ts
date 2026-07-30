@@ -89,23 +89,35 @@ export type StatsSummary = {
   };
 };
 
+/** How wide one point of a trend chart is. */
+export type SeriesUnit = "hour" | "day";
+
 /**
- * One day of the trend charts. `records` and the byte sums count what arrived
- * that day, `games` counts what was *played* that day — an import moves the
+ * One bucket of the trend charts. `records` and the byte sums count what
+ * arrived in it, `games` counts what was *played* in it — an import moves the
  * first three without moving the last.
  */
-export type DailyPoint = {
-  /** `YYYY-MM-DD`, UTC. */
-  day: string;
+export type SeriesPoint = {
+  /** `YYYY-MM-DD` for a day, RFC 3339 for an hour. UTC either way. */
+  at: string;
   records: number;
   games: number;
   raw_bytes: number;
   compressed_bytes: number;
 };
 
-/** Gap-filled by the API: always one entry per day in the window, oldest first. */
-export type DailyStats = {
-  days: DailyPoint[];
+/** Games in the window by mode, busiest first; `rule` is "" where unknown. */
+export type RuleCount = {
+  rule: string;
+  games: number;
+};
+
+export type Series = {
+  unit: SeriesUnit;
+  /** Gap-filled by the API: one entry per bucket in the window, oldest first. */
+  points: SeriesPoint[];
+  /** Counted over the same rows as `points[].games`, so the two agree. */
+  rules: RuleCount[];
 };
 
 export type WatchUuidState =
