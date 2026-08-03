@@ -92,7 +92,7 @@ ClickHouse 是记录级索引的事实来源，表定义见 `migrations/clickhou
 
 查询必须包含时间范围或受服务端最大时间窗限制，并使用 `(received_at, record_id)` keyset cursor；禁止深度 `OFFSET`。玩家数组使用 bloom filter 跳数索引。实际数据上线后通过 `EXPLAIN indexes = 1` 和真实分布决定是否增加 projection 或物化列。
 
-聚合查询同样受最大时间窗限制，但那是另一个数：`GET /api/v1/stats/series` 按 `unit` 分别设上限——`day` 365 天（`MAX_TREND_DAYS`）、`hour` 168 小时（`MAX_TREND_HOURS`），都比记录查询的 90 天（`MAX_QUERY_WINDOW_DAYS`）宽或无关。两者限制的不是同一件事——记录查询每命中一行就要传一行，聚合查询每个桶只回一行、读三列把它算出来，所以一年的代价在扫描上而不在传输上。小时桶的上限是图而不是查询定的：再密下去一根柱子比它旁边的缝还细，而那么宽的窗口问的本来就是「天」的问题。
+聚合查询同样受最大时间窗限制，但那是另一个数：`GET /api/v1/stats/series` 按 `unit` 分别设上限——`day` 365 天（`MAX_TREND_DAYS`）、`hour` 168 小时（`MAX_TREND_HOURS`），都比记录查询的 90 天（`MAX_QUERY_WINDOW_DAYS`）宽或无关。两者限制的不是同一件事——记录查询每命中一行就要传一行，聚合查询每个桶只回一行、读三列把它算出来，所以一年的代价在扫描上而不在传输上。小时桶的上限是图而不是查询定的：再密下去一根柱子比它旁边的缝还细，而那么宽的窗口问的本来就是「天」的问题。窗口既可以是「到现在为止的 N 个桶」，也可以是一段明确的 `from`/`to` 区间；后者两端都带上下界，否则一个落在过去的区间仍然要扫到今天、再在合并那一步把多出来的行丢掉。
 
 它按 `toDate(received_at)` 或 `toStartOfHour(received_at)` 分桶，前者是排序键的第一项、后者对它单调，界都能剪枝；`played_at` 那一半不在任何键里，因为一局什么时候打的和它什么时候进的库无关，这既是这条曲线值得画的原因，也是它必须整列扫的原因。同一个 `played_at` 窗口上还多跑一个 `GROUP BY rule` 得到场次分布，`rule` 是 LowCardinality，分组走的是字典而不是字符串。真到了扛不住的那天，答案是插入时维护的 rollup，不是把窗口调窄。
 

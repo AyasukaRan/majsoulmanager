@@ -38,7 +38,7 @@ use crate::{
     catalog::{
         CatalogError, Cursor, DEFAULT_TREND_SPAN, DownloadCounts, DownloadFormat, DownloadJob,
         DownloadRequest, JobState, Record, RecordFilter, RecordStats, RuleFilter, Series,
-        SeriesUnit, StorageStats,
+        SeriesUnit, SeriesWindow, StorageStats,
     },
     indexer::{self, Claimed, IngestError},
     kafka::MAX_PRODUCE_BATCH_BYTES,
@@ -1134,6 +1134,10 @@ async fn get_stats(State(state): State<AppState>) -> Result<Json<StatsResponse>,
 struct TrendQuery {
     unit: Option<SeriesUnit>,
     span: Option<u32>,
+    /// An explicit range, given together or not at all. RFC 3339, like every
+    /// other timestamp this API takes.
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
     /// Comma separated, because `serde_urlencoded` collects a repeated key into
     /// the last value rather than into a list, and a facet with two of its
     /// values chosen is the ordinary case here.
@@ -1158,11 +1162,13 @@ fn rule_facet<T: FromStr>(field: &'static str, value: Option<&str>) -> Result<Ve
         .collect()
 }
 
-/// The buckets behind the trends page. The span is clamped rather than
-/// rejected — `Catalog::series` always answers with exactly as many points as it
-/// covered, so a caller asking for a decade gets the year it is allowed and can
-/// see from the array that it did. An unknown `unit` or mode is a 400 instead,
-/// because neither has a nearest legal value to fall back to.
+/// The buckets behind the trends page. Either `span` buckets ending now, or the
+/// explicit `from`..`to` range — a width is clamped rather than rejected in
+/// both shapes, and the timestamps on the points are how a caller sees which
+/// window it actually got. What *is* refused: an unknown `unit` or mode, a
+/// range that ends before it starts, and half a range. None of those has a
+/// nearest legal value to fall back to, and a filter silently ignored looks
+/// exactly like a filter that found nothing to exclude.
 async fn get_series_stats(
     State(state): State<AppState>,
     Query(query): Query<TrendQuery>,
@@ -1172,16 +1178,17 @@ async fn get_series_stats(
         rooms: rule_facet("room", query.room.as_deref())?,
         lengths: rule_facet("length", query.length.as_deref())?,
     };
-    Ok(Json(
-        state
-            .catalog
-            .series(
-                query.unit.unwrap_or(SeriesUnit::Day),
-                query.span.unwrap_or(DEFAULT_TREND_SPAN),
-                &filter,
-            )
-            .await?,
-    ))
+    let unit = query.unit.unwrap_or(SeriesUnit::Day);
+    let window = match (query.from, query.to) {
+        (Some(from), Some(to)) => SeriesWindow::between(unit, from, to)?,
+        (None, None) => SeriesWindow::recent(unit, query.span.unwrap_or(DEFAULT_TREND_SPAN)),
+        _ => {
+            return Err(ApiError::BadRequest(
+                "from and to have to be given together".into(),
+            ));
+        }
+    };
+    Ok(Json(state.catalog.series(window, &filter).await?))
 }
 
 fn required_header(headers: &HeaderMap, name: &'static str) -> Result<String, ApiError> {
@@ -1223,7 +1230,9 @@ impl From<CatalogError> for ApiError {
     fn from(error: CatalogError) -> Self {
         match error {
             CatalogError::Conflict | CatalogError::Pending => ApiError::Conflict(error.to_string()),
-            CatalogError::WindowTooWide(_) => ApiError::BadRequest(error.to_string()),
+            CatalogError::WindowTooWide(_) | CatalogError::RangeInverted => {
+                ApiError::BadRequest(error.to_string())
+            }
             CatalogError::Index(_) | CatalogError::Store(_) => {
                 ApiError::Internal(error.to_string())
             }

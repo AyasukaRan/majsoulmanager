@@ -168,6 +168,8 @@ pub enum CatalogError {
     Pending,
     #[error("received_at range must not exceed {0} days")]
     WindowTooWide(i64),
+    #[error("the trend range ends before it starts")]
+    RangeInverted,
     #[error("record index is unavailable: {0}")]
     Index(#[from] ClickHouseError),
     #[error("idempotency store is unavailable: {0}")]
@@ -886,11 +888,10 @@ impl Catalog {
     /// shows that an import happened at all.
     pub async fn series(
         &self,
-        unit: SeriesUnit,
-        span: u32,
+        window: SeriesWindow,
         filter: &RuleFilter,
     ) -> Result<Series, CatalogError> {
-        let span = span.clamp(1, unit.max_span());
+        let SeriesWindow { unit, first, span } = window;
         #[derive(Deserialize)]
         struct ReceivedBucket {
             bucket: String,
@@ -903,13 +904,12 @@ impl Catalog {
             bucket: String,
             games: u64,
         }
-        // The window is computed once here and sent to all three statements
-        // rather than letting each call `now()`: two evaluations either side of
-        // a bucket boundary would cover two different ranges, and the merge
-        // below would silently drop the bucket they disagreed about.
-        let last = unit.truncate(Utc::now());
-        let first = last - unit.step() * (span as i32 - 1);
-        let params = [("start", unit.key(first))];
+        // Both bounds are decided once, by `SeriesWindow`, and sent to all
+        // three statements rather than letting each call `now()`: two
+        // evaluations either side of a bucket boundary would cover two
+        // different ranges, and the merge below would silently drop the bucket
+        // they disagreed about.
+        let params = [("start", unit.key(first)), ("end", unit.key(window.end()))];
         let bucket = unit.clickhouse_fn();
         // One clause, three statements. The mode is a property of the record,
         // not of the axis, so the filter has to reach the arrival series and the
@@ -923,7 +923,8 @@ impl Catalog {
         let received_sql = format!(
             "SELECT toString({bucket}(received_at)) AS bucket, count() AS records, \
              sum(raw_size) AS raw_bytes, sum(compressed_size) AS compressed_bytes \
-             FROM {RECORDS_TABLE} WHERE received_at >= toDateTime({{start:String}}, 'UTC'){modes} \
+             FROM {RECORDS_TABLE} WHERE received_at >= toDateTime({{start:String}}, 'UTC') \
+             AND received_at < toDateTime({{end:String}}, 'UTC'){modes} \
              GROUP BY bucket"
         );
         // `played_at` is in no key, so these two read one column of every part —
@@ -936,7 +937,8 @@ impl Catalog {
         // contributes to a chart of play times: nothing.
         let played_sql = format!(
             "SELECT toString({bucket}(played_at)) AS bucket, count() AS games \
-             FROM {RECORDS_TABLE} WHERE played_at >= toDateTime({{start:String}}, 'UTC'){modes} \
+             FROM {RECORDS_TABLE} WHERE played_at >= toDateTime({{start:String}}, 'UTC') \
+             AND played_at < toDateTime({{end:String}}, 'UTC'){modes} \
              GROUP BY bucket"
         );
         // Grouped on the same rows as `games`, so the breakdown sums to the
@@ -946,7 +948,8 @@ impl Catalog {
         // mode the converter could not name is a panel whose total is wrong.
         let rules_sql = format!(
             "SELECT rule, count() AS games FROM {RECORDS_TABLE} \
-             WHERE played_at >= toDateTime({{start:String}}, 'UTC'){modes} \
+             WHERE played_at >= toDateTime({{start:String}}, 'UTC') \
+             AND played_at < toDateTime({{end:String}}, 'UTC'){modes} \
              GROUP BY rule ORDER BY games DESC LIMIT {MAX_REPORTED_RULES}"
         );
         // Counted without FINAL, like `stats` and for the same reason: a
@@ -1292,6 +1295,64 @@ impl SeriesUnit {
             Self::Hour => at.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             Self::Day => at.format("%Y-%m-%d").to_string(),
         }
+    }
+}
+
+/// Which buckets a request covers: a granularity, the first bucket, and how
+/// many of them. Built either from a span ending with the bucket in progress —
+/// what the preset buttons ask for — or from an explicit range, and clamped to
+/// the unit's ceiling either way. Kept as one value so that `series` is handed
+/// a decided window rather than deciding one from three optional parameters.
+#[derive(Clone, Copy, Debug)]
+pub struct SeriesWindow {
+    unit: SeriesUnit,
+    first: DateTime<Utc>,
+    span: u32,
+}
+
+impl SeriesWindow {
+    /// The `span` buckets ending with the one in progress.
+    pub fn recent(unit: SeriesUnit, span: u32) -> Self {
+        let span = span.clamp(1, unit.max_span());
+        let last = unit.truncate(Utc::now());
+        Self {
+            unit,
+            first: last - unit.step() * (span as i32 - 1),
+            span,
+        }
+    }
+
+    /// Every bucket from the one `from` falls in through the one `to` falls in,
+    /// both ends included — a range picked as two calendar days covers both of
+    /// those days rather than the gap between them.
+    ///
+    /// A range wider than the unit allows keeps its end and loses its start.
+    /// Clamped rather than refused, like the span: somebody who asked for two
+    /// years of days is going to read the recent end first, and the timestamps
+    /// on the points say what they actually got.
+    pub fn between(
+        unit: SeriesUnit,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Self, CatalogError> {
+        if to < from {
+            return Err(CatalogError::RangeInverted);
+        }
+        let last = unit.truncate(to);
+        let wanted = (last - unit.truncate(from)).num_seconds() / unit.step().num_seconds() + 1;
+        let span = wanted.clamp(1, i64::from(unit.max_span())) as u32;
+        Ok(Self {
+            unit,
+            first: last - unit.step() * (span as i32 - 1),
+            span,
+        })
+    }
+
+    /// One past the last bucket, which is the exclusive upper bound the
+    /// statements need. Without it a window that ends in the past would still
+    /// scan every part up to today and throw the rows away in the merge.
+    fn end(&self) -> DateTime<Utc> {
+        self.first + self.unit.step() * self.span as i32
     }
 }
 

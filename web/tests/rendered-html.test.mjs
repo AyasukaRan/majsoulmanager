@@ -128,6 +128,14 @@ test("the trend page charts without a charting dependency", async () => {
   assert.match(chart, /RULE_FACETS/);
   assert.match(chart, /params\.set\(facet\.key/);
   assert.match(chart, /aria-pressed=\{on\}/);
+
+  // The window is not only the presets: a custom range is two native date
+  // inputs, and both bounds go out together — half a range would otherwise be
+  // silently reinterpreted as a window ending now.
+  assert.match(chart, /自定义/);
+  assert.match(chart, /type="date"/);
+  assert.match(chart, /params\.set\("from", dayStart/);
+  assert.match(chart, /params\.set\("to", dayEnd/);
   // A window switch swaps 365 points for 7 under a chart that keeps its hover
   // index, and an unclamped index reads past the end of the array.
   assert.match(chart, /Math\.min\(hovered, points\.length - 1\)/);
@@ -235,6 +243,24 @@ test("the record index filters on the twelve rules and names them in Chinese", a
   // One map, two readers. The trends breakdown names the same tokens, and a
   // second copy would drift the day Majsoul adds a room.
   assert.match(source, /from "@\/lib\/rules"/);
+  // Every label is the three facet labels joined, in token order. The first
+  // version named the player count only for 三麻 and dropped 之间 only there,
+  // so half the list read as a different naming scheme from the other half.
+  for (const mode of modes) {
+    const labelled = new RegExp(`"${mode}": "([^"]+)"`).exec(rules);
+    assert.ok(labelled, `${mode} has no label`);
+    assert.equal(
+      labelled[1],
+      [
+        mode.startsWith("4p") ? "四麻" : "三麻",
+        { gold: "金之间", jade: "玉之间", throne: "王座之间" }[
+          mode.split("-")[1]
+        ],
+        mode.endsWith("east") ? "东风" : "东南",
+      ].join("·"),
+      `${mode} is not named as its three facets`,
+    );
+  }
   // The token itself, not another dash: an unrecognised rule has to stay legible.
   assert.match(source, /RULE_LABELS\[record\.rule\] \?\? record\.rule/);
   // The dropdown is fed from that same map, so it cannot drift out of it.

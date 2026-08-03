@@ -2025,6 +2025,99 @@ async fn buckets_ingest_by_arrival_and_games_by_when_they_were_played() {
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 
+/// The custom range. Every preset window ends with the bucket in progress; this
+/// one does not, which is both the point of it and the one thing about it that
+/// can be asserted without counting rows — the window is the buckets that were
+/// asked for, both ends included, wherever they sit.
+#[tokio::test]
+async fn covers_the_range_it_was_given_rather_than_one_ending_now() {
+    let (state, data_dir) = test_state().await;
+    let app = api::router(state);
+    // One clock read: every bound below is derived from it, so the server
+    // truncates values this test chose rather than a moving `now()`.
+    let now = Utc::now();
+
+    let fetch = |query: String| {
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/stats/series?{query}"))
+                    .header(header::AUTHORIZATION, "Bearer test-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let points = |series: &Value| series["points"].as_array().unwrap().clone();
+
+    // Five calendar days, ending five days before today — nowhere near now.
+    let from = now - TimeDelta::days(9);
+    let to = now - TimeDelta::days(5);
+    let window = json_body(
+        fetch(format!(
+            "unit=day&from={}&to={}",
+            from.to_rfc3339(),
+            to.to_rfc3339()
+        ))
+        .await,
+    )
+    .await;
+    let days = points(&window);
+    assert_eq!(days.len(), 5, "{window}");
+    assert_eq!(days[0]["at"], from.date_naive().to_string(), "{window}");
+    assert_eq!(days[4]["at"], to.date_naive().to_string(), "{window}");
+
+    // Both ends included on the hourly side too: two hours apart is three
+    // buckets, not two.
+    let hourly = json_body(
+        fetch(format!(
+            "unit=hour&from={}&to={}",
+            (now - TimeDelta::hours(2)).to_rfc3339(),
+            now.to_rfc3339()
+        ))
+        .await,
+    )
+    .await;
+    assert_eq!(points(&hourly).len(), 3, "{hourly}");
+
+    // Too wide keeps the end and loses the start: the recent side is the side
+    // somebody who asked for two years is going to read first.
+    let clamped = json_body(
+        fetch(format!(
+            "unit=day&from={}&to={}",
+            (now - TimeDelta::days(800)).to_rfc3339(),
+            to.to_rfc3339()
+        ))
+        .await,
+    )
+    .await;
+    let wide = points(&clamped);
+    assert_eq!(wide.len(), 365, "{clamped}");
+    assert_eq!(
+        wide[364]["at"],
+        to.date_naive().to_string(),
+        "the clamp dropped the end instead of the start: {clamped}"
+    );
+
+    // Refused, not quietly reinterpreted. A backwards range is a caller bug,
+    // and half a range would otherwise silently become a window ending now.
+    for bad in [
+        format!("unit=day&from={}&to={}", to.to_rfc3339(), from.to_rfc3339()),
+        format!("unit=day&from={}", from.to_rfc3339()),
+        format!("unit=day&to={}", to.to_rfc3339()),
+    ] {
+        assert_eq!(
+            fetch(bad.clone()).await.status(),
+            StatusCode::BAD_REQUEST,
+            "{bad} was accepted"
+        );
+    }
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
 /// The mode filter. Whether it works is a property of the SQL rather than of
 /// any count, so what is pinned here is the shape a filter forces on the answer
 /// — every token in the breakdown matching every constrained facet, an
