@@ -884,7 +884,12 @@ impl Catalog {
     /// single afternoon, so a chart drawn on `received_at` alone is one spike
     /// with nothing either side of it, and one drawn on `played_at` alone never
     /// shows that an import happened at all.
-    pub async fn series(&self, unit: SeriesUnit, span: u32) -> Result<Series, CatalogError> {
+    pub async fn series(
+        &self,
+        unit: SeriesUnit,
+        span: u32,
+        filter: &RuleFilter,
+    ) -> Result<Series, CatalogError> {
         let span = span.clamp(1, unit.max_span());
         #[derive(Deserialize)]
         struct ReceivedBucket {
@@ -906,6 +911,11 @@ impl Catalog {
         let first = last - unit.step() * (span as i32 - 1);
         let params = [("start", unit.key(first))];
         let bucket = unit.clickhouse_fn();
+        // One clause, three statements. The mode is a property of the record,
+        // not of the axis, so the filter has to reach the arrival series and the
+        // byte sums as well — a page filtered to 三麻 that still charts every
+        // record's bytes is showing two different populations side by side.
+        let modes = filter.predicate();
         // Bounded by the timestamp rather than by the date, because an hourly
         // window is not a whole number of days. `toDate(received_at)` leads the
         // sorting key and is monotonic in it, so a bound on `received_at` still
@@ -913,7 +923,7 @@ impl Catalog {
         let received_sql = format!(
             "SELECT toString({bucket}(received_at)) AS bucket, count() AS records, \
              sum(raw_size) AS raw_bytes, sum(compressed_size) AS compressed_bytes \
-             FROM {RECORDS_TABLE} WHERE received_at >= toDateTime({{start:String}}, 'UTC') \
+             FROM {RECORDS_TABLE} WHERE received_at >= toDateTime({{start:String}}, 'UTC'){modes} \
              GROUP BY bucket"
         );
         // `played_at` is in no key, so these two read one column of every part —
@@ -926,7 +936,7 @@ impl Catalog {
         // contributes to a chart of play times: nothing.
         let played_sql = format!(
             "SELECT toString({bucket}(played_at)) AS bucket, count() AS games \
-             FROM {RECORDS_TABLE} WHERE played_at >= toDateTime({{start:String}}, 'UTC') \
+             FROM {RECORDS_TABLE} WHERE played_at >= toDateTime({{start:String}}, 'UTC'){modes} \
              GROUP BY bucket"
         );
         // Grouped on the same rows as `games`, so the breakdown sums to the
@@ -936,7 +946,7 @@ impl Catalog {
         // mode the converter could not name is a panel whose total is wrong.
         let rules_sql = format!(
             "SELECT rule, count() AS games FROM {RECORDS_TABLE} \
-             WHERE played_at >= toDateTime({{start:String}}, 'UTC') \
+             WHERE played_at >= toDateTime({{start:String}}, 'UTC'){modes} \
              GROUP BY rule ORDER BY games DESC LIMIT {MAX_REPORTED_RULES}"
         );
         // Counted without FINAL, like `stats` and for the same reason: a
@@ -1298,6 +1308,137 @@ pub struct SeriesPoint {
     pub compressed_bytes: u64,
 }
 
+/// The three independent parts of a `{players}p-{room}-{length}` rule token.
+/// They are enums rather than strings on purpose: `RuleFilter` builds the token
+/// list that reaches the `IN` clause by formatting these variants, so the set of
+/// strings that can ever be spliced into that statement is fixed at compile
+/// time and no caller-supplied byte reaches it. The API layer parses into them
+/// and rejects anything else.
+/// Lets `RuleFilter::predicate` write one clause builder for all three facets.
+trait TokenOf {
+    fn token(self) -> &'static str;
+}
+
+macro_rules! rule_facet {
+    ($name:ident { $($variant:ident => $token:literal),+ $(,)? }) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum $name {
+            $($variant),+
+        }
+
+        impl $name {
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+        }
+
+        impl TokenOf for $name {
+            fn token(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $token),+
+                }
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = ();
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                match value {
+                    $($token => Ok(Self::$variant),)+
+                    _ => Err(()),
+                }
+            }
+        }
+    };
+}
+
+rule_facet!(RulePlayers { Three => "3p", Four => "4p" });
+rule_facet!(RuleRoom { Gold => "gold", Jade => "jade", Throne => "throne" });
+rule_facet!(RuleLength { East => "east", South => "south" });
+
+/// Which modes a trend window covers. Each facet is a set, and an empty one
+/// means "all of it".
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuleFilter {
+    pub players: Vec<RulePlayers>,
+    pub rooms: Vec<RuleRoom>,
+    pub lengths: Vec<RuleLength>,
+}
+
+impl RuleFilter {
+    pub fn is_empty(&self) -> bool {
+        self.players.is_empty() && self.rooms.is_empty() && self.lengths.is_empty()
+    }
+
+    /// The `AND` clause this filter adds, empty when it admits everything.
+    ///
+    /// "Everything" has to mean *no predicate*, not "every token I know about":
+    /// `rule` holds whatever a collector's converter wrote, so a record with a
+    /// thirteenth value or none at all belongs in an unfiltered chart. It
+    /// necessarily leaves a filtered one — constraining any facet is a
+    /// statement about a token this one does not have.
+    ///
+    /// One clause per constrained facet, matched against that facet's position
+    /// in the token, rather than one `IN` list of the whole cross product. Two
+    /// reasons, and the first is correctness: a cross product can only name
+    /// tokens this binary already knows, so `players=4p` over a record whose
+    /// converter wrote `4p-throne-hanchan` would drop it — and that record *is*
+    /// four player, which is the only thing the caller asked about. Matching the
+    /// prefix keeps it. The second is size: the clause is now the sum of the
+    /// chosen values rather than their product, so it cannot be inflated by a
+    /// caller repeating one.
+    fn predicate(&self) -> String {
+        /// Canonical, deduplicated, and empty when the facet is unconstrained —
+        /// which is what makes an unconstrained facet add no clause rather than
+        /// a clause listing everything. Filtered through `ALL` rather than
+        /// deduplicated in place so that `?players=3p,3p,3p…` costs one term,
+        /// not one per repeat.
+        fn selected<T: Copy + PartialEq>(chosen: &[T], all: &'static [T]) -> Vec<T> {
+            if chosen.is_empty() {
+                return Vec::new();
+            }
+            all.iter()
+                .copied()
+                .filter(|value| chosen.contains(value))
+                .collect()
+        }
+        // Every byte of every clause comes from the `token()` arms, so the
+        // quoting cannot be escaped by anything a caller sends: a caller picks
+        // *which* tokens are named, never what they say.
+        fn any_of<T: Copy + TokenOf>(
+            values: &[T],
+            test: impl Fn(&'static str) -> String,
+        ) -> Option<String> {
+            let terms: Vec<String> = values.iter().map(|value| test(value.token())).collect();
+            match terms.len() {
+                0 => None,
+                1 => terms.into_iter().next(),
+                _ => Some(format!("({})", terms.join(" OR "))),
+            }
+        }
+        // `{players}p-{room}-{length}`: the player count is the prefix, the
+        // length is the suffix, and the room is the part between two dashes.
+        let clauses: Vec<String> = [
+            any_of(&selected(&self.players, RulePlayers::ALL), |token| {
+                format!("startsWith(rule, '{token}-')")
+            }),
+            any_of(&selected(&self.rooms, RuleRoom::ALL), |token| {
+                format!("position(rule, '-{token}-') > 0")
+            }),
+            any_of(&selected(&self.lengths, RuleLength::ALL), |token| {
+                format!("endsWith(rule, '-{token}')")
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" AND {}", clauses.join(" AND "))
+        }
+    }
+}
+
 /// Games in the window by the mode they were played in, busiest first.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RuleCount {
@@ -1337,6 +1478,81 @@ pub struct DownloadJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unconstrained_mode_filter_adds_no_clause() {
+        // Not "every token I know about": a record whose converter wrote a mode
+        // this binary has never heard of belongs in an unfiltered chart, and
+        // only a filter with no predicate at all keeps it.
+        assert_eq!(RuleFilter::default().predicate(), "");
+    }
+
+    #[test]
+    fn a_mode_filter_constrains_only_the_facets_it_was_given() {
+        let players_only = RuleFilter {
+            players: vec![RulePlayers::Four],
+            ..RuleFilter::default()
+        };
+        assert_eq!(
+            players_only.predicate(),
+            " AND startsWith(rule, '4p-')",
+            "an unconstrained facet must not contribute a clause"
+        );
+
+        let every_facet = RuleFilter {
+            players: vec![RulePlayers::Three],
+            rooms: vec![RuleRoom::Jade],
+            lengths: vec![RuleLength::East],
+        };
+        assert_eq!(
+            every_facet.predicate(),
+            " AND startsWith(rule, '3p-') AND position(rule, '-jade-') > 0 \
+             AND endsWith(rule, '-east')"
+                .replace("             ", "")
+        );
+    }
+
+    #[test]
+    fn a_mode_filter_is_the_sum_of_its_values_and_never_the_product() {
+        // The clause is built from the facets separately, so a caller repeating
+        // one value cannot inflate it. Two rooms is two terms whatever else is
+        // chosen — the earlier cross-product form turned 2,547 repeats of `3p`
+        // into a quarter of a megabyte of SQL and a 500 from ClickHouse.
+        let noisy = RuleFilter {
+            players: vec![RulePlayers::Three; 2_000],
+            rooms: vec![RuleRoom::Throne, RuleRoom::Gold, RuleRoom::Throne],
+            ..RuleFilter::default()
+        };
+        let predicate = noisy.predicate();
+        assert_eq!(
+            predicate,
+            " AND startsWith(rule, '3p-') \
+             AND (position(rule, '-gold-') > 0 OR position(rule, '-throne-') > 0)"
+                .replace("             ", ""),
+            "repeats must collapse and the order must be the declared one"
+        );
+        assert!(predicate.len() < 200, "{} bytes", predicate.len());
+    }
+
+    #[test]
+    fn a_mode_filter_quotes_nothing_a_caller_supplied() {
+        // The whole safety argument for formatting this into SQL: every literal
+        // comes from a `token()` arm. If a facet ever gains a value carrying a
+        // quote or a space, this fails rather than shipping an injection.
+        for token in RulePlayers::ALL
+            .iter()
+            .map(|value| value.token())
+            .chain(RuleRoom::ALL.iter().map(|value| value.token()))
+            .chain(RuleLength::ALL.iter().map(|value| value.token()))
+        {
+            assert!(
+                token
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric()),
+                "{token} is not a bare alphanumeric token"
+            );
+        }
+    }
 
     #[test]
     fn cursor_round_trips_through_its_token() {

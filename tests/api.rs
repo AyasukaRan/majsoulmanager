@@ -2025,6 +2025,127 @@ async fn buckets_ingest_by_arrival_and_games_by_when_they_were_played() {
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 
+/// The mode filter. Whether it works is a property of the SQL rather than of
+/// any count, so what is pinned here is the shape a filter forces on the answer
+/// — every token in the breakdown matching every constrained facet, an
+/// unconstrained facet still spanning all of its values, and a value nobody
+/// defined refused instead of quietly ignored. None of that can be moved by
+/// another test's rows.
+#[tokio::test]
+async fn filters_the_trends_by_the_three_parts_of_a_mode() {
+    let (state, data_dir) = test_state().await;
+    let source = test_source(&data_dir);
+    let app = api::router(state.clone());
+    // A mode of this test's own, so the filtered breakdown has something in it
+    // whatever else the shared index holds. `rule` is read off the start_game
+    // event, which is where a converter that knows the mode puts it.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/records")
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .header(header::CONTENT_TYPE, "application/x-ndjson")
+                .header("idempotency-key", "modes-1")
+                .header("x-mjai-source", &source)
+                .header(
+                    "x-mjai-played-at",
+                    (Utc::now() - TimeDelta::days(2)).to_rfc3339(),
+                )
+                .body(Body::from(
+                    r#"{"type":"start_game","names":["a","b","c"],"rule":"3p-jade-east"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    index_pending(&state).await;
+
+    let fetch = |query: &str| {
+        let app = app.clone();
+        let uri = format!("/api/v1/stats/series?unit=day&span=7{query}");
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, "Bearer test-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let modes = |series: &Value| {
+        series["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|rule| rule["rule"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    let three = json_body(fetch("&players=3p").await).await;
+    let found = modes(&three);
+    assert!(
+        found.iter().any(|rule| rule == "3p-jade-east"),
+        "the mode this test ingested is missing: {three}"
+    );
+    for rule in &found {
+        assert!(
+            rule.starts_with("3p-"),
+            "a four player mode survived players=3p: {three}"
+        );
+    }
+    // The other side of the same claim: constraining one facet must not be
+    // satisfiable by simply returning everything.
+    let four = json_body(fetch("&players=4p").await).await;
+    for rule in modes(&four) {
+        assert!(
+            rule.starts_with("4p-"),
+            "a three player mode survived players=4p: {four}"
+        );
+    }
+
+    // An unconstrained facet spans all of its values, so this is every room and
+    // both lengths — but only three player games.
+    for rule in modes(&three) {
+        assert!(
+            ["gold", "jade", "throne"]
+                .iter()
+                .any(|room| rule.contains(&format!("-{room}-"))),
+            "players=3p answered with a token no room explains: {rule}"
+        );
+    }
+
+    // All three at once names exactly one of the twelve.
+    let one = json_body(fetch("&players=3p&room=jade&length=east").await).await;
+    assert_eq!(
+        modes(&one),
+        vec!["3p-jade-east".to_owned()],
+        "the fully constrained filter did not name one mode: {one}"
+    );
+
+    // Unfiltered, the breakdown keeps the records whose converter named no mode
+    // at all; filtered, it cannot — they are neither three player nor four.
+    for rule in modes(&one) {
+        assert!(!rule.is_empty(), "the empty mode survived a filter: {one}");
+    }
+
+    // Refused, not ignored: a typo that answers with every mode looks exactly
+    // like a filter that found nothing to exclude.
+    for bad in ["&players=5p", "&room=silver", "&length=west"] {
+        assert_eq!(
+            fetch(bad).await.status(),
+            StatusCode::BAD_REQUEST,
+            "{bad} was accepted"
+        );
+    }
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
 /// The export page's list. The job table is shared too, so this asserts its own
 /// job is in the page and that the page is ordered newest first, not how long
 /// the page is.
