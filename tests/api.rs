@@ -5,7 +5,7 @@ use axum::{
     http::{Request, StatusCode, header},
     routing::post,
 };
-use chrono::{DateTime, NaiveDate, SubsecRound, TimeDelta, Utc};
+use chrono::{DateTime, NaiveDate, SecondsFormat, SubsecRound, TimeDelta, Utc};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use mjai_management::auth::{
     AuthError, AuthSettings, CreateUserRequest, LoginRequest, RegisterRequest, UserRole,
@@ -2022,6 +2022,96 @@ async fn buckets_ingest_by_arrival_and_games_by_when_they_were_played() {
     let default = fetch("").await;
     assert_eq!(default["unit"], "day", "{default}");
     assert_eq!(points(&default).len(), 30, "{default}");
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+/// The custom range. Every preset window ends with the bucket in progress; this
+/// one does not, which is both the point of it and the one thing about it that
+/// can be asserted without counting rows — the window is the buckets that were
+/// asked for, both ends included, wherever they sit.
+#[tokio::test]
+async fn covers_the_range_it_was_given_rather_than_one_ending_now() {
+    let (state, data_dir) = test_state().await;
+    let app = api::router(state);
+    // One clock read: every bound below is derived from it, so the server
+    // truncates values this test chose rather than a moving `now()`.
+    let now = Utc::now();
+
+    let fetch = |query: String| {
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/stats/series?{query}"))
+                    .header(header::AUTHORIZATION, "Bearer test-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    // Says which status came back rather than letting `json_body` fail to parse
+    // an error page — "expected value, line 1 column 1" names nothing.
+    let ok = |query: String| async move {
+        let response = fetch(query.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK, "{query}");
+        json_body(response).await
+    };
+    let points = |series: &Value| series["points"].as_array().unwrap().clone();
+    // `Z`, not `+00:00`: an unencoded `+` in a query string is a space by the
+    // time the extractor sees it, and the timestamp then fails to parse. The
+    // console sends `toISOString()`, which is this form.
+    let stamp = |at: DateTime<Utc>| at.to_rfc3339_opts(SecondsFormat::Secs, true);
+
+    // Five calendar days, ending five days before today — nowhere near now.
+    let from = now - TimeDelta::days(9);
+    let to = now - TimeDelta::days(5);
+    let window = ok(format!("unit=day&from={}&to={}", stamp(from), stamp(to))).await;
+    let days = points(&window);
+    assert_eq!(days.len(), 5, "{window}");
+    assert_eq!(days[0]["at"], from.date_naive().to_string(), "{window}");
+    assert_eq!(days[4]["at"], to.date_naive().to_string(), "{window}");
+
+    // Both ends included on the hourly side too: two hours apart is three
+    // buckets, not two.
+    let hourly = ok(format!(
+        "unit=hour&from={}&to={}",
+        stamp(now - TimeDelta::hours(2)),
+        stamp(now)
+    ))
+    .await;
+    assert_eq!(points(&hourly).len(), 3, "{hourly}");
+
+    // Too wide keeps the end and loses the start: the recent side is the side
+    // somebody who asked for two years is going to read first.
+    let clamped = ok(format!(
+        "unit=day&from={}&to={}",
+        stamp(now - TimeDelta::days(800)),
+        stamp(to)
+    ))
+    .await;
+    let wide = points(&clamped);
+    assert_eq!(wide.len(), 365, "{clamped}");
+    assert_eq!(
+        wide[364]["at"],
+        to.date_naive().to_string(),
+        "the clamp dropped the end instead of the start: {clamped}"
+    );
+
+    // Refused, not quietly reinterpreted. A backwards range is a caller bug,
+    // and half a range would otherwise silently become a window ending now.
+    for bad in [
+        format!("unit=day&from={}&to={}", stamp(to), stamp(from)),
+        format!("unit=day&from={}", stamp(from)),
+        format!("unit=day&to={}", stamp(to)),
+    ] {
+        assert_eq!(
+            fetch(bad.clone()).await.status(),
+            StatusCode::BAD_REQUEST,
+            "{bad} was accepted"
+        );
+    }
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 

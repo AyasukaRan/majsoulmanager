@@ -22,8 +22,9 @@ import {
   ruleLabel,
   type RuleFacetKey,
 } from "@/lib/rules";
-import { cn, formatBytes } from "@/lib/utils";
+import { cn, dayEnd, dayStart, formatBytes } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 
 type Window = { label: string; unit: SeriesUnit; span: number };
 
@@ -39,6 +40,28 @@ const WINDOWS: Window[] = [
   { label: "365 天", unit: "day", span: 365 },
 ];
 const DEFAULT_WINDOW = 2;
+
+/** A custom range this many days wide or narrower is bucketed by the hour. */
+const HOURLY_RANGE_DAYS = 7;
+const MS_PER_DAY = 86_400_000;
+
+/** `YYYY-MM-DD` in the reader's own timezone, which is what a date input wants. */
+function calendarDay(at: Date) {
+  return `${at.getFullYear()}-${pad2(at.getMonth() + 1)}-${pad2(at.getDate())}`;
+}
+
+/**
+ * How many days a picked range covers, both ends included — two dates one day
+ * apart is two days of data, not one.
+ */
+function rangeDays(from: string, to: string) {
+  const span =
+    (new Date(`${to}T00:00:00`).getTime() -
+      new Date(`${from}T00:00:00`).getTime()) /
+      MS_PER_DAY +
+    1;
+  return Math.max(1, Math.round(span));
+}
 
 // The chart is drawn at device pixels rather than in a scaled viewBox. A
 // viewBox stretched to the card's width scales everything in it — the first
@@ -180,7 +203,6 @@ function useMeasuredWidth() {
 function TrendChart({
   points,
   unit,
-  span,
   series,
   format,
   tick,
@@ -190,7 +212,6 @@ function TrendChart({
 }: {
   points: SeriesPoint[];
   unit: SeriesUnit;
-  span: number;
   series: SeriesSpec[];
   format: (value: number) => string;
   tick: (value: number) => string;
@@ -412,7 +433,7 @@ function TrendChart({
                     className="fill-muted-foreground text-[10px] tabular-nums"
                   >
                     {points[tickIndex]
-                      ? bucketTick(points[tickIndex], unit, span)
+                      ? bucketTick(points[tickIndex], unit, points.length)
                       : ""}
                   </text>
                 );
@@ -550,30 +571,51 @@ function Tile({
 }
 
 export function StatsTrends() {
-  const [choice, setChoice] = useState(DEFAULT_WINDOW);
+  const [choice, setChoice] = useState<number | "custom">(DEFAULT_WINDOW);
+  const [range, setRange] = useState({ from: "", to: "" });
   const [modes, setModes] =
     useState<Record<RuleFacetKey, string[]>>(NO_RULE_FILTER);
   const [series, setSeries] = useState<Series | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const window_ = WINDOWS[choice];
   const filtered = RULE_FACETS.some((facet) => modes[facet.key].length > 0);
+  const custom = choice === "custom";
+  const picked = custom && range.from !== "" && range.to !== "";
+  // The granularity a custom range implies, rather than another control to
+  // set: a week or less is worth an hour a bar, and past that the hourly
+  // ceiling would silently clip the range the reader just picked.
+  const customUnit: SeriesUnit =
+    picked && rangeDays(range.from, range.to) <= HOURLY_RANGE_DAYS
+      ? "hour"
+      : "day";
+  const unit = custom ? customUnit : WINDOWS[choice as number].unit;
 
   // One string identifies the request, so it is also the only thing the poll
   // has to watch. Depending on the three arrays directly would refetch on every
   // render, because a fresh array is never equal to the last one.
   const search = useMemo(() => {
-    const params = new URLSearchParams({
-      unit: window_.unit,
-      span: String(window_.span),
-    });
+    if (custom && !picked) {
+      // Nothing to ask for yet. Returning null rather than a half range keeps
+      // the last answer on screen instead of replacing it with an error the
+      // reader caused by opening the picker.
+      return null;
+    }
+    const params = new URLSearchParams({ unit });
+    if (custom) {
+      // The bounds are the reader's own calendar days, not UTC's — the same
+      // day the timestamps beside them are rendered in.
+      params.set("from", dayStart(range.from));
+      params.set("to", dayEnd(range.to));
+    } else {
+      params.set("span", String(WINDOWS[choice as number].span));
+    }
     for (const facet of RULE_FACETS) {
       if (modes[facet.key].length > 0) {
         params.set(facet.key, modes[facet.key].join(","));
       }
     }
     return params.toString();
-  }, [window_, modes]);
+  }, [choice, custom, picked, unit, range, modes]);
 
   const toggle = (key: RuleFacetKey, value: string) =>
     setModes((previous) => ({
@@ -591,6 +633,9 @@ export function StatsTrends() {
   // next tick. A flag scoped to the effect blocks only its own repeats, and
   // `live` discards the answer to a window nobody is looking at any more.
   useEffect(() => {
+    if (search === null) {
+      return;
+    }
     let live = true;
     let busy = false;
     const load = async () => {
@@ -656,7 +701,7 @@ export function StatsTrends() {
     };
   }, [series]);
 
-  const bucketName = window_.unit === "hour" ? "小时" : "天";
+  const bucketName = (series?.unit ?? unit) === "hour" ? "小时" : "天";
 
   return (
     <div className="space-y-4">
@@ -676,7 +721,70 @@ export function StatsTrends() {
             {option.label}
           </Button>
         ))}
+        <Button
+          size="sm"
+          variant="ghost"
+          className={cn(
+            "h-7 px-3 text-xs",
+            custom
+              ? "bg-background text-foreground hover:bg-background shadow-sm"
+              : "text-muted-foreground",
+          )}
+          onClick={() => {
+            // Opened onto the last week rather than onto two empty inputs, so
+            // the picker answers with something before it is touched.
+            if (!custom) {
+              const today = new Date();
+              const start = new Date(today);
+              start.setDate(start.getDate() - (HOURLY_RANGE_DAYS - 1));
+              setRange({ from: calendarDay(start), to: calendarDay(today) });
+            }
+            setChoice("custom");
+          }}
+        >
+          自定义
+        </Button>
       </div>
+
+      {custom ? (
+        <div className="flex flex-wrap items-center gap-2 text-xs">
+          <Input
+            type="date"
+            aria-label="起始日期"
+            className="h-7 w-auto text-xs"
+            value={range.from}
+            max={range.to || undefined}
+            onChange={(event) =>
+              setRange((previous) => ({
+                ...previous,
+                from: event.target.value,
+              }))
+            }
+          />
+          <span className="text-muted-foreground">到</span>
+          <Input
+            type="date"
+            aria-label="结束日期"
+            className="h-7 w-auto text-xs"
+            value={range.to}
+            min={range.from || undefined}
+            onChange={(event) =>
+              setRange((previous) => ({ ...previous, to: event.target.value }))
+            }
+          />
+          <span className="text-muted-foreground">
+            {!picked
+              ? "选好起止两天才会查询"
+              : customUnit === "hour"
+                ? `含两端共 ${rangeDays(range.from, range.to)} 天，按小时分桶`
+                : `含两端共 ${count(rangeDays(range.from, range.to))} 天，按天分桶${
+                    rangeDays(range.from, range.to) > 365
+                      ? "；超过 365 天，只画最近的 365 天"
+                      : ""
+                  }`}
+          </span>
+        </div>
+      ) : null}
 
       {/* Multi-select, and an untouched facet means all of it — so "四麻" alone
           is every 四麻 room at every length, not one mode. Filtering on any
@@ -769,7 +877,6 @@ export function StatsTrends() {
             <TrendChart
               points={series.points}
               unit={series.unit}
-              span={window_.span}
               title={`每${bucketName}入库与对局`}
               description={`蓝柱是记录进索引的那${bucketName}，青柱是这局牌开打的那${bucketName}——一次历史导入只抬高前者。`}
               format={count}
@@ -782,7 +889,6 @@ export function StatsTrends() {
             <TrendChart
               points={series.points}
               unit={series.unit}
-              span={window_.span}
               title={`每${bucketName}新增数据量`}
               description="按入库时间统计的牌谱体积，两根柱子的高度差就是 zstd 省下的部分。"
               format={formatBytes}
