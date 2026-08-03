@@ -5,7 +5,7 @@ use axum::{
     http::{Request, StatusCode, header},
     routing::post,
 };
-use chrono::{DateTime, NaiveDate, SubsecRound, TimeDelta, Utc};
+use chrono::{DateTime, NaiveDate, SecondsFormat, SubsecRound, TimeDelta, Utc};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use mjai_management::auth::{
     AuthError, AuthSettings, CreateUserRequest, LoginRequest, RegisterRequest, UserRole,
@@ -2051,20 +2051,23 @@ async fn covers_the_range_it_was_given_rather_than_one_ending_now() {
             .unwrap()
         }
     };
+    // Says which status came back rather than letting `json_body` fail to parse
+    // an error page — "expected value, line 1 column 1" names nothing.
+    let ok = |query: String| async move {
+        let response = fetch(query.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK, "{query}");
+        json_body(response).await
+    };
     let points = |series: &Value| series["points"].as_array().unwrap().clone();
+    // `Z`, not `+00:00`: an unencoded `+` in a query string is a space by the
+    // time the extractor sees it, and the timestamp then fails to parse. The
+    // console sends `toISOString()`, which is this form.
+    let stamp = |at: DateTime<Utc>| at.to_rfc3339_opts(SecondsFormat::Secs, true);
 
     // Five calendar days, ending five days before today — nowhere near now.
     let from = now - TimeDelta::days(9);
     let to = now - TimeDelta::days(5);
-    let window = json_body(
-        fetch(format!(
-            "unit=day&from={}&to={}",
-            from.to_rfc3339(),
-            to.to_rfc3339()
-        ))
-        .await,
-    )
-    .await;
+    let window = ok(format!("unit=day&from={}&to={}", stamp(from), stamp(to))).await;
     let days = points(&window);
     assert_eq!(days.len(), 5, "{window}");
     assert_eq!(days[0]["at"], from.date_naive().to_string(), "{window}");
@@ -2072,27 +2075,21 @@ async fn covers_the_range_it_was_given_rather_than_one_ending_now() {
 
     // Both ends included on the hourly side too: two hours apart is three
     // buckets, not two.
-    let hourly = json_body(
-        fetch(format!(
-            "unit=hour&from={}&to={}",
-            (now - TimeDelta::hours(2)).to_rfc3339(),
-            now.to_rfc3339()
-        ))
-        .await,
-    )
+    let hourly = ok(format!(
+        "unit=hour&from={}&to={}",
+        stamp(now - TimeDelta::hours(2)),
+        stamp(now)
+    ))
     .await;
     assert_eq!(points(&hourly).len(), 3, "{hourly}");
 
     // Too wide keeps the end and loses the start: the recent side is the side
     // somebody who asked for two years is going to read first.
-    let clamped = json_body(
-        fetch(format!(
-            "unit=day&from={}&to={}",
-            (now - TimeDelta::days(800)).to_rfc3339(),
-            to.to_rfc3339()
-        ))
-        .await,
-    )
+    let clamped = ok(format!(
+        "unit=day&from={}&to={}",
+        stamp(now - TimeDelta::days(800)),
+        stamp(to)
+    ))
     .await;
     let wide = points(&clamped);
     assert_eq!(wide.len(), 365, "{clamped}");
@@ -2105,9 +2102,9 @@ async fn covers_the_range_it_was_given_rather_than_one_ending_now() {
     // Refused, not quietly reinterpreted. A backwards range is a caller bug,
     // and half a range would otherwise silently become a window ending now.
     for bad in [
-        format!("unit=day&from={}&to={}", to.to_rfc3339(), from.to_rfc3339()),
-        format!("unit=day&from={}", from.to_rfc3339()),
-        format!("unit=day&to={}", to.to_rfc3339()),
+        format!("unit=day&from={}&to={}", stamp(to), stamp(from)),
+        format!("unit=day&from={}", stamp(from)),
+        format!("unit=day&to={}", stamp(to)),
     ] {
         assert_eq!(
             fetch(bad.clone()).await.status(),
