@@ -146,7 +146,7 @@ ClickHouse 是记录级索引的事实来源，表定义见 `migrations/clickhou
 
 - tar.zst 解码（tar 与 tar.gz 已支持）。
 - packer/indexer 与 exporter worker 二进制：目前是 API 进程内的任务（每 partition 一个）。位点在 PostgreSQL 且没有任何 rebalance，多副本会从同一行位点各消费一遍、互相覆盖，因此现阶段 API 只能单副本。
-- Redpanda 单节点单 partition、无副本：broker 数据卷损坏等于丢掉尚未打包的那一段记录；上线前至少要给这个卷单独的可靠存储或备份。
+- Redpanda 单节点单 partition、无副本：broker 数据损坏等于丢掉尚未打包的那一段记录；上线前至少要给 `$MJAI_STORAGE_ROOT/redpanda` 单独的可靠存储或备份（六份数据都是这个根下的目录，把盘挂到子目录上即可，见 README 的「数据目录与迁移」）。
 - 历史 pack 上传对象存储后本地副本保留，容量按两份算。确认对象存储读取无误之前不删，删除动作留给人工。
 - JWT/RBAC、租户隔离、审计日志和限流。
 - OpenTelemetry 指标、追踪、DLQ 与重放（orphan GC 已实现）。

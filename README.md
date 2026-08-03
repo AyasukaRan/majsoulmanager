@@ -131,9 +131,74 @@ GitHub Actions 分为 `CI` 与 `Release` 两个工作流，共用 `Checks`（Rus
 
 Watch 默认关闭。进入管理台填写 `file:/run/secrets/...` 或 `env:...`
 形式的账号密钥引用后启用；密钥文件内容为 `username,password`。订阅链接由
-后端以 `0600` 权限保存在数据卷中，状态 API 只返回订阅域名。协议模块的打包和
+后端以 `0600` 权限保存在数据目录中，状态 API 只返回订阅域名。协议模块的打包和
 进程接口见 [docs/watch-modules.md](docs/watch-modules.md)。
 本地 Compose 可在 `.env` 设置 `MAJSOUL_ACCOUNTS=username,password`，然后
 在网页选择 `env:MAJSOUL_ACCOUNTS`；生产环境建议改用只读文件 secret。
 
 生产路径不会把每个约 10KB 的 mjson 分别存成 RustFS 对象。打包器把每条记录压成独立 Zstandard frame，再合并为约 256MB 的 `.mjpack`；单条读取根据 ClickHouse 中的 offset/length 发起 Range GET，只下载对应的几 KB。
+
+## 数据目录与迁移
+
+六份持久化数据都是 `MJAI_STORAGE_ROOT`（默认 `./storage`）下的一个目录，不是 Docker
+命名卷。它和 `MJAI_DATA_DIR`（默认 `./data`，`make dev` 直接跑在宿主机上时用的那个）
+不是一回事，也刻意不共用父目录：这里的子目录是 Docker 守护进程建的，属于 root。
+
+| 子目录 | 内容 | 丢了会怎样 |
+| --- | --- | --- |
+| `rustfs/` | `.mjpack` 原始语料 | 不可再生 |
+| `clickhouse/` | 记录级索引 | 同样不可再生。启动时的补索引只扫 `api/packs`，也就是对象存储出现之前的那批本地语料，它不会枚举 RustFS 重建整个索引 |
+| `api/` | 用户、Watch 状态与已发现的 uuid、导出产物、对象存储之前的本地语料 | 账号和 Watch 进度要重来 |
+| `postgres/` | 采集幂等状态和下载任务 | 幂等键重置，重传过的批次会被再收一次 |
+| `redpanda/` | 已回 `202` 但还没打包的记录 | 丢这一段。停掉采集、等消费追平之后它可以是空的 |
+| `mihomo/` | 代理订阅与配置 | 重新填一次订阅 |
+
+要把某一份放到单独的盘上不必改 compose，把盘挂到对应子目录即可——通常是最大的
+`rustfs/`。绑定挂载不归 Docker 管，所以 `docker compose down -v` 也不再会连数据
+一起删。
+
+### 从命名卷迁过来
+
+这套目录布局之前，六份数据是命名卷。切过来要先把内容搬走，在宿主机上以 root 执行。
+**先搬再起**：用新 compose 起过一次的话，新目录里会有空目录甚至新初始化出来的数据，
+搬之前要先删掉。
+
+```bash
+# 1. 停。给 ClickHouse 和 PostgreSQL 时间刷盘，默认的 10 秒不够
+docker compose stop -t 120
+
+# 2. 搬。同一块盘上 mv 是瞬时的，跨盘会退化成拷贝，两种情况都保留属主
+export MJAI_STORAGE_ROOT=/srv/mjai
+mkdir -p "$MJAI_STORAGE_ROOT"
+for name in api postgres clickhouse rustfs redpanda mihomo; do
+  mv "$(docker volume inspect -f '{{.Mountpoint}}' "mjai-management_${name}-data")" \
+     "$MJAI_STORAGE_ROOT/$name"
+done
+
+# 3. 让 .env 指向同一个路径，然后起
+echo "MJAI_STORAGE_ROOT=$MJAI_STORAGE_ROOT" >> .env
+docker compose pull && docker compose up -d
+
+# 4. 确认记录总量和迁移前一致、趋势页有数据之后，再回收空卷
+for name in api postgres clickhouse rustfs redpanda mihomo; do
+  docker volume rm "mjai-management_${name}-data"
+done
+```
+
+### 换机器
+
+```bash
+# 语料是不可变追加的，可以在服务还跑着的时候先同步大头，重复几轮到增量足够小
+rsync -aHAX --numeric-ids /srv/mjai/rustfs/ 新宿主机:/srv/mjai/rustfs/
+
+# 然后停机，整棵树再同步一次。rustfs 这一轮只剩增量，停机窗口就只有其余五份的大小
+docker compose stop -t 120
+rsync -aHAX --numeric-ids --delete /srv/mjai/ 新宿主机:/srv/mjai/
+
+# 新宿主机上带着这个仓库和 .env
+docker compose up -d
+```
+
+`--numeric-ids` 不能省：两台机器上不会有同名的 `postgres`、`clickhouse` 用户，按名字
+映射会把属主写成别人，PostgreSQL 直接拒绝启动。迁移期间只用 `stop`，`down -v` 会删掉
+还没搬走的命名卷。
