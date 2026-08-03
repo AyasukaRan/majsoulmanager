@@ -26,14 +26,16 @@ test:
 # which reads as a broken test rather than as a broker that needed another
 # second.
 #
-# RustFS is started by the second line rather than the first because `up --wait`
-# still exits 1 when any container it started has exited, including the one-shot
-# chown RustFS depends on (docker/compose#10596, open). `run` has no such
-# problem: it honours the same depends_on conditions, so the bucket is only
-# attempted once RustFS reports ready, and a bucket that cannot be created fails
-# here with its own message instead of as an upload error inside a test.
+# Only the two databases are started with `up --wait`, because they are the only
+# two with no one-shot dependency: `up --wait` exits 1 when any container it
+# started has exited, including a chown sidecar that exited 0
+# (docker/compose#10596, open). `run` has no such problem — it honours the same
+# depends_on conditions — so RustFS comes up behind the bucket line and Redpanda
+# behind the retention line, each waiting for the health check its sidecar sits
+# in front of, and each failing here with its own message instead of as a
+# confusing error inside a test.
 test-infra:
-	$(DEV_COMPOSE) up -d --wait postgres clickhouse redpanda
+	$(DEV_COMPOSE) up -d --wait postgres clickhouse
 	$(DEV_COMPOSE) run --rm create-bucket
 	# Not needed by the suite — retention has no bearing on a test that produces
 	# a handful of records. It runs here so that CI executes the sidecar on every

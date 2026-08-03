@@ -1,12 +1,36 @@
 name: mjai-management
 
+# 六份持久化数据都是 MJAI_STORAGE_ROOT 下的目录，而不是命名卷。命名卷藏在
+# /var/lib/docker/volumes 里：想把语料单独放到一块大盘上得去动 daemon 的 data-root，
+# 换一台机器得知道每个卷的内部路径再逐个捞。摊成一棵目录树之后，迁移就是搬这一个
+# 目录，某一份要单独的盘就把盘挂到它对应的子目录上，都不用再改这个文件。
+#
+# 默认的 ./storage 是给本地开发和 CI 的，相对路径由 Compose 按项目目录解析；部署要在
+# .env 里指向一个自己管理的绝对路径。改这个值不会搬走已有数据，迁移步骤见 README。
+#
+# 刻意不叫 ./data：那个是 MJAI_DATA_DIR 的默认值，`cargo run` 直接跑在宿主机上时用
+# 的目录。这里的子目录由 Docker 守护进程创建、属于 root，两者共用一个父目录的话，起
+# 过一次 Compose 之后 `make dev` 就写不进去了。
+
 services:
-  mihomo-perms:
+  # 绑定挂载不像命名卷那样从镜像继承属主：Docker 新建的目录归 root，而 api 和 rustfs
+  # 都以 uid 10001 跑，两个都不会自己修。mihomo 自己是 root 无所谓，但它那份配置是
+  # api 写的，所以同样归 10001。postgres 和 clickhouse 不在这里，它们的 entrypoint
+  # 以 root 起、发现属主不对会自己 chown。
+  #
+  # 顶层目录对了就不再往下走：rustfs 那棵树是整个语料，无条件 chown -R 会让开机成本
+  # 随语料一起长，而属主只在有人拷贝数据时才会丢。
+  storage-perms:
     image: alpine:3.21
     user: root
     volumes:
-      - mihomo-data:/fix_path
-    command: chown -R 10001:10001 /fix_path
+      - ${MJAI_STORAGE_ROOT:-./storage}/api:/fix/api
+      - ${MJAI_STORAGE_ROOT:-./storage}/mihomo:/fix/mihomo
+      - ${MJAI_STORAGE_ROOT:-./storage}/rustfs:/fix/rustfs
+    entrypoint: /bin/sh
+    command: >-
+      -c 'for dir in /fix/api /fix/mihomo /fix/rustfs;
+      do [ "$$(stat -c %u "$$dir")" = 10001 ] || chown -R 10001:10001 "$$dir"; done'
 
   api:
     image: ghcr.io/ayasukaran/majsoulmanager-api:${MJAI_IMAGE_TAG:-latest}
@@ -54,10 +78,10 @@ services:
       MJAI_EMAIL_FROM: ${MJAI_EMAIL_FROM:-noreply@example.com}
     ports: ["${MJAI_API_PORT:-8000}:8000"]
     volumes:
-      - api-data:/var/lib/mjai
-      - mihomo-data:/var/lib/mjai/mihomo
+      - ${MJAI_STORAGE_ROOT:-./storage}/api:/var/lib/mjai
+      - ${MJAI_STORAGE_ROOT:-./storage}/mihomo:/var/lib/mjai/mihomo
     depends_on:
-      mihomo-perms:
+      storage-perms:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
@@ -85,7 +109,7 @@ services:
       api:
         condition: service_healthy
     volumes:
-      - mihomo-data:/root/.config/mihomo
+      - ${MJAI_STORAGE_ROOT:-./storage}/mihomo:/root/.config/mihomo
     restart: unless-stopped
 
   web:
@@ -99,9 +123,9 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # Both initdb mounts only run when the data volume is first created, so on an
+  # Both initdb mounts only run when the data directory is still empty, so on an
   # existing deployment they are dead weight; the API applies the same files at
-  # startup, which is what actually reaches the live volumes.
+  # startup, which is what actually reaches the live databases.
   postgres:
     image: postgres:17-alpine
     environment:
@@ -109,7 +133,7 @@ services:
       POSTGRES_PASSWORD: mjai
       POSTGRES_DB: mjai
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - ${MJAI_STORAGE_ROOT:-./storage}/postgres:/var/lib/postgresql/data
       - ./migrations/postgres.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U mjai"]
@@ -124,7 +148,7 @@ services:
       CLICKHOUSE_USER: mjai
       CLICKHOUSE_PASSWORD: mjai
     volumes:
-      - clickhouse-data:/var/lib/clickhouse
+      - ${MJAI_STORAGE_ROOT:-./storage}/clickhouse:/var/lib/clickhouse
       - ./migrations/clickhouse:/docker-entrypoint-initdb.d:ro
       - ./deploy/clickhouse/listen-ipv4.xml:/etc/clickhouse-server/config.d/zz-listen-ipv4.xml:ro
     healthcheck:
@@ -134,17 +158,10 @@ services:
       retries: 20
     restart: unless-stopped
 
-  rustfs-perms:
-    image: alpine:3.21
-    user: root
-    volumes:
-      - rustfs-data:/fix_path
-    command: chown -R 10001:10001 /fix_path
-
   rustfs:
     image: rustfs/rustfs:latest
     depends_on:
-      rustfs-perms:
+      storage-perms:
         condition: service_completed_successfully
     environment:
       RUSTFS_ACCESS_KEY: rustfsadmin
@@ -152,7 +169,7 @@ services:
       RUSTFS_CONSOLE_ENABLE: "true"
     command: /data
     volumes:
-      - rustfs-data:/data
+      - ${MJAI_STORAGE_ROOT:-./storage}/rustfs:/data
     # Readiness rather than liveness: `/health` answers while the store is
     # still initialising, and both the bucket sidecar and every upload need a
     # store that can actually serve. The endpoints are unauthenticated on the
@@ -186,8 +203,22 @@ services:
       sleep 1; done;
       echo 'mjai-raw bucket could not be created on http://rustfs:9000'; exit 1"
 
+  # 和 storage-perms 同一件事，分开是因为 uid 由镜像自己定义：用它自己的镜像按名字
+  # chown，就不必把一个数字抄到这里、也不会在镜像换 uid 的那天悄悄失配。无条件递归，
+  # 这个目录被 retention 卡在 40GiB 上限内，遍历不了多久。
+  redpanda-perms:
+    image: redpandadata/redpanda:v25.1.3
+    user: root
+    entrypoint: chown
+    command: ["-R", "redpanda:redpanda", "/var/lib/redpanda/data"]
+    volumes:
+      - ${MJAI_STORAGE_ROOT:-./storage}/redpanda:/var/lib/redpanda/data
+
   redpanda:
     image: redpandadata/redpanda:v25.1.3
+    depends_on:
+      redpanda-perms:
+        condition: service_completed_successfully
     command:
       - redpanda
       - start
@@ -204,7 +235,7 @@ services:
       timeout: 5s
       retries: 20
     volumes:
-      - redpanda-data:/var/lib/redpanda/data
+      - ${MJAI_STORAGE_ROOT:-./storage}/redpanda:/var/lib/redpanda/data
     restart: unless-stopped
 
   # Retention is a cluster property, and cluster properties have exactly two ways
@@ -259,11 +290,3 @@ services:
     command: >-
       -c "rpk -X admin.hosts=redpanda:9644 cluster config set --no-confirm retention_bytes=42949672960 &&
       rpk -X admin.hosts=redpanda:9644 cluster config set --no-confirm log_retention_ms=-1"
-
-volumes:
-  api-data:
-  postgres-data:
-  clickhouse-data:
-  rustfs-data:
-  redpanda-data:
-  mihomo-data:
