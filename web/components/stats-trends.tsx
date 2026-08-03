@@ -16,7 +16,12 @@ import {
   type SeriesPoint,
   type SeriesUnit,
 } from "@/lib/mjai-api";
-import { ruleLabel } from "@/lib/rules";
+import {
+  NO_RULE_FILTER,
+  RULE_FACETS,
+  ruleLabel,
+  type RuleFacetKey,
+} from "@/lib/rules";
 import { cn, formatBytes } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 
@@ -546,10 +551,37 @@ function Tile({
 
 export function StatsTrends() {
   const [choice, setChoice] = useState(DEFAULT_WINDOW);
+  const [modes, setModes] =
+    useState<Record<RuleFacetKey, string[]>>(NO_RULE_FILTER);
   const [series, setSeries] = useState<Series | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const window_ = WINDOWS[choice];
+  const filtered = RULE_FACETS.some((facet) => modes[facet.key].length > 0);
+
+  // One string identifies the request, so it is also the only thing the poll
+  // has to watch. Depending on the three arrays directly would refetch on every
+  // render, because a fresh array is never equal to the last one.
+  const search = useMemo(() => {
+    const params = new URLSearchParams({
+      unit: window_.unit,
+      span: String(window_.span),
+    });
+    for (const facet of RULE_FACETS) {
+      if (modes[facet.key].length > 0) {
+        params.set(facet.key, modes[facet.key].join(","));
+      }
+    }
+    return params.toString();
+  }, [window_, modes]);
+
+  const toggle = (key: RuleFacetKey, value: string) =>
+    setModes((previous) => ({
+      ...previous,
+      [key]: previous[key].includes(value)
+        ? previous[key].filter((kept) => kept !== value)
+        : [...previous[key], value],
+    }));
 
   // Everything the poll needs lives inside the effect, one instance per window.
   // The overview's shared in-flight ref would be wrong here: it exists to stop
@@ -567,9 +599,7 @@ export function StatsTrends() {
       }
       busy = true;
       try {
-        const next = await jsonRequest<Series>(
-          `/api/stats/series?unit=${window_.unit}&span=${window_.span}`,
-        );
+        const next = await jsonRequest<Series>(`/api/stats/series?${search}`);
         if (live) {
           setSeries(next);
           setError(null);
@@ -593,7 +623,7 @@ export function StatsTrends() {
       live = false;
       globalThis.clearInterval(timer);
     };
-  }, [window_.unit, window_.span]);
+  }, [search]);
 
   const summary = useMemo(() => {
     const points = series?.points;
@@ -646,6 +676,55 @@ export function StatsTrends() {
             {option.label}
           </Button>
         ))}
+      </div>
+
+      {/* Multi-select, and an untouched facet means all of it — so "四麻" alone
+          is every 四麻 room at every length, not one mode. Filtering on any
+          facet does drop the records whose converter left no mode on them:
+          they are not 三麻 and not 四麻, and a chart that keeps them under
+          either heading is lying about which population it drew. */}
+      <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
+        {RULE_FACETS.map((facet) => (
+          <div key={facet.key} className="flex items-center gap-2">
+            <span className="text-muted-foreground text-xs">{facet.label}</span>
+            {/* The same segmented shape as the window picker above it. An
+                unselected option drawn as bare text is indistinguishable from
+                the label beside it, and nothing on the row then looks
+                clickable — which is the whole point of the row. */}
+            <div className="bg-muted inline-flex rounded-lg p-[3px]">
+              {facet.options.map((option) => {
+                const on = modes[facet.key].includes(option.value);
+                return (
+                  <Button
+                    key={option.value}
+                    size="sm"
+                    variant="ghost"
+                    aria-pressed={on}
+                    className={cn(
+                      "h-7 px-2.5 text-xs",
+                      on
+                        ? "bg-background text-foreground hover:bg-background shadow-sm"
+                        : "text-muted-foreground",
+                    )}
+                    onClick={() => toggle(facet.key, option.value)}
+                  >
+                    {option.label}
+                  </Button>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+        {filtered ? (
+          <Button
+            size="sm"
+            variant="ghost"
+            className="text-muted-foreground h-7 px-2.5 text-xs"
+            onClick={() => setModes(NO_RULE_FILTER)}
+          >
+            清除筛选
+          </Button>
+        ) : null}
       </div>
 
       {error ? (

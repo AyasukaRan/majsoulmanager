@@ -123,7 +123,11 @@ test("the trend page charts without a charting dependency", async () => {
   // The mode breakdown reads the shared label map rather than the raw token.
   assert.match(chart, /ruleLabel/);
   assert.match(chart, /from "@\/lib\/rules"/);
-
+  // The three facets are multi-select and each is sent only when constrained;
+  // an omitted facet is what tells the API to add no predicate at all.
+  assert.match(chart, /RULE_FACETS/);
+  assert.match(chart, /params\.set\(facet\.key/);
+  assert.match(chart, /aria-pressed=\{on\}/);
   // A window switch swaps 365 points for 7 under a chart that keeps its hover
   // index, and an unclamped index reads past the end of the array.
   assert.match(chart, /Math\.min\(hovered, points\.length - 1\)/);
@@ -136,6 +140,45 @@ test("the trend page charts without a charting dependency", async () => {
   assert.match(chart, /tabIndex=\{0\}/);
   assert.match(chart, /ArrowLeft/);
   assert.match(chart, /aria-live="polite"/);
+});
+
+
+/**
+ * The facet values are substrings of the rule token that the API parses and
+ * rejects by name, so this file and `RulePlayers`/`RuleRoom`/`RuleLength` in
+ * `src/catalog.rs` have to agree exactly. A value only the console knows about
+ * is a filter that 400s on click.
+ */
+test("the mode facets match the tokens the API will accept", async () => {
+  const [rules, catalog] = await Promise.all([
+    readFile(new URL("lib/rules.ts", projectRoot), "utf8"),
+    readFile(new URL("../src/catalog.rs", projectRoot), "utf8"),
+  ]);
+  const facets = {
+    RulePlayers: ["3p", "4p"],
+    RuleRoom: ["gold", "jade", "throne"],
+    RuleLength: ["east", "south"],
+  };
+  for (const [name, values] of Object.entries(facets)) {
+    const declared = new RegExp(`rule_facet!\\(${name} \\{([^}]*)\\}`).exec(catalog);
+    assert.ok(declared, `${name} is not declared with rule_facet!`);
+    const tokens = [...declared[1].matchAll(/"([^"]+)"/g)].map((hit) => hit[1]);
+    assert.deepEqual(
+      tokens.sort(),
+      [...values].sort(),
+      `${name} in catalog.rs is not the set the console offers`,
+    );
+  }
+
+  // Both directions. Containment alone would let the console offer a value the
+  // API has never heard of, which is a filter that 400s the moment it is
+  // clicked — exactly the failure this test says it prevents. `value: "` occurs
+  // only inside RULE_FACETS, so the extraction is exact.
+  assert.deepEqual(
+    [...rules.matchAll(/value: "([^"]+)"/g)].map((hit) => hit[1]).sort(),
+    Object.values(facets).flat().sort(),
+    "lib/rules.ts offers a facet value the API will reject",
+  );
 });
 
 /**

@@ -1,6 +1,7 @@
 use std::{
     io::{Read, Seek, Write},
     path::Path,
+    str::FromStr,
 };
 
 use axum::{
@@ -36,8 +37,8 @@ use crate::{
     },
     catalog::{
         CatalogError, Cursor, DEFAULT_TREND_SPAN, DownloadCounts, DownloadFormat, DownloadJob,
-        DownloadRequest, JobState, Record, RecordFilter, RecordStats, Series, SeriesUnit,
-        StorageStats,
+        DownloadRequest, JobState, Record, RecordFilter, RecordStats, RuleFilter, Series,
+        SeriesUnit, StorageStats,
     },
     indexer::{self, Claimed, IngestError},
     kafka::MAX_PRODUCE_BATCH_BYTES,
@@ -1133,23 +1134,51 @@ async fn get_stats(State(state): State<AppState>) -> Result<Json<StatsResponse>,
 struct TrendQuery {
     unit: Option<SeriesUnit>,
     span: Option<u32>,
+    /// Comma separated, because `serde_urlencoded` collects a repeated key into
+    /// the last value rather than into a list, and a facet with two of its
+    /// values chosen is the ordinary case here.
+    players: Option<String>,
+    room: Option<String>,
+    length: Option<String>,
+}
+
+/// Splits one facet and refuses a value it does not know. Not silently ignored:
+/// a typo that answers with every mode looks exactly like a filter that found
+/// nothing to exclude, and the reader has no way to tell which they got.
+fn rule_facet<T: FromStr>(field: &'static str, value: Option<&str>) -> Result<Vec<T>, ApiError> {
+    value
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .filter(|token| !token.is_empty())
+        .map(|token| {
+            token.parse().map_err(|_| {
+                ApiError::BadRequest(format!("{field} does not have a value named {token:?}"))
+            })
+        })
+        .collect()
 }
 
 /// The buckets behind the trends page. The span is clamped rather than
 /// rejected — `Catalog::series` always answers with exactly as many points as it
 /// covered, so a caller asking for a decade gets the year it is allowed and can
-/// see from the array that it did. An unknown `unit` is a 400 from the extractor
-/// instead, because there is no nearest legal granularity to fall back to.
+/// see from the array that it did. An unknown `unit` or mode is a 400 instead,
+/// because neither has a nearest legal value to fall back to.
 async fn get_series_stats(
     State(state): State<AppState>,
     Query(query): Query<TrendQuery>,
 ) -> Result<Json<Series>, ApiError> {
+    let filter = RuleFilter {
+        players: rule_facet("players", query.players.as_deref())?,
+        rooms: rule_facet("room", query.room.as_deref())?,
+        lengths: rule_facet("length", query.length.as_deref())?,
+    };
     Ok(Json(
         state
             .catalog
             .series(
                 query.unit.unwrap_or(SeriesUnit::Day),
                 query.span.unwrap_or(DEFAULT_TREND_SPAN),
+                &filter,
             )
             .await?,
     ))

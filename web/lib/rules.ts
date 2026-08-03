@@ -28,3 +28,47 @@ export const RULE_LABELS: Record<string, string> = {
 export function ruleLabel(rule: string) {
   return RULE_LABELS[rule] ?? (rule || "未知场次");
 }
+
+/**
+ * The three parts a rule token is made of, which are also the three questions
+ * worth asking of it separately: how many players, which room, how long. The
+ * `value`s are the exact substrings the API parses, and it rejects anything
+ * else — so this list and `RulePlayers`/`RuleRoom`/`RuleLength` in
+ * `src/catalog.rs` have to say the same thing.
+ */
+export const RULE_FACETS = [
+  {
+    key: "players" as const,
+    label: "人数",
+    options: [
+      { value: "4p", label: "四麻" },
+      { value: "3p", label: "三麻" },
+    ],
+  },
+  {
+    key: "room" as const,
+    label: "房间",
+    options: [
+      { value: "gold", label: "金之间" },
+      { value: "jade", label: "玉之间" },
+      { value: "throne", label: "王座之间" },
+    ],
+  },
+  {
+    key: "length" as const,
+    label: "场长",
+    options: [
+      { value: "east", label: "东风" },
+      { value: "south", label: "东南" },
+    ],
+  },
+];
+
+export type RuleFacetKey = (typeof RULE_FACETS)[number]["key"];
+
+/** Every facet unset, which the API reads as "no predicate at all". */
+export const NO_RULE_FILTER: Record<RuleFacetKey, string[]> = {
+  players: [],
+  room: [],
+  length: [],
+};
