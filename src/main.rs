@@ -47,6 +47,9 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(backfill::rewrite_record_metadata(state.clone()));
     tokio::spawn(backfill::write_game_scoped_claims(state.clone()));
     tokio::spawn(backfill::score_indexed_records(state.clone()));
+    // Last, and never marked complete: it depends on a collector being up to
+    // serve it, so a boot where the watch is off has to be able to try again.
+    tokio::spawn(backfill::refetch_majsoul_protobufs(state.clone()));
     tokio::spawn(collect_orphans(state.clone()));
     // What the ingest path's backlog ceiling reads. Nothing samples it in the
     // test suite, which is why an unsampled reading of zero has to mean "no

@@ -166,6 +166,39 @@ impl IngestMessage {
         }
     }
 
+    /// Replacement bytes for a record already in the index.
+    ///
+    /// The one constructor that takes `received_at` instead of stamping it, and
+    /// the module documentation is why it has to exist separately rather than
+    /// as a parameter on `new`: that column is the partition key and the head of
+    /// the sorting key, so a message carrying a fresh one writes a *second* row
+    /// rather than converging onto the first. A replayed record must therefore
+    /// never get a new timestamp, which is what `new` guarantees by offering no
+    /// way to supply one.
+    ///
+    /// A re-index is the other case. The record exists, its identity is
+    /// deliberately being kept, and only its bytes are changing — so `record_id`,
+    /// `source` and `received_at` all have to be the ones already stored, or the
+    /// result is two rows for one record instead of one better row. Every caller
+    /// of this reads all three off the index row it is replacing.
+    pub fn reindex(
+        record_id: Uuid,
+        source: &str,
+        received_at: DateTime<Utc>,
+        played_at: Option<DateTime<Utc>>,
+        raw: Vec<u8>,
+        majsoul_pb: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            record_id,
+            source: source.to_owned(),
+            played_at: played_at.map(|at| at.trunc_subsecs(3)),
+            raw,
+            majsoul_pb,
+            received_at: received_at.trunc_subsecs(3),
+        }
+    }
+
     /// The ingest time, which is what the consumer writes as `received_at`.
     pub fn received_at(&self) -> DateTime<Utc> {
         self.received_at

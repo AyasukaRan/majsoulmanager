@@ -195,6 +195,41 @@ pub async fn claim(
     }
 }
 
+/// Replaces the bytes of a record already in the index.
+///
+/// No claim: the record exists, so whatever identity it was claimed under is
+/// already held, and claiming again would answer "duplicate" and refuse. What
+/// this produces is a message carrying the stored `record_id`, `source` and
+/// `received_at` — the three columns of the sorting key — with new bytes, so
+/// the worker packs it afresh and the row converges onto the one already there
+/// through ReplacingMergeTree.
+///
+/// The old pack keeps the old bytes. Nothing points at them any more, but the
+/// pack is shared with other records, so there is nothing to collect and
+/// nothing to delete; the cost is the few kilobytes it goes on holding.
+pub async fn reindex_one(
+    kafka: &Kafka,
+    record: &Record,
+    raw: Vec<u8>,
+    majsoul_pb: Option<Vec<u8>>,
+) -> Result<(), IngestError> {
+    // Parsed before it is produced, for the same reason ingest parses: bytes
+    // the worker cannot read would replace a record that was fine with one that
+    // is not indexed at all.
+    mjai::parse_metadata(&raw)?;
+    kafka
+        .produce(IngestMessage::reindex(
+            record.id,
+            &record.source,
+            record.received_at,
+            record.played_at,
+            raw,
+            majsoul_pb,
+        ))
+        .await?;
+    Ok(())
+}
+
 /// Produces claimed records and returns once the broker has acknowledged them,
 /// which is what makes the `202` a durability claim.
 ///

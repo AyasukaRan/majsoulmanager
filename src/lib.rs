@@ -14,6 +14,7 @@ pub mod mjai;
 pub mod objects;
 pub mod pack;
 pub mod recovery;
+pub mod refetch;
 pub mod replay;
 pub mod watch;
 pub mod watch_log;
@@ -44,6 +45,9 @@ pub struct AppState {
     pub packs: Arc<PackStore>,
     pub watch: Arc<WatchRegistry>,
     pub watch_service: Arc<WatchSupervisor>,
+    /// Where the re-fetch backfill leaves work for a collector to pick up in
+    /// its spare time. Shared rather than owned by either: see `src/refetch.rs`.
+    pub refetch: Arc<refetch::RefetchBroker>,
     pub export_dir: PathBuf,
 }
 
@@ -96,8 +100,10 @@ impl AppState {
             config.mihomo_proxy_url.clone(),
         )?);
         let watch_logs = Arc::new(WatchLogBuffer::default());
+        let refetch = Arc::new(refetch::RefetchBroker::default());
         let dependencies = Arc::new(ManagedWatchDependencies {
             data_dir: data_dir.clone(),
+            refetch: Arc::clone(&refetch),
             catalog: Arc::clone(&catalog),
             kafka: Arc::clone(&kafka),
             registry: Arc::clone(&watch),
@@ -119,6 +125,7 @@ impl AppState {
             objects,
             watch,
             watch_service,
+            refetch,
             config: Arc::new(config),
             export_dir,
         })

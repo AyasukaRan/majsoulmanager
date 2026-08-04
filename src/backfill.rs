@@ -1,7 +1,9 @@
 use crate::{
     AppState,
     catalog::{PlayerGame, Record, RecordFilter},
+    majsoul::convert::GameMetadata,
     mjai::{self, Metadata},
+    refetch::RefetchError,
     replay,
     watch_log::WatchLogLevel,
 };
@@ -587,6 +589,199 @@ async fn score(state: &AppState) -> anyhow::Result<Progress> {
         }
     }
     Ok(progress)
+}
+
+/// Names the pass that re-fetches the protobuf of every record that has none
+/// and replaces its mjai with what the current converter makes of it.
+pub const REFETCH_NAME: &str = "refetch_majsoul_pb";
+
+/// Re-fetches the Mahjong Soul protobuf of every record that has none, converts
+/// it with the current converter, and replaces the record.
+///
+/// Every record already in the index when the converter was fixed carries the
+/// errors it was fixed for and no original to re-derive from. They all carry a
+/// game uuid, though, and fetching a game by uuid is exactly what the collector
+/// does all day — so they can be fetched again.
+///
+/// The record keeps its identity: same `record_id`, same `source`, same
+/// `received_at`. Only the bytes change, and the row converges onto the one
+/// already there. See `indexer::reindex_one`.
+///
+/// Two things make this safe to leave running. It never opens a session of its
+/// own — it asks the collector, which serves it only in time it would have
+/// slept through. And it only replaces a record when the new conversion parses
+/// and carries at least as many events as the stored one, so a truncated or
+/// half-generated paipu cannot overwrite good corpus.
+pub async fn refetch_majsoul_protobufs(state: AppState) {
+    match already_done(&state, REFETCH_NAME).await {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            report(
+                &state,
+                WatchLogLevel::Error,
+                format!("读不到牌谱补抓的完成标记，本次启动不补抓：{error}"),
+            );
+            return;
+        }
+    }
+
+    report(
+        &state,
+        WatchLogLevel::Info,
+        "开始补抓历史牌谱的雀魂原始记录并重新转换".to_owned(),
+    );
+    let progress = match refetch(&state).await {
+        Ok(progress) => progress,
+        Err(error) => {
+            report(
+                &state,
+                WatchLogLevel::Error,
+                format!("牌谱补抓中止，已替换的部分仍然有效，下次启动会接着跑：{error}"),
+            );
+            return;
+        }
+    };
+    // Deliberately no completion marker. Unlike the other passes this one can
+    // stop for a reason that is not about the corpus — the collector was off,
+    // or Mahjong Soul was refusing everything — and a marker written on such a
+    // run would end the re-fetch for good. It is cheap to re-run: a record that
+    // already has a protobuf is skipped without a read.
+    report(
+        &state,
+        WatchLogLevel::Info,
+        format!(
+            "本轮牌谱补抓结束：扫描 {} 条，替换 {} 条，雀魂拒绝 {} 条，读不到字节 {} 条",
+            progress.scanned, progress.rewritten, progress.unparsable, progress.unreadable
+        ),
+    );
+}
+
+async fn refetch(state: &AppState) -> anyhow::Result<Progress> {
+    let mut progress = Progress::default();
+    let mut cursor = None;
+    let mut reported = 0usize;
+    // One record at a time, unlike the other passes. Those are bounded by the
+    // object store and read sixteen at once; this one is bounded by a single
+    // Mahjong Soul session that serves it only in its spare moments, and
+    // several requests in flight would just fill the counter with ones that
+    // time out while the collector works through them at its own pace.
+    loop {
+        let (page, next) = state
+            .catalog
+            .scan(&RecordFilter::default(), cursor, PAGE_SIZE)
+            .await?;
+        for row in &page {
+            progress.scanned += 1;
+            // Already has its original. Skipped without a read, which is what
+            // makes re-running this pass cheap once most of the corpus is done.
+            if row.majsoul_pb.is_some() {
+                continue;
+            }
+            let raw = match state.packs.read(&row.storage).await {
+                Ok(raw) => raw,
+                Err(error) => {
+                    tracing::warn!(record = %row.id, %error, "跳过一条读不到字节的记录");
+                    progress.unreadable += 1;
+                    continue;
+                }
+            };
+            // The uuid names the game to fetch and the header names the mode,
+            // which the converter writes back into `start_game`. Both come from
+            // the record being replaced, so the replacement carries the same
+            // header the original did.
+            let Some((uuid, metadata)) = majsoul_header(&raw) else {
+                progress.unparsable += 1;
+                continue;
+            };
+            let pb = match state.refetch.fetch(&uuid).await {
+                Ok(pb) => pb,
+                // Nobody served it: the watch is off, or every instance is
+                // between sessions. Walking the rest of the corpus three
+                // minutes at a time would be pointless, so the pass stops and
+                // the next boot starts it again.
+                Err(RefetchError::Unserved) => {
+                    anyhow::bail!("没有采集器接手补抓请求，本轮到此为止");
+                }
+                Err(RefetchError::Refused(why)) => {
+                    tracing::info!(record = %row.id, %why, "雀魂拒绝提供这局的牌谱");
+                    progress.unparsable += 1;
+                    continue;
+                }
+            };
+            match reconverted(&pb, &metadata, &raw) {
+                Some(mjai) => {
+                    crate::indexer::reindex_one(&state.kafka, row, mjai, Some(pb)).await?;
+                    progress.rewritten += 1;
+                }
+                None => progress.unparsable += 1,
+            }
+            if progress.scanned - reported >= PROGRESS_EVERY {
+                reported = progress.scanned;
+                report(
+                    state,
+                    WatchLogLevel::Info,
+                    format!(
+                        "牌谱补抓中：扫描 {} 条，替换 {} 条，拒绝或无法转换 {} 条",
+                        progress.scanned, progress.rewritten, progress.unparsable
+                    ),
+                );
+            }
+        }
+        match next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    Ok(progress)
+}
+
+/// The game uuid and the mode header of a stored record.
+fn majsoul_header(raw: &[u8]) -> Option<(String, GameMetadata)> {
+    let events = mjai::events(raw).ok()?;
+    let start = events
+        .iter()
+        .find(|event| event.get("type").and_then(|kind| kind.as_str()) == Some("start_game"))?;
+    let majsoul = start.get("majsoul")?;
+    Some((
+        majsoul.get("uuid")?.as_str()?.to_owned(),
+        GameMetadata {
+            mode_id: majsoul.get("mode_id").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+            room: majsoul
+                .get("room")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+            game_length: majsoul
+                .get("game_length")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+            players: majsoul.get("players").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
+            year: majsoul.get("year").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+        },
+    ))
+}
+
+/// The protobuf converted with today's converter, or `None` if the result is
+/// not safe to put in the corpus's place.
+///
+/// The guard is an event count. A paipu Mahjong Soul generated only partly, or
+/// a conversion that gave up halfway, produces a shorter record — and replacing
+/// a complete game with a truncated one would be a loss dressed up as a repair.
+/// Equal is allowed and expected: the fixed converter adds fields to events, not
+/// events.
+fn reconverted(pb: &[u8], metadata: &GameMetadata, stored: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+
+    let (_, compressed) = crate::majsoul::convert::convert_record_bytes(pb, Some(metadata)).ok()?;
+    let mut mjai = Vec::new();
+    flate2::read::GzDecoder::new(compressed.as_slice())
+        .read_to_end(&mut mjai)
+        .ok()?;
+    let fresh = mjai::events(&mjai).ok()?.len();
+    let before = mjai::events(stored).ok()?.len();
+    (fresh >= before).then_some(mjai)
 }
 
 async fn already_done(state: &AppState, name: &str) -> Result<bool, sqlx::Error> {

@@ -451,6 +451,88 @@ async fn scores_a_game_into_per_player_counters() {
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 
+/// Replacing a record's bytes keeps it one record.
+///
+/// This is the property the whole re-fetch backfill rests on: a re-fetched game
+/// is converted again and written back under the identity it already has, and
+/// `received_at` is the partition key and the head of the sorting key — so a
+/// message carrying a fresh timestamp, or a different source, would leave two
+/// rows for one game rather than one better row. Both would then be returned by
+/// every filter that matched, and counted twice in every aggregate.
+#[tokio::test]
+async fn re_indexing_a_record_replaces_it_rather_than_adding_a_second() {
+    let (state, data_dir) = test_state().await;
+    let source = test_source(&data_dir);
+    let app = api::router(state.clone());
+    let before = r#"{"type":"start_game","names":["a","b","c","d"],"rule":"tonpu"}
+{"type":"start_kyoku","bakaze":"E","kyoku":1}"#;
+    // What a re-conversion produces: the same game with the fields the fixed
+    // converter adds, and a protobuf beside it that the original never had.
+    let after = r#"{"type":"start_game","names":["a","b","c","d"],"rule":"tonpu"}
+{"type":"start_kyoku","bakaze":"E","kyoku":1}
+{"type":"end_game","scores":[25000,25000,25000,25000]}"#;
+    let pb = b"the original this was converted from".to_vec();
+
+    let accepted = mjai_management::indexer::ingest_one(
+        &state.catalog,
+        &state.kafka,
+        &source,
+        "reindex-game",
+        None,
+        before.as_bytes(),
+        None,
+    )
+    .await
+    .unwrap();
+    index_pending(&state).await;
+
+    let stored = state.catalog.get(accepted.id).await.unwrap().unwrap();
+    assert!(stored.majsoul_pb.is_none());
+
+    mjai_management::indexer::reindex_one(
+        &state.kafka,
+        &stored,
+        after.as_bytes().to_vec(),
+        Some(pb.clone()),
+    )
+    .await
+    .unwrap();
+    index_pending(&state).await;
+
+    // One row, not two, and it is the new bytes.
+    assert_eq!(
+        indexed_rows(&state.config, &source).await,
+        1,
+        "the re-index wrote a second row instead of replacing the first"
+    );
+    let replaced = state.catalog.get(accepted.id).await.unwrap().unwrap();
+    assert_eq!(replaced.id, stored.id);
+    assert_eq!(
+        replaced.received_at, stored.received_at,
+        "received_at is the sorting key; a re-index must not move it"
+    );
+    assert_eq!(replaced.source, stored.source);
+    assert_eq!(replaced.event_count, 3);
+    assert_ne!(
+        replaced.storage.pack_key, stored.storage.pack_key,
+        "the replacement is in a new pack, which is why it needs no second key"
+    );
+    assert!(replaced.majsoul_pb.is_some(), "the protobuf came with it");
+
+    let raw = ok(&app, &format!("/api/v1/records/{}/raw", accepted.id)).await;
+    assert_eq!(
+        to_bytes(raw.into_body(), usize::MAX).await.unwrap(),
+        after.as_bytes()
+    );
+    let original = ok(&app, &format!("/api/v1/records/{}/majsoul-pb", accepted.id)).await;
+    assert_eq!(
+        to_bytes(original.into_body(), usize::MAX).await.unwrap(),
+        pb
+    );
+
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
 /// A game has one identity and two ingests of it are one record, whatever
 /// source presented them. Deduplication used to be scoped by the caller's
 /// source, so a game the collector had already stored came back out of an
