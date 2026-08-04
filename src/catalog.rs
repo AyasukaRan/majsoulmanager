@@ -1,12 +1,12 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fmt,
     future::Future,
     str::FromStr,
     time::{Duration, Instant},
 };
 
-use chrono::{DateTime, NaiveDateTime, SubsecRound, TimeDelta, Timelike, Utc};
+use chrono::{DateTime, Datelike, NaiveDateTime, SubsecRound, TimeDelta, Timelike, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use sqlx::{Row, postgres::PgPoolOptions};
 use thiserror::Error;
@@ -1769,6 +1769,13 @@ mod tests {
 
 const PLAYER_GAMES_TABLE: &str = "mjai.player_games";
 
+/// How many months' worth of seat rows may travel in one insert.
+///
+/// ClickHouse's `max_partitions_per_insert_block` defaults to a hundred and
+/// `player_games` is partitioned by month, so this is that limit with room to
+/// spare rather than a tuning choice.
+const MAX_MONTHS_PER_INSERT: usize = 64;
+
 /// One seat of one game as it is stored. Flat because it is one row: the shape
 /// `replay` returns is grouped by game, and this is that shape crossed with the
 /// record's own identity and filters.
@@ -1849,6 +1856,89 @@ pub struct PlayerSummary {
     pub max_han: u64,
 }
 
+/// Seat rows split so that no insert block spans more months than ClickHouse
+/// will accept.
+///
+/// `player_games` is partitioned by `toYYYYMM(played_at)` and ClickHouse refuses
+/// an insert block touching more than `max_partitions_per_insert_block`
+/// partitions — a hundred by default. Nothing written so far has come close,
+/// because everything was collected as it was played and one pack spans an hour
+/// at most. A pass that fetches games *by uuid* has no such property: a page of
+/// a thousand can be spread over every month Mahjong Soul has existed, which is
+/// already about eighty and grows by twelve a year. The whole block would be
+/// rejected, and the records would land with no seat rows behind them.
+///
+/// Grouped by month rather than chunked at a fixed row count, so each insert
+/// carries whole partitions.
+fn month_blocks(games: &[PlayerGame]) -> Vec<String> {
+    let mut by_month: BTreeMap<(i32, u32), Vec<String>> = BTreeMap::new();
+    for game in games {
+        by_month
+            .entry((game.played_at.year(), game.played_at.month()))
+            .or_default()
+            .push(player_game_json(game));
+    }
+    let mut blocks = Vec::new();
+    let mut batch: Vec<String> = Vec::with_capacity(games.len());
+    let mut months = 0usize;
+    for rows in by_month.into_values() {
+        batch.extend(rows);
+        months += 1;
+        if months == MAX_MONTHS_PER_INSERT {
+            blocks.push(std::mem::take(&mut batch).join("\n"));
+            months = 0;
+        }
+    }
+    if !batch.is_empty() {
+        blocks.push(batch.join("\n"));
+    }
+    blocks
+}
+
+#[cfg(test)]
+mod player_game_batching_tests {
+    use super::*;
+
+    fn seat_row(played_at: &str) -> PlayerGame {
+        PlayerGame {
+            record_id: Uuid::new_v4(),
+            played_at: played_at.parse().unwrap(),
+            rule: Some("4p-jade-south".into()),
+            seats: 4,
+            detailed: true,
+            stats: crate::replay::SeatStats::default(),
+        }
+    }
+
+    #[test]
+    fn a_page_spanning_years_is_split_and_loses_no_row() {
+        let months: Vec<PlayerGame> = (0..8)
+            .flat_map(|year| {
+                (1..=12u32).map(move |month| {
+                    seat_row(&format!("20{:02}-{month:02}-01T00:00:00Z", 19 + year))
+                })
+            })
+            .collect();
+        assert_eq!(months.len(), 96, "eight years of monthly partitions");
+
+        let blocks = month_blocks(&months);
+        assert!(blocks.len() > 1, "96 months cannot travel in one block");
+        let lines: usize = blocks.iter().map(|block| block.lines().count()).sum();
+        assert_eq!(lines, 96, "no seat row is dropped by the split");
+
+        // The ordinary case — a pack of games collected as they were played —
+        // still goes in one statement.
+        let live: Vec<PlayerGame> = (1..=4)
+            .map(|seat| seat_row(&format!("2026-08-04T0{seat}:00:00Z")))
+            .collect();
+        assert_eq!(month_blocks(&live).len(), 1);
+        assert!(
+            month_blocks(&[]).is_empty(),
+            "nothing to write, nothing sent"
+        );
+    }
+}
+
 /// A name and how many games it appears in, for the search box.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlayerHit {
@@ -1857,14 +1947,26 @@ pub struct PlayerHit {
 }
 
 impl Catalog {
+    /// Writes seat rows, split so that no single insert block spans more months
+    /// than ClickHouse will accept.
+    ///
+    /// `player_games` is partitioned by `toYYYYMM(played_at)` and ClickHouse
+    /// refuses an insert block touching more than `max_partitions_per_insert_block`
+    /// partitions — a hundred by default. Nothing has ever come close, because
+    /// everything written so far was collected as it was played and a pack
+    /// spans an hour at most. A pass that fetches games *by uuid* has no such
+    /// property: a page of a thousand of them can be spread over every month
+    /// Mahjong Soul has existed, which is already about eighty and grows by
+    /// twelve a year. The whole page would be rejected, and the records
+    /// themselves would land with no seat rows behind them.
+    ///
+    /// Grouped rather than chunked at a fixed size, so each insert carries whole
+    /// months and a page that does span a hundred of them becomes a handful of
+    /// statements instead of one failure.
     pub async fn insert_player_games(&self, games: &[PlayerGame]) -> Result<(), CatalogError> {
-        if games.is_empty() {
-            return Ok(());
+        for block in month_blocks(games) {
+            self.index.insert(PLAYER_GAMES_TABLE, block).await?;
         }
-        let rows: Vec<String> = games.iter().map(player_game_json).collect();
-        self.index
-            .insert(PLAYER_GAMES_TABLE, rows.join("\n"))
-            .await?;
         Ok(())
     }
 
