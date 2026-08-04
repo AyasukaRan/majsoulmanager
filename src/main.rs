@@ -39,13 +39,14 @@ async fn main() -> anyhow::Result<()> {
     // log at error level — the only other symptom of a broken upload is a bucket
     // that quietly stays empty.
     //
-    // The two backfills are spawned together rather than chained because each is
-    // a no-op once its marker is written, and on the one boot where both have
+    // The backfills are spawned together rather than chained because each is a
+    // no-op once its marker is written, and on the one boot where several have
     // work they are reading the same pages of the same index a moment apart,
     // which the object store serves from the same place either way.
     tokio::spawn(upload_legacy_packs(state.clone()));
     tokio::spawn(backfill::rewrite_record_metadata(state.clone()));
     tokio::spawn(backfill::write_game_scoped_claims(state.clone()));
+    tokio::spawn(backfill::score_indexed_records(state.clone()));
     tokio::spawn(collect_orphans(state.clone()));
     // What the ingest path's backlog ceiling reads. Nothing samples it in the
     // test suite, which is why an unsampled reading of zero has to mean "no

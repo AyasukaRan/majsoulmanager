@@ -347,6 +347,110 @@ async fn keeps_the_protobuf_the_collector_converted_from() {
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 
+/// The statistics pipeline end to end: a game is scored while it is packed, the
+/// seat rows reach ClickHouse, and both the search box and the summary read
+/// them back.
+///
+/// The players are named after this test's own source so that the shared index
+/// every test writes into cannot make one run's counters depend on another's.
+#[tokio::test]
+async fn scores_a_game_into_per_player_counters() {
+    let (state, data_dir) = test_state().await;
+    let source = test_source(&data_dir);
+    let app = api::router(state.clone());
+    let names: Vec<String> = (0..4).map(|seat| format!("{source}-p{seat}")).collect();
+    let raw = format!(
+        r#"{{"type":"start_game","names":{names},"rule":"tonpu"}}
+{{"type":"start_kyoku","bakaze":"E","kyoku":1,"oya":0,"honba":0,"kyotaku":0,"scores":[25000,25000,25000,25000],"tehais":[[],[],[],[]]}}
+{{"type":"tsumo","actor":1,"pai":"1m"}}
+{{"type":"reach","actor":1}}
+{{"type":"dahai","actor":1,"pai":"1m","tsumogiri":true}}
+{{"type":"reach_accepted","actor":1}}
+{{"type":"tsumo","actor":3,"pai":"2m"}}
+{{"type":"dahai","actor":3,"pai":"2m","tsumogiri":true}}
+{{"type":"hora","actor":1,"target":3,"pai":"2m","fan":4,"yakuman":false,"yaku_ids":[1,30],"deltas":[0,9000,0,-8000],"scores":[25000,33000,25000,17000]}}
+{{"type":"end_kyoku"}}
+{{"type":"end_game","scores":[25000,33000,25000,17000],"majsoul_result":[{{"seat":0,"total_point":-5000,"grading_score":-10}},{{"seat":1,"total_point":25000,"grading_score":75}},{{"seat":2,"total_point":-5000,"grading_score":-10}},{{"seat":3,"total_point":-15000,"grading_score":-55}}]}}"#,
+        names = serde_json::to_string(&names).unwrap()
+    );
+
+    let response = app
+        .clone()
+        .oneshot(ingest_request(&source, "stats-game", &raw))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    index_pending(&state).await;
+
+    let hits = json_body(ok(&app, &format!("/api/v1/players?q={source}")).await).await;
+    let found: Vec<&str> = hits["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["player"].as_str().unwrap())
+        .collect();
+    assert_eq!(found.len(), 4, "every named seat is searchable: {found:?}");
+    assert!(found.contains(&names[1].as_str()));
+
+    let winner = json_body(
+        ok(
+            &app,
+            &format!("/api/v1/players/stats?player={}&span=365", names[1]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(winner["games"], 1);
+    assert_eq!(
+        winner["detailed_games"], 1,
+        "the record carries a yaku list"
+    );
+    assert_eq!(winner["hands"], 1);
+    assert_eq!(winner["wins"], 1);
+    assert_eq!(winner["wins_tsumo"], 0);
+    assert_eq!(winner["riichi"], 1);
+    assert_eq!(winner["riichi_wins"], 1);
+    assert_eq!(winner["riichi_first"], 1);
+    assert_eq!(winner["riichi_ippatsu"], 1, "yaku id 30 is 一発");
+    // The delta credits the winner with the stick it swept back up; the hand
+    // was worth 8000, not 9000.
+    assert_eq!(winner["win_points"], 8_000);
+    assert_eq!(winner["win_turns"], 1);
+    assert_eq!(winner["placements"][0], 1, "first place, once");
+    assert_eq!(winner["settled_point"], 25_000);
+    assert_eq!(winner["grading_score"], 75);
+
+    let dealt_in = json_body(
+        ok(
+            &app,
+            &format!("/api/v1/players/stats?player={}&span=365", names[3]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(dealt_in["deal_ins"], 1);
+    assert_eq!(dealt_in["deal_in_points"], 8_000);
+    assert_eq!(dealt_in["wins"], 0);
+    assert_eq!(dealt_in["placements"][3], 1, "last place, once");
+
+    // A mode filter reaches this table the same way it reaches the trends, and
+    // this record's rule is not one of the twelve, so every facet excludes it.
+    let filtered = json_body(
+        ok(
+            &app,
+            &format!(
+                "/api/v1/players/stats?player={}&span=365&room=jade",
+                names[1]
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(filtered["games"], 0);
+
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
 /// A game has one identity and two ingests of it are one record, whatever
 /// source presented them. Deduplication used to be scoped by the caller's
 /// source, so a game the collector had already stored came back out of an

@@ -11,6 +11,7 @@ import {
   LogOut,
   Radio,
   Settings,
+  UserRound,
   Users,
 } from "lucide-react";
 import type { SessionUser } from "@/lib/session";
@@ -19,6 +20,7 @@ import { Button } from "@/components/ui/button";
 const nav = [
   { href: "/", label: "概览", icon: CircleGauge },
   { href: "/trends", label: "数据趋势", icon: ChartLine },
+  { href: "/players", label: "玩家战绩", icon: UserRound },
   { href: "/records", label: "牌谱索引", icon: Database },
   { href: "/watch", label: "Watch 服务", icon: Radio },
   { href: "/exports", label: "批量导出", icon: Archive },

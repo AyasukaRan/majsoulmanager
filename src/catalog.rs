@@ -24,7 +24,13 @@ use crate::{
 /// data volume is created. The live volumes already exist, so the application
 /// is the only thing that can still apply them.
 const POSTGRES_SCHEMA: &str = include_str!("../migrations/postgres.sql");
-const CLICKHOUSE_SCHEMA: &str = include_str!("../migrations/clickhouse/001_records.sql");
+/// Applied in order at every boot, each statement separately. Splitting the
+/// schema across files rather than growing one keeps a table's definition, its
+/// comments and its later `ALTER`s in one place.
+const CLICKHOUSE_SCHEMA: [&str; 2] = [
+    include_str!("../migrations/clickhouse/001_records.sql"),
+    include_str!("../migrations/clickhouse/002_player_games.sql"),
+];
 
 const RECORDS_TABLE: &str = "mjai.records";
 const RECORD_COLUMNS: &str = "record_id, source, sha256, received_at, played_at, players, rule, \
@@ -71,6 +77,9 @@ pub const DEFAULT_TREND_SPAN: u32 = 30;
 /// whatever a collector's own converter wrote into the header, so the panel that
 /// reports it is bounded like the source breakdown beside it.
 const MAX_REPORTED_RULES: usize = 24;
+
+/// The search box shows one screen of names, not a directory of the corpus.
+const MAX_PLAYER_HITS: usize = 50;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Record {
@@ -323,6 +332,7 @@ impl Catalog {
         // inside one would cut a statement in half, and a chunk that is only a
         // comment is rejected as an empty query.
         let clickhouse_schema = CLICKHOUSE_SCHEMA
+            .join("\n")
             .lines()
             .filter(|line| !line.trim_start().starts_with("--"))
             .collect::<Vec<_>>()
@@ -1413,6 +1423,17 @@ impl SeriesWindow {
     fn end(&self) -> DateTime<Utc> {
         self.first + self.unit.step() * self.span as i32
     }
+
+    /// The half-open `[start, end)` this window covers, as the strings
+    /// ClickHouse is given. One place builds them, so a query that bounds by
+    /// this window cannot spell the bucket key differently from the one that
+    /// groups by it.
+    fn bounds(&self) -> [(&'static str, String); 2] {
+        [
+            ("start", self.unit.key(self.first)),
+            ("end", self.unit.key(self.end())),
+        ]
+    }
 }
 
 /// One bucket of the console's trend charts. `records` and the byte sums are
@@ -1698,4 +1719,316 @@ mod tests {
             Err(CatalogError::WindowTooWide(MAX_QUERY_WINDOW_DAYS))
         ));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-player statistics
+// ---------------------------------------------------------------------------
+
+const PLAYER_GAMES_TABLE: &str = "mjai.player_games";
+
+/// One seat of one game as it is stored. Flat because it is one row: the shape
+/// `replay` returns is grouped by game, and this is that shape crossed with the
+/// record's own identity and filters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlayerGame {
+    pub record_id: Uuid,
+    pub played_at: DateTime<Utc>,
+    pub rule: Option<String>,
+    pub seats: u8,
+    pub detailed: bool,
+    pub stats: crate::replay::SeatStats,
+}
+
+impl PlayerGame {
+    /// Every seat of one replayed game, stamped with what the index knows about
+    /// the record it came from.
+    ///
+    /// `played_at` falls back to the ingest time: it is the partition key of
+    /// `player_games`, and a record with no `majsoul.start_time` — any mjai log
+    /// that did not come from the converter — would otherwise have nowhere to
+    /// go. Seats with no name are dropped rather than stored under the empty
+    /// string, which would collect every anonymous seat in the corpus into one
+    /// player.
+    pub fn of(record: &Record, game: crate::replay::GameStats) -> Vec<Self> {
+        let played_at = record.played_at.unwrap_or(record.received_at);
+        game.players
+            .into_iter()
+            .filter(|stats| !stats.player.is_empty())
+            .map(|stats| Self {
+                record_id: record.id,
+                played_at: played_at.trunc_subsecs(3),
+                rule: record.rule.clone(),
+                seats: game.seats,
+                detailed: game.detailed,
+                stats,
+            })
+            .collect()
+    }
+}
+
+/// What a filtered set of `player_games` rows sums to. Ratios are left to the
+/// caller so that the denominators stay visible: `hands` for most of them,
+/// `detailed_games` for the four counters an older record cannot fill in.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct PlayerSummary {
+    pub games: u64,
+    pub detailed_games: u64,
+    pub hands: u64,
+    pub hands_as_dealer: u64,
+    pub max_dealer_streak: u64,
+    pub net_points: i64,
+    pub placements: Vec<u64>,
+    pub busted: u64,
+    pub final_score: i64,
+    pub settled_point: i64,
+    pub grading_score: i64,
+    pub wins: u64,
+    pub wins_tsumo: u64,
+    pub win_points: i64,
+    pub win_turns: u64,
+    pub deal_ins: u64,
+    pub deal_in_points: i64,
+    pub riichi: u64,
+    pub riichi_wins: u64,
+    pub riichi_deal_ins: u64,
+    pub riichi_turns: u64,
+    pub riichi_first: u64,
+    pub riichi_chasing: u64,
+    pub riichi_chased: u64,
+    pub riichi_net: i64,
+    pub called: u64,
+    pub called_wins: u64,
+    pub draws: u64,
+    pub draws_tenpai: u64,
+    pub riichi_ippatsu: u64,
+    pub riichi_ura_hits: u64,
+    pub yakuman: u64,
+    pub max_han: u64,
+}
+
+/// A name and how many games it appears in, for the search box.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PlayerHit {
+    pub player: String,
+    pub games: u64,
+}
+
+impl Catalog {
+    pub async fn insert_player_games(&self, games: &[PlayerGame]) -> Result<(), CatalogError> {
+        if games.is_empty() {
+            return Ok(());
+        }
+        let rows: Vec<String> = games.iter().map(player_game_json).collect();
+        self.index
+            .insert(PLAYER_GAMES_TABLE, rows.join("\n"))
+            .await?;
+        Ok(())
+    }
+
+    /// Players whose name contains `query`, busiest first.
+    ///
+    /// A substring match rather than a prefix, because a Mahjong Soul nickname
+    /// is as likely to be recognised by its middle as by its start, and because
+    /// neither can use the sorting key: `player` leads it, but a `LIKE '%x%'`
+    /// prunes nothing. This is a scan of one column, which is what the bloom
+    /// filter cannot help with and what the column store makes affordable.
+    pub async fn search_players(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<PlayerHit>, CatalogError> {
+        #[derive(Deserialize)]
+        struct Row {
+            player: String,
+            games: u64,
+        }
+        let rows: Vec<Row> = self
+            .index
+            .query(
+                &format!(
+                    "SELECT player, uniqExact(record_id) AS games FROM {PLAYER_GAMES_TABLE} \
+                     WHERE positionCaseInsensitiveUTF8(player, {{query:String}}) > 0 \
+                     GROUP BY player ORDER BY games DESC, player ASC LIMIT {}",
+                    limit.clamp(1, MAX_PLAYER_HITS)
+                ),
+                &[("query", query.to_owned())],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| PlayerHit {
+                player: row.player,
+                games: row.games,
+            })
+            .collect())
+    }
+
+    /// Sums one player's rows over a window and a mode filter.
+    ///
+    /// No FINAL, the same as every other count here: a replayed insert converges
+    /// through ReplacingMergeTree, and within the merge window a counter can
+    /// read high. The alternative costs a full merge on every page load.
+    pub async fn player_summary(
+        &self,
+        player: &str,
+        window: SeriesWindow,
+        filter: &RuleFilter,
+    ) -> Result<PlayerSummary, CatalogError> {
+        let modes = filter.predicate();
+        let sql = format!(
+            "SELECT count() AS games, sum(detailed) AS detailed_games, \
+             sum(hands) AS hands, sum(hands_as_dealer) AS hands_as_dealer, \
+             max(max_dealer_streak) AS max_dealer_streak, sum(net_points) AS net_points, \
+             countIf(placement = 1) AS first, countIf(placement = 2) AS second, \
+             countIf(placement = 3) AS third, countIf(placement = 4) AS fourth, \
+             sum(busted) AS busted, sum(final_score) AS final_score, \
+             sum(settled_point) AS settled_point, sum(grading_score) AS grading_score, \
+             sum(wins) AS wins, sum(wins_tsumo) AS wins_tsumo, sum(win_points) AS win_points, \
+             sum(win_turns) AS win_turns, sum(deal_ins) AS deal_ins, \
+             sum(deal_in_points) AS deal_in_points, sum(riichi) AS riichi, \
+             sum(riichi_wins) AS riichi_wins, sum(riichi_deal_ins) AS riichi_deal_ins, \
+             sum(riichi_turns) AS riichi_turns, sum(riichi_first) AS riichi_first, \
+             sum(riichi_chasing) AS riichi_chasing, sum(riichi_chased) AS riichi_chased, \
+             sum(riichi_net) AS riichi_net, sum(called) AS called, \
+             sum(called_wins) AS called_wins, sum(draws) AS draws, \
+             sum(draws_tenpai) AS draws_tenpai, sum(riichi_ippatsu) AS riichi_ippatsu, \
+             sum(riichi_ura_hits) AS riichi_ura_hits, sum(yakuman) AS yakuman, \
+             max(max_han) AS max_han \
+             FROM {PLAYER_GAMES_TABLE} \
+             WHERE player = {{player:String}} \
+             AND played_at >= toDateTime({{start:String}}, 'UTC') \
+             AND played_at < toDateTime({{end:String}}, 'UTC'){modes}"
+        );
+        #[derive(Default, Deserialize)]
+        struct Row {
+            games: u64,
+            detailed_games: u64,
+            hands: u64,
+            hands_as_dealer: u64,
+            max_dealer_streak: u64,
+            net_points: i64,
+            first: u64,
+            second: u64,
+            third: u64,
+            fourth: u64,
+            busted: u64,
+            final_score: i64,
+            settled_point: i64,
+            grading_score: i64,
+            wins: u64,
+            wins_tsumo: u64,
+            win_points: i64,
+            win_turns: u64,
+            deal_ins: u64,
+            deal_in_points: i64,
+            riichi: u64,
+            riichi_wins: u64,
+            riichi_deal_ins: u64,
+            riichi_turns: u64,
+            riichi_first: u64,
+            riichi_chasing: u64,
+            riichi_chased: u64,
+            riichi_net: i64,
+            called: u64,
+            called_wins: u64,
+            draws: u64,
+            draws_tenpai: u64,
+            riichi_ippatsu: u64,
+            riichi_ura_hits: u64,
+            yakuman: u64,
+            max_han: u64,
+        }
+        let rows: Vec<Row> = self
+            .index
+            .query(&sql, &{
+                let mut params = vec![("player", player.to_owned())];
+                params.extend(window.bounds());
+                params
+            })
+            .await?;
+        let row = rows.into_iter().next().unwrap_or_default();
+        Ok(PlayerSummary {
+            games: row.games,
+            detailed_games: row.detailed_games,
+            hands: row.hands,
+            hands_as_dealer: row.hands_as_dealer,
+            max_dealer_streak: row.max_dealer_streak,
+            net_points: row.net_points,
+            placements: vec![row.first, row.second, row.third, row.fourth],
+            busted: row.busted,
+            final_score: row.final_score,
+            settled_point: row.settled_point,
+            grading_score: row.grading_score,
+            wins: row.wins,
+            wins_tsumo: row.wins_tsumo,
+            win_points: row.win_points,
+            win_turns: row.win_turns,
+            deal_ins: row.deal_ins,
+            deal_in_points: row.deal_in_points,
+            riichi: row.riichi,
+            riichi_wins: row.riichi_wins,
+            riichi_deal_ins: row.riichi_deal_ins,
+            riichi_turns: row.riichi_turns,
+            riichi_first: row.riichi_first,
+            riichi_chasing: row.riichi_chasing,
+            riichi_chased: row.riichi_chased,
+            riichi_net: row.riichi_net,
+            called: row.called,
+            called_wins: row.called_wins,
+            draws: row.draws,
+            draws_tenpai: row.draws_tenpai,
+            riichi_ippatsu: row.riichi_ippatsu,
+            riichi_ura_hits: row.riichi_ura_hits,
+            yakuman: row.yakuman,
+            max_han: row.max_han,
+        })
+    }
+}
+
+fn player_game_json(game: &PlayerGame) -> String {
+    let stats = &game.stats;
+    serde_json::json!({
+        "record_id": game.record_id,
+        "seat": stats.seat,
+        "player": stats.player,
+        "played_at": clickhouse_timestamp(game.played_at),
+        // LowCardinality(String) is not nullable, the same as `records.rule`.
+        "rule": game.rule.clone().unwrap_or_default(),
+        "seats": game.seats,
+        "detailed": u8::from(game.detailed),
+        "placement": stats.placement,
+        "final_score": stats.final_score,
+        "settled_point": stats.settled_point,
+        "grading_score": stats.grading_score,
+        "level_id": stats.level_id,
+        "busted": u8::from(stats.busted),
+        "hands": stats.hands,
+        "hands_as_dealer": stats.hands_as_dealer,
+        "max_dealer_streak": stats.max_dealer_streak,
+        "net_points": stats.net_points,
+        "wins": stats.wins,
+        "wins_tsumo": stats.wins_tsumo,
+        "win_points": stats.win_points,
+        "win_turns": stats.win_turns,
+        "deal_ins": stats.deal_ins,
+        "deal_in_points": stats.deal_in_points,
+        "riichi": stats.riichi,
+        "riichi_wins": stats.riichi_wins,
+        "riichi_deal_ins": stats.riichi_deal_ins,
+        "riichi_turns": stats.riichi_turns,
+        "riichi_first": stats.riichi_first,
+        "riichi_chasing": stats.riichi_chasing,
+        "riichi_chased": stats.riichi_chased,
+        "riichi_net": stats.riichi_net,
+        "called": stats.called,
+        "called_wins": stats.called_wins,
+        "draws": stats.draws,
+        "draws_tenpai": stats.draws_tenpai,
+        "riichi_ippatsu": stats.riichi_ippatsu,
+        "riichi_ura_hits": stats.riichi_ura_hits,
+        "yakuman": stats.yakuman,
+        "max_han": stats.max_han,
+    })
+    .to_string()
 }

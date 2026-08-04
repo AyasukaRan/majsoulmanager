@@ -1,7 +1,8 @@
 use crate::{
     AppState,
-    catalog::{Record, RecordFilter},
+    catalog::{PlayerGame, Record, RecordFilter},
     mjai::{self, Metadata},
+    replay,
     watch_log::WatchLogLevel,
 };
 
@@ -425,6 +426,158 @@ async fn scan_game_claims(state: &AppState) -> anyhow::Result<Progress> {
                 format!(
                     "对局幂等认领回填中：已扫描 {} 条，写入认领 {} 条，读不到 {} 条",
                     progress.scanned, progress.rewritten, progress.unreadable
+                ),
+            );
+        }
+        match next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    Ok(progress)
+}
+
+/// Names the pass that scores every record already in the index.
+///
+/// `player_games` is written by the pack worker for everything it packs, which
+/// covers records arriving from now on and nothing else. This is the other
+/// 810,004.
+pub const PLAYER_STATS_NAME: &str = "player_game_stats";
+
+/// Scores every already-indexed record into `player_games`.
+///
+/// Spawned behind the listener like the other two passes and for the same
+/// reason: it reads the bytes of every record ever collected. It writes only to
+/// `player_games`, so the worst a failure costs is a statistics table that is
+/// missing part of the corpus until the next boot re-runs the pass — no record
+/// and no index row can be damaged by it.
+///
+/// Idempotent rather than resumable, the same as the others: a record scored
+/// twice produces byte-identical rows under the same ReplacingMergeTree key,
+/// so a rerun costs the reads and changes nothing.
+pub async fn score_indexed_records(state: AppState) {
+    match already_done(&state, PLAYER_STATS_NAME).await {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            report(
+                &state,
+                WatchLogLevel::Error,
+                format!("读不到玩家战绩回填的完成标记，本次启动不回填：{error}"),
+            );
+            return;
+        }
+    }
+
+    report(
+        &state,
+        WatchLogLevel::Info,
+        "开始为索引中已有的记录统计玩家战绩".to_owned(),
+    );
+    let progress = match score(&state).await {
+        Ok(progress) => progress,
+        Err(error) => {
+            report(
+                &state,
+                WatchLogLevel::Error,
+                format!("玩家战绩回填失败，已写入的部分仍然有效，下次启动会重跑：{error}"),
+            );
+            return;
+        }
+    };
+    if !progress.is_complete() {
+        report(
+            &state,
+            WatchLogLevel::Error,
+            format!(
+                "玩家战绩回填未完成：{} 条记录读不到字节（共扫描 {} 条，写入 {} 条座位行，无法计分 {} 条）。\
+                 下次启动会重跑；若确认这些 pack 已永久丢失，执行 \
+                 INSERT INTO completed_backfills (name) VALUES (\'{PLAYER_STATS_NAME}\') 可以结束重跑",
+                progress.unreadable, progress.scanned, progress.rewritten, progress.unparsable
+            ),
+        );
+        return;
+    }
+    if let Err(error) = mark_done(&state, PLAYER_STATS_NAME).await {
+        report(
+            &state,
+            WatchLogLevel::Error,
+            format!("玩家战绩已回填完成，但完成标记没有写入，下次启动会重跑：{error}"),
+        );
+        return;
+    }
+    report(
+        &state,
+        WatchLogLevel::Info,
+        format!(
+            "玩家战绩回填完成：共扫描 {} 条，写入 {} 条座位行，无法计分跳过 {} 条",
+            progress.scanned, progress.rewritten, progress.unparsable
+        ),
+    );
+}
+
+async fn score(state: &AppState) -> anyhow::Result<Progress> {
+    use futures_util::StreamExt;
+
+    let mut progress = Progress::default();
+    let mut cursor = None;
+    let mut reported = 0usize;
+    loop {
+        // Newest-first like the other two passes, and safe beside live ingest
+        // for the same reason: a row written while the walk is in flight either
+        // sorts above the cursor and is never read, or is read like any other —
+        // and the worker has already scored it into rows this pass would
+        // reproduce exactly.
+        let (page, next) = state
+            .catalog
+            .scan(&RecordFilter::default(), cursor, PAGE_SIZE)
+            .await?;
+        let locations: Vec<_> = page
+            .iter()
+            .enumerate()
+            .map(|(index, row)| (index, row.storage.clone()))
+            .collect();
+        let read = futures_util::stream::iter(locations)
+            .map(|(index, storage)| async move { (index, state.packs.read(&storage).await) })
+            .buffer_unordered(READ_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+
+        let mut games = Vec::with_capacity(read.len() * 4);
+        for (index, bytes) in read {
+            let row = &page[index];
+            let raw = match bytes {
+                Ok(raw) => raw,
+                Err(error) => {
+                    tracing::warn!(record = %row.id, %error, "跳过一条读不到字节的记录");
+                    progress.unreadable += 1;
+                    continue;
+                }
+            };
+            // A record that cannot be scored is an outcome, not a failure: an
+            // mjai log with no hand ever dealt, or one whose seats have no
+            // names, has nothing to attribute. Counted apart from an unreadable
+            // row so that it cannot hold the completion marker hostage.
+            let Some(scored) = mjai::events(&raw)
+                .ok()
+                .and_then(|events| replay::replay(&events))
+            else {
+                progress.unparsable += 1;
+                continue;
+            };
+            games.extend(PlayerGame::of(row, scored));
+        }
+        progress.scanned += page.len();
+        progress.rewritten += games.len();
+        state.catalog.insert_player_games(&games).await?;
+        if progress.scanned - reported >= PROGRESS_EVERY {
+            reported = progress.scanned;
+            report(
+                state,
+                WatchLogLevel::Info,
+                format!(
+                    "玩家战绩回填中：已扫描 {} 条，写入 {} 条座位行，读不到 {} 条，无法计分 {} 条",
+                    progress.scanned, progress.rewritten, progress.unreadable, progress.unparsable
                 ),
             );
         }
