@@ -22,11 +22,12 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
-    catalog::{Catalog, CatalogError, IdempotencyClaim, KeyScope, PbLocation, Record},
+    catalog::{Catalog, CatalogError, IdempotencyClaim, KeyScope, PbLocation, PlayerGame, Record},
     kafka::{IngestMessage, Kafka, KafkaError, PartitionConsumer, commit_offset, load_offset},
     mjai,
     objects::ObjectError,
     pack::{PackError, PackWriter},
+    replay,
 };
 
 /// How long a worker waits after a failed fetch, seal, upload or insert before
@@ -335,6 +336,7 @@ pub fn append_batch(
     writer: &mut PackWriter,
     messages: Vec<IngestMessage>,
     rows: &mut Vec<Record>,
+    player_games: &mut Vec<PlayerGame>,
 ) -> Result<(), IndexError> {
     for message in messages {
         // The worker parses a second time because the message carries only the
@@ -342,6 +344,7 @@ pub fn append_batch(
         // the live collection rate that is nothing; carrying the metadata in
         // the message headers is the upgrade path if this ever becomes the
         // worker's bottleneck.
+        let events = mjai::events(&message.raw).unwrap_or_default();
         let metadata = match mjai::parse_metadata(&message.raw) {
             Ok(metadata) => metadata,
             Err(error) => {
@@ -399,6 +402,16 @@ pub fn append_batch(
             event_count: metadata.event_count,
             storage: location,
         });
+        // Scored here rather than by a later pass over the corpus, because the
+        // bytes are in hand exactly once. A record this cannot score — an mjai
+        // log with no hand ever dealt, or one whose seats are unnamed —
+        // contributes no rows and no error: the record itself is indexed either
+        // way, and the statistics table is allowed to be a subset of it.
+        if let Some(row) = rows.last()
+            && let Some(game) = replay::replay(&events)
+        {
+            player_games.extend(PlayerGame::of(row, game));
+        }
     }
     Ok(())
 }
@@ -429,6 +442,9 @@ pub struct PackWorker {
     seal_failures: u32,
     open: Option<PackWriter>,
     rows: Vec<Record>,
+    /// Scored alongside `rows` and inserted in the same step, so the statistics
+    /// of a pack cannot be committed without the records they describe.
+    player_games: Vec<PlayerGame>,
 }
 
 impl PackWorker {
@@ -456,6 +472,7 @@ impl PackWorker {
             seal_failures: 0,
             open: None,
             rows: Vec::new(),
+            player_games: Vec::new(),
         })
     }
 
@@ -577,7 +594,7 @@ impl PackWorker {
             self.open = Some(self.state.packs.staging_writer(self.partition)?);
         }
         let writer = self.open.as_mut().expect("a writer was just opened");
-        append_batch(writer, messages, &mut self.rows)
+        append_batch(writer, messages, &mut self.rows, &mut self.player_games)
     }
 
     /// Whether the open pack should be sealed now. Checked after a whole
@@ -646,9 +663,17 @@ impl PackWorker {
         }
         let indexed = self.rows.len();
         self.state.catalog.insert_batch(&self.rows).await?;
+        // After the records and before the offset commit, so a crash between
+        // the two replays both: these rows converge through their own
+        // ReplacingMergeTree key exactly as the records do.
+        self.state
+            .catalog
+            .insert_player_games(&self.player_games)
+            .await?;
         commit_offset(&self.postgres, &self.topic, self.partition, self.cursor).await?;
         self.committed = self.cursor;
         self.rows.clear();
+        self.player_games.clear();
         tracing::info!(
             partition = self.partition,
             pack = key,
@@ -673,6 +698,7 @@ impl PackWorker {
             tracing::warn!(path = ?writer.path(), %error, "could not discard the staged pack");
         }
         self.rows.clear();
+        self.player_games.clear();
         self.cursor = self.committed;
     }
 }
@@ -837,7 +863,7 @@ mod tests {
             .map(|name| IngestMessage::new(Uuid::new_v4(), "watch-cn", None, record(name), None))
             .collect();
         let mut rows = Vec::new();
-        append_batch(&mut writer, messages.clone(), &mut rows).unwrap();
+        append_batch(&mut writer, messages.clone(), &mut rows, &mut Vec::new()).unwrap();
 
         assert_eq!(rows.len(), 2);
         for (row, message) in rows.iter().zip(&messages) {
@@ -878,7 +904,13 @@ mod tests {
         let without = IngestMessage::new(Uuid::new_v4(), "collector", None, record("b"), None);
 
         let mut rows = Vec::new();
-        append_batch(&mut writer, vec![with.clone(), without], &mut rows).unwrap();
+        append_batch(
+            &mut writer,
+            vec![with.clone(), without],
+            &mut rows,
+            &mut Vec::new(),
+        )
+        .unwrap();
 
         let stored = rows[0].majsoul_pb.as_ref().expect("protobuf was kept");
         assert_eq!(stored.raw_size as usize, pb.len());
@@ -910,6 +942,7 @@ mod tests {
             &mut packs.staging_writer(0).unwrap(),
             vec![message.clone()],
             &mut rows,
+            &mut Vec::new(),
         )
         .unwrap();
         // The same message consumed again, as a replay of an uncommitted offset
@@ -920,6 +953,7 @@ mod tests {
             &mut packs.staging_writer(0).unwrap(),
             vec![message.clone()],
             &mut replayed,
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -947,6 +981,7 @@ mod tests {
                 IngestMessage::new(Uuid::new_v4(), "watch-cn", None, record("a"), None),
             ],
             &mut rows,
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(rows.len(), 1);
@@ -971,6 +1006,7 @@ mod tests {
                 IngestMessage::new(Uuid::new_v4(), "s", None, record("b"), None),
             ],
             &mut rows,
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(rows[0].played_at, Some(override_at));

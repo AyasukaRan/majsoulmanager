@@ -16,6 +16,8 @@
 - `GET /api/v1/downloads`：按创建时间倒序列出最近的导出任务。
 - `GET /api/v1/stats`：管理台概览的聚合，包含记录总量与近 24 小时增量、按来源的分布、数据包数量与体积、导出任务状态和 Watch 运行状态；计数不使用 FINAL，重放插入后的合并窗口内可能略高。
 - `GET /api/v1/stats/series?unit=hour|day&span=N`：管理台趋势页的分桶，缺口补零，永远返回窗口长度那么多个点、最后一个是当前那个桶。`records` 与两个字节数按 `received_at`（进索引的时间）分桶，`games` 按 `played_at`（这局牌开打的时间）分桶——一次历史导入会抬高前者而不动后者。小时桶的 `at` 是 RFC 3339（UTC），天桶是裸日期。窗口有两种写法：`span=N` 表示到当前这个桶为止的 N 个桶；`from`/`to`（RFC 3339，必须成对给）表示一段明确的区间，两端所在的桶都包含在内。上限 `hour` 168、`day` 365，两种写法超出上限都是截断而不是拒绝——区间写法保留 `to` 那一端、砍掉起点。`unit` 认不出来、区间反了、只给了一半，这三种才是 400。同时返回 `rules`：窗口内开打的对局按 `rule` 分组、局数降序，最多 24 项，与 `points[].games` 是同一批记录。计数同样不使用 FINAL。另有 `players`/`room`/`length` 三个逗号分隔的多选筛选（如 `players=4p&room=jade,throne`），分别匹配 `{players}p-{room}-{length}` 的三段：留空表示该段不限、三段全空则不加任何条件，非空的段之间取交集。认不出来的取值和认不出来的 `unit` 一样是 400 而不是被忽略。注意只要筛了任意一段，`rule` 不是这个形状的记录（转换器没写模式、或写了第十三种值）就必然被排除——它们不属于其中任何一段。
+- `GET /api/v1/players?q=`：昵称包含该子串的玩家，按对局数降序，最多 50 个。留空表示全部，也就是出场最多的那些。
+- `GET /api/v1/players/stats?player=`：一个玩家在某个窗口内的计数。窗口与场次筛选的写法和 `/stats/series` 完全一致（`span=N` 或 `from`/`to`，加 `players`/`room`/`length`）。玩家名是查询参数不是路径段——雀魂昵称里斜杠、问号、百分号都合法。返回的是计数不是比率，分母跟着一起返回：多数指标除以 `hands`，而一发率、里宝率、流听率、役满、最大番数和精算要除以 `detailed_games`——更早转换的记录没有这些字段，那里的 0 表示「不知道」而不是「没发生」。每条记录的每个座位在打包时就被 `src/replay.rs` 计过分写进 `mjai.player_games`，历史记录由启动时的一次性回填补上。
 - 内置 majsoul2mjai Watch：在线配置房间、模式、账号密钥引用、代理和轮询频率，展示 UUID 获取与转换状态。
 - PB 到 mjai 的转换保留雀魂给出的记分信息：`hora` 带 `fan`/`yakuman`/`riichi`/`yakus`/`yaku_ids`/`dora_markers`/`uradora_markers`，杠翻出的新宝牌指示牌作为 `dora` 事件补上，`ryukyoku` 带 `tenpais` 和每座位的分数变动，`end_game` 带最终点数与精算（`majsoul_result` 里有 `total_point`/`part_point_1`/`grading_score`）。这些字段只出现在此后转换的记录上；更早的记录形状不变，读取方要能同时接受两种。
 - 登录与 PB 获取采用版本化进程模块，安装时校验 SHA-256 和协议健康状态，可在线切换、失败回滚。

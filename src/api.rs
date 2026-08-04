@@ -37,8 +37,8 @@ use crate::{
     },
     catalog::{
         CatalogError, Cursor, DEFAULT_TREND_SPAN, DownloadCounts, DownloadFormat, DownloadJob,
-        DownloadRequest, JobState, Record, RecordFilter, RecordStats, RuleFilter, Series,
-        SeriesUnit, SeriesWindow, StorageStats,
+        DownloadRequest, JobState, PlayerHit, PlayerSummary, Record, RecordFilter, RecordStats,
+        RuleFilter, Series, SeriesUnit, SeriesWindow, StorageStats,
     },
     indexer::{self, Claimed, IngestError},
     kafka::MAX_PRODUCE_BATCH_BYTES,
@@ -81,6 +81,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/records/{id}/majsoul-pb", get(get_majsoul_pb))
         .route("/api/v1/stats", get(get_stats))
         .route("/api/v1/stats/series", get(get_series_stats))
+        .route("/api/v1/players", get(search_players))
+        .route("/api/v1/players/stats", get(get_player_stats))
         .route(
             "/api/v1/downloads",
             post(create_download).get(list_downloads),
@@ -1232,6 +1234,89 @@ async fn get_series_stats(
         }
     };
     Ok(Json(state.catalog.series(window, &filter).await?))
+}
+
+#[derive(Deserialize)]
+struct PlayerSearchQuery {
+    q: Option<String>,
+    limit: Option<usize>,
+}
+
+/// Names in the corpus containing `q`, busiest first.
+///
+/// An empty or missing `q` matches everything, which is the useful default for
+/// a search box that has not been typed in yet: it answers with the players
+/// who appear in the most games.
+async fn search_players(
+    State(state): State<AppState>,
+    Query(query): Query<PlayerSearchQuery>,
+) -> Result<Json<PlayerPage>, ApiError> {
+    let items = state
+        .catalog
+        .search_players(
+            query.q.as_deref().unwrap_or_default(),
+            query.limit.unwrap_or(20),
+        )
+        .await?;
+    Ok(Json(PlayerPage { items }))
+}
+
+#[derive(Serialize)]
+struct PlayerPage {
+    items: Vec<PlayerHit>,
+}
+
+/// The same window and mode grammar the trends page uses, plus the player.
+#[derive(Deserialize)]
+struct PlayerStatsQuery {
+    player: String,
+    unit: Option<SeriesUnit>,
+    span: Option<u32>,
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+    players: Option<String>,
+    room: Option<String>,
+    length: Option<String>,
+}
+
+/// One player's counters over a window.
+///
+/// The player is a query parameter rather than a path segment because a Mahjong
+/// Soul nickname is arbitrary text: slashes, question marks and percent signs
+/// are all legal in one, and every one of them means something else in a path.
+///
+/// Ratios are not computed here. The counters and their denominators travel
+/// together so that a reader can see which denominator each rate is over —
+/// `hands` for most, `detailed_games` for the four an older record cannot
+/// answer at all.
+async fn get_player_stats(
+    State(state): State<AppState>,
+    Query(query): Query<PlayerStatsQuery>,
+) -> Result<Json<PlayerSummary>, ApiError> {
+    if query.player.trim().is_empty() {
+        return Err(ApiError::BadRequest("player must not be empty".into()));
+    }
+    let filter = RuleFilter {
+        players: rule_facet("players", query.players.as_deref())?,
+        rooms: rule_facet("room", query.room.as_deref())?,
+        lengths: rule_facet("length", query.length.as_deref())?,
+    };
+    let unit = query.unit.unwrap_or(SeriesUnit::Day);
+    let window = match (query.from, query.to) {
+        (Some(from), Some(to)) => SeriesWindow::between(unit, from, to)?,
+        (None, None) => SeriesWindow::recent(unit, query.span.unwrap_or(DEFAULT_TREND_SPAN)),
+        _ => {
+            return Err(ApiError::BadRequest(
+                "from and to have to be given together".into(),
+            ));
+        }
+    };
+    Ok(Json(
+        state
+            .catalog
+            .player_summary(&query.player, window, &filter)
+            .await?,
+    ))
 }
 
 fn required_header(headers: &HeaderMap, name: &'static str) -> Result<String, ApiError> {

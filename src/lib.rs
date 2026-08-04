@@ -14,6 +14,7 @@ pub mod mjai;
 pub mod objects;
 pub mod pack;
 pub mod recovery;
+pub mod replay;
 pub mod watch;
 pub mod watch_log;
 pub mod watch_service;

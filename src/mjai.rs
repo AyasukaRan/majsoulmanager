@@ -27,6 +27,37 @@ pub enum ParseError {
     NotEvents,
 }
 
+/// The record's events, as JSON. Both shapes the ingest paths accept are
+/// handled: a NDJSON stream, which is what the converter writes, and a single
+/// JSON array, which some archives carry.
+///
+/// Separate from `parse_metadata` because the statistics pass needs every
+/// event where the index needs only the header, and parsing twice would double
+/// the worker's JSON cost for every record.
+pub fn events(payload: &[u8]) -> Result<Vec<Value>, ParseError> {
+    let text = std::str::from_utf8(payload).map_err(|_| ParseError::Utf8)?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(ParseError::Empty);
+    }
+    let events = if trimmed.starts_with('[') {
+        serde_json::from_str::<Vec<Value>>(trimmed)
+            .map_err(|error| ParseError::Json(error.to_string()))?
+    } else {
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str::<Value>(line)
+                    .map_err(|error| ParseError::Json(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    if events.is_empty() || events.iter().any(|event| !event.is_object()) {
+        return Err(ParseError::NotEvents);
+    }
+    Ok(events)
+}
+
 pub fn parse_metadata(payload: &[u8]) -> Result<Metadata, ParseError> {
     let text = std::str::from_utf8(payload).map_err(|_| ParseError::Utf8)?;
     let trimmed = text.trim();
