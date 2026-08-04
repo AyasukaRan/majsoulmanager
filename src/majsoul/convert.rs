@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::warn;
 
 use super::events::{AnGangAddGangType, ChiPengGangType, GameEvent, parse_record_action};
+use super::modes::{mode_metadata, uuid_year};
 use super::proto::{GameRecord, decode_game_record};
 
 fn get_dan_name(level_id: u32) -> String {
@@ -66,6 +67,28 @@ pub struct GameMetadata {
     pub game_length: String,
     pub players: u8,
     pub year: i32,
+}
+
+impl GameMetadata {
+    /// What the protobuf says about itself, or `None` for a game that is not a
+    /// ranked one — a friend room carries no `mode_id`, and `mode_metadata` has
+    /// no row for anything outside the twelve ranked modes.
+    ///
+    /// This is what lets a record be fetched by uuid alone. Every other caller
+    /// has a header to pass, from the live list or from the row being replaced;
+    /// a uuid that was never in this deployment's index has neither, and
+    /// without these five fields the record lands with an empty `rule` and
+    /// disappears from every query that filters on one.
+    pub fn of(record: &GameRecord) -> Option<Self> {
+        let (room, game_length, players) = mode_metadata(record.mode_id).ok()?;
+        Some(Self {
+            mode_id: record.mode_id,
+            room: room.to_owned(),
+            game_length: game_length.to_owned(),
+            players,
+            year: uuid_year(&record.uuid).ok()?,
+        })
+    }
 }
 
 impl MajsoulConverter {
@@ -783,7 +806,17 @@ pub fn convert_record_bytes(
         }
     }
 
-    let mjai_events = MajsoulConverter.events_to_mjai(&record, &events, metadata)?;
+    // What the caller knows beats what the record says, because a caller that
+    // passes a header took it from the live list or from the row being
+    // replaced and those name the game this deployment already believes it
+    // collected. Only where there is no header at all does the protobuf
+    // describe itself — which is the case for a record fetched by uuid alone.
+    let derived = metadata
+        .is_none()
+        .then(|| GameMetadata::of(&record))
+        .flatten();
+    let mjai_events =
+        MajsoulConverter.events_to_mjai(&record, &events, metadata.or(derived.as_ref()))?;
 
     let mut compressed = Vec::new();
     {
@@ -875,6 +908,7 @@ mod tests {
         let record = GameRecord {
             uuid: "uuid".to_string(),
             start_time: 123,
+            mode_id: 0,
             player_names: Vec::new(),
             player_accounts: Vec::new(),
             result: Vec::new(),
@@ -888,6 +922,35 @@ mod tests {
         assert_eq!(events[0]["majsoul"]["game_length"], "south");
         assert_eq!(events[0]["majsoul"]["players"], 4);
         assert_eq!(events[0]["majsoul"]["year"], 2020);
+    }
+
+    /// A record fetched by uuid alone has no header to be handed, so the
+    /// protobuf has to describe itself — otherwise it lands with an empty
+    /// `rule` and vanishes from every query that filters on one.
+    #[test]
+    fn a_protobuf_describes_itself_when_no_header_is_passed() {
+        let bare = |uuid: &str, mode_id: i32| GameRecord {
+            uuid: uuid.to_string(),
+            start_time: 123,
+            mode_id,
+            player_names: Vec::new(),
+            player_accounts: Vec::new(),
+            result: Vec::new(),
+            records: Vec::new(),
+        };
+        // jade east, three players. Read off `head.config.meta.mode_id`.
+        let derived =
+            GameMetadata::of(&bare("260716-abcdef", 23)).expect("a ranked mode describes itself");
+        assert_eq!(derived.room, "jade");
+        assert_eq!(derived.game_length, "east");
+        assert_eq!(derived.players, 3);
+        assert_eq!(derived.year, 2026, "the year comes from the uuid prefix");
+
+        // A friend room or a contest carries no ranked mode, and inventing one
+        // would put a game the ladder never saw into `3p-jade-east`.
+        assert!(GameMetadata::of(&bare("260716-abcdef", 0)).is_none());
+        // So does a uuid with no date prefix to read a year out of.
+        assert!(GameMetadata::of(&bare("abc", 23)).is_none());
     }
 
     /// A pon of `PPP` where the third tile came off seat 3: the caller's own
