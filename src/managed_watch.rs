@@ -60,6 +60,9 @@ const VERSION_PROBE_DELAY_SECS: u64 = 5;
 
 pub struct ManagedWatchDependencies {
     pub data_dir: PathBuf,
+    /// Where the re-fetch backfill leaves work. An instance serves it only in
+    /// the part of its poll interval it would otherwise sleep through.
+    pub refetch: Arc<crate::refetch::RefetchBroker>,
     pub catalog: Arc<Catalog>,
     pub kafka: Arc<Kafka>,
     pub registry: Arc<WatchRegistry>,
@@ -870,10 +873,87 @@ async fn watch_session(
             tokio::time::sleep(Duration::from_millis(config.request_delay_ms)).await;
         }
 
-        let elapsed = round_started.elapsed();
+        // Whatever is left of the poll interval goes to the re-fetch backlog
+        // instead of being slept through. An instance that ran long has no
+        // spare time and serves nothing, which is what keeps this from ever
+        // delaying live collection.
         let interval = Duration::from_secs(config.poll_interval_secs);
+        let deadline = round_started + interval;
+        serve_refetches(
+            config,
+            dependencies,
+            source,
+            client_version,
+            transport,
+            pb_worker,
+            deadline,
+        )
+        .await?;
+        let elapsed = round_started.elapsed();
         tokio::time::sleep(interval.saturating_sub(elapsed).max(Duration::from_secs(1))).await;
     }
+}
+
+/// Answers re-fetch requests until `deadline`, then returns.
+///
+/// The one thing this has to get right is which failures are the session's and
+/// which are the record's, and it is the same rule the pending-game loop above
+/// follows: a business error means Mahjong Soul answered and this uuid is not
+/// coming, so it travels back to the waiter and the loop goes on; a stale
+/// session or a transport failure means nothing else will succeed either, so it
+/// ends the session and the caller reconnects.
+async fn serve_refetches(
+    config: &WatchServiceConfig,
+    dependencies: &ManagedWatchDependencies,
+    source: &str,
+    client_version: &str,
+    transport: &mut LoginTransport,
+    pb_worker: Option<&Arc<PluginWorker>>,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    let mut served = 0usize;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let Some(request) = dependencies.refetch.claim() else {
+            // Parked on the counter rather than on a timer, so a request that
+            // arrives one second into a sixty second window is served then and
+            // not a minute later.
+            dependencies.refetch.wait_for_work(deadline - now).await;
+            continue;
+        };
+        match fetch_game_record(transport, pb_worker, request.uuid(), client_version).await {
+            Ok(raw) => {
+                served += 1;
+                request.answer(Ok(raw));
+            }
+            Err(error) => {
+                let server = error.downcast_ref::<ServerError>().copied();
+                let Some(_) = server.filter(|code| !code.is_session_stale()) else {
+                    // Answered before the session is torn down, so the waiter
+                    // learns why instead of timing out three minutes later.
+                    request.answer(Err(crate::refetch::RefetchError::Refused(format!(
+                        "{error:#}"
+                    ))));
+                    return Err(error);
+                };
+                request.answer(Err(crate::refetch::RefetchError::Refused(format!(
+                    "{error:#}"
+                ))));
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(config.request_delay_ms)).await;
+    }
+    if served > 0 {
+        dependencies.logs.append(
+            WatchLogLevel::Info,
+            source,
+            format!("空闲时段补抓了 {served} 局历史牌谱"),
+        );
+    }
+    Ok(())
 }
 
 /// The live collector's ingest, which is the path that actually feeds the
