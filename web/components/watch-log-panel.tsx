@@ -48,7 +48,25 @@ function levelClass(level: WatchLogLevel) {
   }
 }
 
-export function WatchLogPanel() {
+/**
+ * The backend keeps one 500-entry ring buffer for every service, tagged by
+ * source, so a page that only wants its own lines filters them out of the same
+ * poll. Filtering happens as entries are merged rather than at render, or a
+ * chatty collector would push a quiet service's lines out of the 800 this keeps
+ * and the panel would look empty while the buffer still held them.
+ */
+export function WatchLogPanel({
+  source,
+  title = "服务日志",
+  description = "Watch 后台服务与协议模块的最近日志(内存环形缓冲,最多保留 500 条)",
+  emptyHint = "Watch 服务启动后日志会自动出现在这里",
+}: {
+  /** Prefix of `entry.source`; unset shows every service. */
+  source?: string;
+  title?: string;
+  description?: string;
+  emptyHint?: string;
+} = {}) {
   const [entries, setEntries] = useState<WatchLogEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -95,9 +113,12 @@ export function WatchLogPanel() {
         if (page.next_cursor !== null) {
           cursorRef.current = page.next_cursor;
         }
-        if (page.items.length) {
+        const fresh = source
+          ? page.items.filter((entry) => entry.source.startsWith(source))
+          : page.items;
+        if (fresh.length) {
           setEntries((prev) => {
-            const merged = [...prev, ...page.items];
+            const merged = [...prev, ...fresh];
             return merged.length > MAX_ENTRIES
               ? merged.slice(merged.length - MAX_ENTRIES)
               : merged;
@@ -113,7 +134,7 @@ export function WatchLogPanel() {
         }
       }
     },
-    [fetchPage],
+    [fetchPage, source],
   );
 
   useEffect(() => {
@@ -159,7 +180,7 @@ export function WatchLogPanel() {
         <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
           <div>
             <div className="flex items-center gap-2">
-              <CardTitle>服务日志</CardTitle>
+              <CardTitle>{title}</CardTitle>
               {error ? (
                 <Badge
                   variant="outline"
@@ -169,9 +190,7 @@ export function WatchLogPanel() {
                 </Badge>
               ) : null}
             </div>
-            <CardDescription className="mt-1">
-              Watch 后台服务与协议模块的最近日志(内存环形缓冲,最多保留 500 条)
-            </CardDescription>
+            <CardDescription className="mt-1">{description}</CardDescription>
           </div>
           <div className="flex items-center gap-2">
             <Button
@@ -213,7 +232,7 @@ export function WatchLogPanel() {
           onScroll={handleScroll}
           tabIndex={0}
           role="log"
-          aria-label="服务日志"
+          aria-label={title}
           className="h-72 overflow-y-auto px-6 py-3 font-mono text-xs"
         >
           {entries.length ? (
@@ -248,9 +267,7 @@ export function WatchLogPanel() {
               <p className="text-sm font-medium text-muted-foreground">
                 {loading ? "正在读取服务日志…" : "暂无日志"}
               </p>
-              <p className="mt-1 text-xs text-muted-foreground">
-                Watch 服务启动后日志会自动出现在这里
-              </p>
+              <p className="mt-1 text-xs text-muted-foreground">{emptyHint}</p>
             </div>
           )}
         </div>

@@ -99,18 +99,29 @@ impl RefetchBroker {
         }
     }
 
-    /// Takes the next request, or `None` if there is none waiting. Never
-    /// blocks: a collector calls this while it still owes its own round a
-    /// return, and must not be parked here by an empty queue.
+    /// Takes the next request nobody has given up on, or `None` if there is
+    /// none waiting. Never blocks: a collector calls this while it still owes
+    /// its own round a return, and must not be parked here by an empty queue.
+    ///
+    /// A request whose waiter is gone is dropped rather than served. Nothing
+    /// removes a timed-out request from the queue — [`Self::fetch`] pushes it
+    /// and then only waits — and a walk that is stopped mid-flight abandons
+    /// whatever it had outstanding. Serving those costs a real Mahjong Soul
+    /// request and a pacing delay each, for an answer sent into a closed
+    /// channel, and because the queue is first-in-first-out they sit in front of
+    /// live requests: enough of them and a fresh request waits out the whole
+    /// claim timeout, which produces more of them.
     pub fn claim(&self) -> Option<PendingFetch> {
-        self.queue
-            .lock()
-            .expect("refetch queue")
-            .pop_front()
-            .map(|request| PendingFetch {
-                uuid: request.uuid,
-                answer: request.answer,
-            })
+        let mut queue = self.queue.lock().expect("refetch queue");
+        while let Some(request) = queue.pop_front() {
+            if !request.answer.is_closed() {
+                return Some(PendingFetch {
+                    uuid: request.uuid,
+                    answer: request.answer,
+                });
+            }
+        }
+        None
     }
 
     /// Resolves once a request is waiting, or after `patience` — whichever
@@ -121,9 +132,16 @@ impl RefetchBroker {
         let _ = tokio::time::timeout(patience, self.arrived.notified()).await;
     }
 
-    /// How many requests are waiting. Reported, not acted on.
+    /// How many requests are waiting for an answer somebody still wants.
+    /// Reported, not acted on — which is why it counts the same set
+    /// [`Self::claim`] would serve rather than the raw queue length.
     pub fn waiting(&self) -> usize {
-        self.queue.lock().expect("refetch queue").len()
+        self.queue
+            .lock()
+            .expect("refetch queue")
+            .iter()
+            .filter(|request| !request.answer.is_closed())
+            .count()
     }
 }
 
@@ -215,5 +233,39 @@ mod tests {
         // And so does waiting for work that never comes.
         broker.wait_for_work(Duration::from_millis(10)).await;
         assert_eq!(broker.waiting(), 0);
+    }
+
+    /// Nothing takes a request off the queue when its waiter gives up, so the
+    /// abandoned ones pile up in front of the live ones. Serving them costs a
+    /// real Mahjong Soul request each and pushes the request behind them towards
+    /// the timeout that abandons *it* — which is how a walk that was merely
+    /// slow turns into one that cannot finish.
+    #[tokio::test]
+    async fn a_request_nobody_is_waiting_for_is_dropped_rather_than_served() {
+        let broker = Arc::new(RefetchBroker::default());
+        let abandoning = Arc::clone(&broker);
+        // Times out with nothing serving, which leaves its request behind.
+        let abandoned =
+            tokio::time::timeout(Duration::from_millis(20), abandoning.fetch("260716-gone")).await;
+        assert!(
+            abandoned.is_err(),
+            "the fetch should still have been waiting"
+        );
+
+        let live = Arc::clone(&broker);
+        let waiting = tokio::spawn(async move { live.fetch("260716-live").await });
+        // Let the live request reach the queue before anything claims.
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            broker.waiting(),
+            1,
+            "the abandoned request must not be reported as outstanding work"
+        );
+        let claimed = broker.claim().expect("the live request is still there");
+        assert_eq!(claimed.uuid(), "260716-live", "the dead one was skipped");
+        claimed.answer(Ok(b"protobuf".to_vec()));
+        assert_eq!(waiting.await.unwrap().unwrap(), b"protobuf");
+        assert!(broker.claim().is_none());
     }
 }

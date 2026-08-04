@@ -218,6 +218,50 @@ export type WatchServiceConfig = {
   instances: WatchInstance[];
 };
 
+/**
+ * The re-fetch pool. It logs in with accounts of its own rather than borrowing a
+ * collector's session, so `concurrency` is how many sessions run at once — and
+ * it cannot exceed the number of accounts, because Mahjong Soul allows one
+ * session per account. The backend reports what it settled on as
+ * `RefetchStatus.workers`.
+ */
+export type RefetchServiceConfig = {
+  revision: number;
+  enabled: boolean;
+  server: "cn" | "en" | "jp";
+  proxy_mode: "direct" | "mihomo" | "custom";
+  custom_proxy_url: string | null;
+  /** `file:` or `env:`, one `username,password` per line. Never the accounts themselves. */
+  account_secret_ref: string;
+  concurrency: number;
+  request_delay_ms: number;
+  client_version: string | null;
+};
+
+export type RefetchProgress = {
+  pass: number;
+  scanned: number;
+  replaced: number;
+  refused: number;
+  unreadable: number;
+  unconvertible: number;
+};
+
+export type RefetchStatus = {
+  phase: WatchRuntimeStatus["phase"];
+  active_revision: number | null;
+  started_at: string | null;
+  updated_at: string;
+  last_error: string | null;
+  accounts: number;
+  workers: number;
+  sessions: number;
+  waiting: number;
+  /** Records with no protobuf when the run started; null before the first run. */
+  backlog: number | null;
+  progress: RefetchProgress;
+};
+
 export type InstalledWatchModule = {
   kind: "login" | "pb_fetch";
   name: string;

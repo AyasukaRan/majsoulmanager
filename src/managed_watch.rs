@@ -79,7 +79,7 @@ struct LiveGame {
     queued_at: Option<u64>,
 }
 
-enum LoginTransport {
+pub(crate) enum LoginTransport {
     Builtin(MajsoulRpc),
     External {
         worker: Arc<PluginWorker>,
@@ -108,7 +108,7 @@ impl LoginTransport {
         }
     }
 
-    async fn close(&self) {
+    pub(crate) async fn close(&self) {
         match self {
             Self::Builtin(rpc) => {
                 let _ = rpc.close().await;
@@ -148,20 +148,8 @@ pub(crate) async fn run(
         WatchProxyMode::Mihomo => Some(dependencies.mihomo.proxy_url().to_owned()),
         WatchProxyMode::Custom => config.custom_proxy_url.clone(),
     };
-    // 外置模块的 stderr 与错误链会进入 Web 可见的日志缓冲,可能回显
-    // open_session 参数;先注册机密让 append 统一脱敏。
-    dependencies.logs.register_secret(password.clone());
-    if let Some(proxy_url) = proxy.as_deref() {
-        dependencies.logs.register_secret(proxy_url);
-        if let Ok(parsed) = reqwest::Url::parse(proxy_url) {
-            if let Some(proxy_password) = parsed.password() {
-                dependencies.logs.register_secret(proxy_password);
-            }
-            if !parsed.username().is_empty() {
-                dependencies.logs.register_secret(parsed.username());
-            }
-        }
-    }
+    // The password and the proxy credentials are registered by `connect`, which
+    // is the one place every login goes through.
     let state_path = state_path(&dependencies.data_dir, &instance);
     let discovery_dir = discovery_dir(&dependencies.data_dir, &instance);
     // Shared: the gateway, package version and version floor are properties of
@@ -196,11 +184,14 @@ pub(crate) async fn run(
         dependencies.logs.append(
             WatchLogLevel::Info,
             &source,
-            format!("开始连接雀魂服务器 (账号 {username}, 代理 {proxy_label})"),
+            format!(
+                "开始连接雀魂服务器 (账号 {}, 代理 {proxy_label})",
+                masked_account(&username)
+            ),
         );
         match connect(
-            &config,
-            &instance,
+            &config.server,
+            instance.client_version.as_deref(),
             &username,
             &password,
             proxy.as_deref(),
@@ -250,63 +241,21 @@ pub(crate) async fn run(
                     &source,
                     format!("登录失败: {detail}"),
                 );
-                if detail.contains("151") {
-                    let rejected = instance
-                        .client_version
-                        .clone()
-                        .unwrap_or_else(|| CN_CODE_VERSION.to_string());
-                    // A sibling instance hits the same server-wide bump at the
-                    // same time. Whoever finishes first publishes the floor, so
-                    // check for it before paying for a second search.
-                    let shared = load_client_version(&cache_dir)
-                        .filter(|shared| parse_version(shared) > parse_version(&rejected));
-                    if let Some(shared) = shared {
-                        dependencies.logs.append(
-                            WatchLogLevel::Info,
-                            &source,
-                            format!(
-                                "error 151 = 客户端版本 {rejected} 已过期,采用其他实例探测到的 {shared}"
-                            ),
-                        );
-                        instance.client_version = Some(shared);
-                    } else {
-                        dependencies.logs.append(
-                            WatchLogLevel::Warn,
-                            &source,
-                            format!(
-                                "error 151 = 客户端版本 {rejected} 已过期,开始探测服务端接受的最低版本"
-                            ),
-                        );
-                        match discover_version_floor(
-                            &config,
-                            &instance,
-                            &username,
-                            &password,
-                            proxy.as_deref(),
-                            login_worker.clone(),
-                            &dependencies.logs,
-                            &source,
-                            &cache_dir,
-                            &rejected,
-                        )
-                        .await
-                        {
-                            Ok(version) => {
-                                store_client_version(&cache_dir, &version);
-                                instance.client_version = Some(version.clone());
-                                dependencies.logs.append(
-                                    WatchLogLevel::Info,
-                                    &source,
-                                    format!("客户端版本已自动更新为 {version}"),
-                                );
-                            }
-                            Err(error) => dependencies.logs.append(
-                                WatchLogLevel::Error,
-                                &source,
-                                format!("版本探测失败: {error:#}"),
-                            ),
-                        }
-                    }
+                if let Some(refreshed) = refreshed_client_version(
+                    &config.server,
+                    &username,
+                    &password,
+                    proxy.as_deref(),
+                    login_worker.clone(),
+                    &dependencies.logs,
+                    &source,
+                    &cache_dir,
+                    instance.client_version.as_deref(),
+                    &detail,
+                )
+                .await
+                {
+                    instance.client_version = Some(refreshed);
                 }
             }
         }
@@ -339,8 +288,22 @@ fn discovery_dir(data_dir: &Path, instance: &WatchInstance) -> PathBuf {
     data_dir.join(format!("watch/discovered/{}", instance.key))
 }
 
+/// Whether a failed Mahjong Soul request means this session is finished.
+///
+/// The one rule every fetch loop in this codebase has to get right, so it is
+/// stated once. A business error means the socket and the session answered and
+/// the failure is about the one record asked for: reconnecting neither fixes it
+/// nor lets anything else through, and the record would fail again after every
+/// reconnect, forever. Anything else — a stale login, a dead socket — means
+/// nothing else will succeed either.
+pub(crate) fn ends_the_session(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ServerError>()
+        .is_none_or(|server| server.is_session_stale())
+}
+
 /// Renders a proxy URL as `scheme://host[:port]`, never exposing credentials.
-fn proxy_display(proxy: &str) -> String {
+pub(crate) fn proxy_display(proxy: &str) -> String {
     match reqwest::Url::parse(proxy) {
         Ok(url) => {
             let scheme = url.scheme();
@@ -409,7 +372,7 @@ async fn fetch_live_list(
     parse_live_list(&response, fallback_mode_id)
 }
 
-async fn fetch_game_record(
+pub(crate) async fn fetch_game_record(
     transport: &LoginTransport,
     pb_worker: Option<&Arc<PluginWorker>>,
     uuid: &str,
@@ -516,13 +479,79 @@ fn format_version(value: u32) -> String {
     format!("0.{}.{}", value / 1000, value % 1000)
 }
 
+/// What to log in with next after a rejected login, or `None` when the
+/// rejection was not about the client version.
+///
+/// Majsoul raises its accepted floor server-wide, so every login in the process
+/// meets it within the same minute — the collectors and the re-fetch pool alike.
+/// Whichever one finishes the search first publishes the floor to the shared
+/// cache, and the rest read it instead of paying for a search of their own. That
+/// sharing is the reason this is one function rather than a copy per caller: two
+/// copies would be two searches, which is a burst of failed logins from several
+/// accounts at once.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn refreshed_client_version(
+    server: &str,
+    username: &str,
+    password: &str,
+    proxy: Option<&str>,
+    worker: Option<Arc<PluginWorker>>,
+    logs: &WatchLogBuffer,
+    source: &str,
+    cache_dir: &Path,
+    current: Option<&str>,
+    failure: &str,
+) -> Option<String> {
+    if !failure.contains("151") {
+        return None;
+    }
+    let rejected = current.unwrap_or(CN_CODE_VERSION).to_owned();
+    if let Some(shared) = load_client_version(cache_dir)
+        .filter(|shared| parse_version(shared) > parse_version(&rejected))
+    {
+        logs.append(
+            WatchLogLevel::Info,
+            source,
+            format!("error 151 = 客户端版本 {rejected} 已过期,采用其他会话探测到的 {shared}"),
+        );
+        return Some(shared);
+    }
+    logs.append(
+        WatchLogLevel::Warn,
+        source,
+        format!("error 151 = 客户端版本 {rejected} 已过期,开始探测服务端接受的最低版本"),
+    );
+    match discover_version_floor(
+        server, username, password, proxy, worker, logs, source, cache_dir, &rejected,
+    )
+    .await
+    {
+        Ok(version) => {
+            store_client_version(cache_dir, &version);
+            logs.append(
+                WatchLogLevel::Info,
+                source,
+                format!("客户端版本已自动更新为 {version}"),
+            );
+            Some(version)
+        }
+        Err(error) => {
+            logs.append(
+                WatchLogLevel::Error,
+                source,
+                format!("版本探测失败: {error:#}"),
+            );
+            None
+        }
+    }
+}
+
 /// Try one candidate version. `Ok(false)` means the server rejected it as too
 /// old (151); any other failure is a real error and must abort the search
 /// rather than be mistaken for a rejection.
 #[allow(clippy::too_many_arguments)]
 async fn probe_version(
-    config: &WatchServiceConfig,
-    instance: &WatchInstance,
+    server: &str,
     username: &str,
     password: &str,
     proxy: Option<&str>,
@@ -532,10 +561,16 @@ async fn probe_version(
     cache_dir: &Path,
     version: &str,
 ) -> Result<bool> {
-    let mut candidate = instance.clone();
-    candidate.client_version = Some(version.to_string());
     match connect(
-        config, &candidate, username, password, proxy, worker, logs, source, cache_dir,
+        server,
+        Some(version),
+        username,
+        password,
+        proxy,
+        worker,
+        logs,
+        source,
+        cache_dir,
     )
     .await
     {
@@ -557,9 +592,8 @@ async fn probe_version(
 /// comfortably above it because the floor is what a browser tab a few patches
 /// behind reports, whereas an arbitrarily high version is a giveaway.
 #[allow(clippy::too_many_arguments)]
-async fn discover_version_floor(
-    config: &WatchServiceConfig,
-    instance: &WatchInstance,
+pub(crate) async fn discover_version_floor(
+    server: &str,
     username: &str,
     password: &str,
     proxy: Option<&str>,
@@ -577,8 +611,7 @@ async fn discover_version_floor(
         async move {
             let version = format_version(value);
             let accepted = probe_version(
-                config, instance, username, password, proxy, worker, logs, source, cache_dir,
-                &version,
+                server, username, password, proxy, worker, logs, source, cache_dir, &version,
             )
             .await?;
             logs.append(
@@ -632,10 +665,17 @@ where
     Ok(accepted)
 }
 
+/// Opens one authenticated Mahjong Soul session.
+///
+/// It takes the server and the pinned client version rather than the documents
+/// they usually come out of, because the re-fetch pool logs in the same way from
+/// a configuration that has no collectors in it at all. Those two values are
+/// everything the login depends on; the rest of a collector's configuration
+/// describes what to do afterwards.
 #[allow(clippy::too_many_arguments)]
-async fn connect(
-    config: &WatchServiceConfig,
-    instance: &WatchInstance,
+pub(crate) async fn connect(
+    server: &str,
+    client_version: Option<&str>,
     username: &str,
     password: &str,
     proxy: Option<&str>,
@@ -644,16 +684,33 @@ async fn connect(
     source: &str,
     cache_dir: &Path,
 ) -> Result<(LoginTransport, String)> {
+    // Here rather than at each caller, because an external login module is
+    // handed the password as plain JSON and its stderr is appended to a buffer
+    // every console member can read. A caller that forgot this would leak every
+    // account it logs in with, and the only sign would be the password sitting
+    // in the log.
+    logs.register_secret(password);
+    if let Some(url) = proxy {
+        logs.register_secret(url);
+        if let Ok(parsed) = reqwest::Url::parse(url) {
+            if let Some(credential) = parsed.password() {
+                logs.register_secret(credential);
+            }
+            if !parsed.username().is_empty() {
+                logs.register_secret(parsed.username());
+            }
+        }
+    }
     if let Some(worker) = worker {
         let result = worker
             .request(
                 "open_session",
                 serde_json::json!({
-                    "server": config.server,
+                    "server": server,
                     "username": username,
                     "password": password,
                     "proxy_url": proxy,
-                    "client_version": instance.client_version,
+                    "client_version": client_version,
                 }),
             )
             .await
@@ -676,7 +733,7 @@ async fn connect(
     }
     let http = builder.build()?;
     let (endpoint, _resource_version, route_id) =
-        discover_gateway(&http, &config.server, cache_dir).await?;
+        discover_gateway(&http, server, cache_dir).await?;
     logs.append(
         WatchLogLevel::Info,
         source,
@@ -687,11 +744,8 @@ async fn connect(
     // instance — which is also how a discovered floor is applied. The package
     // (Unity build) is discovered from index.html, falling back to the pinned
     // default.
-    let code_version = instance
-        .client_version
-        .clone()
-        .unwrap_or_else(|| CN_CODE_VERSION.to_string());
-    let package_version = discover_package_version(&http, &config.server, cache_dir)
+    let code_version = client_version.unwrap_or(CN_CODE_VERSION).to_owned();
+    let package_version = discover_package_version(&http, server, cache_dir)
         .await
         .unwrap_or_else(|_| CN_PACKAGE_VERSION.to_string());
     logs.append(
@@ -706,7 +760,7 @@ async fn connect(
         password,
         &code_version,
         &package_version,
-        &config.server,
+        server,
         &route_id,
     )
     .await?;
@@ -797,16 +851,14 @@ async fn watch_session(
                             Some(error.to_string()),
                             None,
                         ))?;
-                        // A business error is about this one record: the socket
-                        // answered, so tearing the session down neither fixes it
-                        // nor lets the other pending games through — the record
-                        // would just fail again after every reconnect, forever.
-                        // Only a stale session or a transport failure is worth
-                        // reconnecting for.
-                        let server = error.downcast_ref::<ServerError>().copied();
-                        let Some(server) = server.filter(|code| !code.is_session_stale()) else {
+                        if ends_the_session(&error) {
                             return Err(error);
-                        };
+                        }
+                        // Only a business code reaches here, and it is what the
+                        // give-up message below names as the reason.
+                        let code = error
+                            .downcast_ref::<ServerError>()
+                            .map_or(0, |server| server.code);
                         // The paipu for a game can legitimately lag behind its
                         // disappearance from the live list, but not for hours;
                         // past that it is never coming and the entry would
@@ -826,7 +878,7 @@ async fn watch_session(
                                 format!(
                                     "放弃对局 {} (服务端错误 {} 持续超过 {} 分钟)",
                                     game.uuid,
-                                    server.code,
+                                    code,
                                     GIVE_UP_SECS / 60
                                 ),
                             );
@@ -867,6 +919,30 @@ async fn watch_session(
                         Some(format!("{error:#}")),
                         None,
                     ))?;
+                    // The same give-up the fetch path has, and for a sharper
+                    // reason: this entry has already been fetched, so every
+                    // retry costs a fetch *and* a conversion, and the pending
+                    // loop is serial with a pacing delay after each. An ingest
+                    // that keeps failing — a topic past `MJAI_KAFKA_MAX_LAG` is
+                    // the reachable one — would otherwise grow this queue
+                    // without bound and stretch the poll round with it, and a
+                    // poll round that has stretched is games that were played
+                    // and never seen live at all.
+                    if game
+                        .queued_at
+                        .is_some_and(|queued| now.saturating_sub(queued) > GIVE_UP_SECS)
+                    {
+                        pending.remove(&game.uuid);
+                        dependencies.logs.append(
+                            WatchLogLevel::Warn,
+                            source,
+                            format!(
+                                "放弃对局 {} (转换或入库连续失败超过 {} 分钟)",
+                                game.uuid,
+                                GIVE_UP_SECS / 60
+                            ),
+                        );
+                    }
                 }
             }
             persist_state(state_path, tracked.values(), pending.values())?;
@@ -930,18 +1006,15 @@ async fn serve_refetches(
                 request.answer(Ok(raw));
             }
             Err(error) => {
-                let server = error.downcast_ref::<ServerError>().copied();
-                let Some(_) = server.filter(|code| !code.is_session_stale()) else {
-                    // Answered before the session is torn down, so the waiter
-                    // learns why instead of timing out three minutes later.
-                    request.answer(Err(crate::refetch::RefetchError::Refused(format!(
-                        "{error:#}"
-                    ))));
-                    return Err(error);
-                };
+                // Answered before the session is torn down, so a waiter whose
+                // request died with the session learns why instead of timing
+                // out three minutes later.
                 request.answer(Err(crate::refetch::RefetchError::Refused(format!(
                     "{error:#}"
                 ))));
+                if ends_the_session(&error) {
+                    return Err(error);
+                }
             }
         }
         tokio::time::sleep(Duration::from_millis(config.request_delay_ms)).await;
@@ -1082,7 +1155,14 @@ fn event(
     }
 }
 
-fn load_first_account(secret_ref: &str) -> Result<(String, String)> {
+/// Every account in a secret, in file order.
+///
+/// A collector takes the first and ignores the rest; the re-fetch pool takes all
+/// of them, which is the only reason this returns more than one. Reading the
+/// same format from one place is what lets an operator point both at a single
+/// file and have the collector claim line one while the pool works through what
+/// is left — the pool drops any account a collector already holds.
+pub(crate) fn load_accounts(secret_ref: &str) -> Result<Vec<(String, String)>> {
     let (scheme, target) = secret_ref
         .split_once(':')
         .context("account secret reference has no scheme")?;
@@ -1093,19 +1173,50 @@ fn load_first_account(secret_ref: &str) -> Result<(String, String)> {
             .with_context(|| format!("account secret environment variable {target} is missing"))?,
         _ => anyhow::bail!("unsupported account secret scheme"),
     };
-    for line in content.lines().map(str::trim) {
+    let mut accounts = Vec::new();
+    for (number, line) in content.lines().map(str::trim).enumerate() {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         let delimiter = if line.contains('\t') { '\t' } else { ',' };
-        let (username, password) = line
-            .split_once(delimiter)
-            .context("account secret must contain username,password")?;
+        // Skipped rather than fatal, and this is load-bearing. A malformed line
+        // used to be unreachable because the collector stopped at the first
+        // usable one; now that the pool reads the whole file, one line missing
+        // its comma would take down every collector reading that file at its
+        // next start — for a typo in an account the collector does not even use.
+        let Some((username, password)) = line.split_once(delimiter) else {
+            warn!(
+                line = number + 1,
+                "跳过账号文件里没有分隔符的一行（需要 用户名,密码）"
+            );
+            continue;
+        };
         if !username.trim().is_empty() && !password.trim().is_empty() {
-            return Ok((username.trim().into(), password.trim().into()));
+            accounts.push((username.trim().to_owned(), password.trim().to_owned()));
         }
     }
-    anyhow::bail!("account secret contains no usable account")
+    if accounts.is_empty() {
+        anyhow::bail!("account secret contains no usable account");
+    }
+    Ok(accounts)
+}
+
+/// An account as it may appear in a log the whole console can read.
+///
+/// A Mahjong Soul username is half a credential, and `/api/v1/watch/logs` is
+/// open to every member. Enough is kept to tell two accounts apart, which is all
+/// a log line needs it for.
+pub(crate) fn masked_account(username: &str) -> String {
+    let (local, domain) = match username.split_once('@') {
+        Some((local, domain)) => (local, format!("@{domain}")),
+        None => (username, String::new()),
+    };
+    let kept: String = local.chars().take(2).collect();
+    format!("{kept}***{domain}")
+}
+
+fn load_first_account(secret_ref: &str) -> Result<(String, String)> {
+    Ok(load_accounts(secret_ref)?.swap_remove(0))
 }
 
 /// Append-only record of every game uuid this collector has ever seen live.
@@ -1190,29 +1301,31 @@ fn now_unix() -> u64 {
 mod tests {
     use super::*;
 
-    /// Mirrors the decision `watch_session` makes on a failed record fetch.
-    fn reconnects_on(error: &anyhow::Error) -> bool {
-        error
-            .downcast_ref::<ServerError>()
-            .copied()
-            .filter(|code| !code.is_session_stale())
-            .is_none()
-    }
-
+    /// The rule every fetch loop shares: the live collector's pending queue, the
+    /// collector's spare-time re-fetch serving, and the re-fetch pool's own
+    /// workers all decide whether to reconnect with this one function.
     #[test]
     fn only_a_stale_session_or_transport_failure_reconnects() {
         // 1203 (record not available) is about one game. Reconnecting neither
         // fixes it nor lets the rest of the queue through, so the session must
         // survive it.
         let business = ensure_success_response(&[0x08, 0xb3, 0x09], "fetchGameRecord").unwrap_err();
-        assert!(!reconnects_on(&business), "1203 must not kill the session");
+        assert!(
+            !ends_the_session(&business),
+            "1203 must not kill the session"
+        );
 
         // 1201 is ERR_TOKEN_NOT_EXIST: a fresh login is exactly the cure.
         let stale = ensure_success_response(&[0x08, 0xb1, 0x09], "fetchGameRecord").unwrap_err();
-        assert!(reconnects_on(&stale), "a stale session must reconnect");
+        assert!(ends_the_session(&stale), "a stale session must reconnect");
 
         // Anything that is not a server answer at all is a transport failure.
-        assert!(reconnects_on(&anyhow::Error::msg("connection reset")));
+        assert!(ends_the_session(&anyhow::Error::msg("connection reset")));
+
+        // The context wrapper `ensure_success_response` adds must not hide the
+        // code from `downcast_ref`, or every business error would be read as a
+        // dead session and the queue would reconnect in a loop forever.
+        assert!(!ends_the_session(&business.context("fetching 260716-abc")));
     }
 
     /// Issue #37: renaming a collector used to move its state file, and a state
@@ -1312,6 +1425,81 @@ mod tests {
         unsafe { std::env::set_var(&variable, "bot@example.com,password") };
         let account = load_first_account(&format!("env:{variable}")).unwrap();
         assert_eq!(account.0, "bot@example.com");
+        unsafe { std::env::remove_var(variable) };
+    }
+
+    /// One malformed line used to be unreachable — the collector stopped at the
+    /// first usable account and never looked further. Now that the pool reads
+    /// the whole file, a missing comma on line seven would, if it were fatal,
+    /// stop every collector reading that file at its next start: an account the
+    /// collector does not even use taking down live collection.
+    #[test]
+    fn a_malformed_line_costs_that_account_and_nothing_else() {
+        let variable = format!("MJAI_TEST_BROKEN_{}", Uuid::new_v4());
+        // SAFETY: this uniquely named variable is only read in this test.
+        unsafe {
+            std::env::set_var(
+                &variable,
+                "live@example.com,one\nthis-line-has-no-separator\npool@example.com,two\n",
+            )
+        };
+        let reference = format!("env:{variable}");
+        assert_eq!(
+            load_accounts(&reference).unwrap(),
+            vec![
+                ("live@example.com".to_owned(), "one".to_owned()),
+                ("pool@example.com".to_owned(), "two".to_owned()),
+            ]
+        );
+        assert_eq!(
+            load_first_account(&reference).unwrap().0,
+            "live@example.com"
+        );
+        unsafe { std::env::remove_var(variable) };
+    }
+
+    /// The log buffer behind `/api/v1/watch/logs` is readable by every console
+    /// member, and a Mahjong Soul username is half a credential.
+    #[test]
+    fn a_log_line_names_an_account_without_giving_it_away() {
+        let masked = masked_account("collector-bot@example.com");
+        assert_eq!(masked, "co***@example.com");
+        assert_ne!(masked_account("aa-one@example.com"), masked);
+        // A phone number has no domain to keep.
+        assert_eq!(masked_account("13800000000"), "13***");
+        assert_eq!(masked_account(""), "***");
+    }
+
+    /// The re-fetch pool's whole capacity is the number of accounts it can read,
+    /// and a collector pointed at the same secret has to keep taking exactly the
+    /// first one — otherwise pointing both at one file would silently move which
+    /// account the live collector logs in with.
+    #[test]
+    fn reads_every_account_in_a_secret_while_a_collector_still_takes_the_first() {
+        let variable = format!("MJAI_TEST_POOL_{}", Uuid::new_v4());
+        // SAFETY: this uniquely named variable is only read in this test.
+        unsafe {
+            std::env::set_var(
+                &variable,
+                "# collector\nlive@example.com,one\n\n  pool-a@example.com , two \n\
+                 pool-b@example.com\tthree\n",
+            )
+        };
+        let reference = format!("env:{variable}");
+        let accounts = load_accounts(&reference).unwrap();
+        assert_eq!(
+            accounts,
+            vec![
+                ("live@example.com".to_owned(), "one".to_owned()),
+                ("pool-a@example.com".to_owned(), "two".to_owned()),
+                ("pool-b@example.com".to_owned(), "three".to_owned()),
+            ],
+            "comments and blank lines are skipped, tabs and commas both split"
+        );
+        assert_eq!(
+            load_first_account(&reference).unwrap().0,
+            "live@example.com"
+        );
         unsafe { std::env::remove_var(variable) };
     }
 }

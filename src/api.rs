@@ -43,6 +43,7 @@ use crate::{
     indexer::{self, Claimed, IngestError},
     kafka::MAX_PRODUCE_BATCH_BYTES,
     mihomo::{MihomoAction, MihomoError, MihomoStatus, ProxySelection, SubscriptionUpdate},
+    refetch_service::{RefetchRuntimeStatus, RefetchServiceConfig},
     watch_log::WatchLogEntry,
     watch_service::{
         InstallModuleRequest, InstalledModule, ServicePhase, WatchAction, WatchDashboard,
@@ -69,6 +70,11 @@ pub fn router(state: AppState) -> Router {
             put(put_watch_proxy_selection),
         )
         .route("/api/v1/watch/proxy/actions", post(post_watch_proxy_action))
+        // The re-fetch pool logs in with its own accounts and hammers Mahjong
+        // Soul for as long as the backlog lasts, so starting it and choosing its
+        // pacing belong to the same people who may start a collector.
+        .route("/api/v1/refetch/config", put(put_refetch_config))
+        .route("/api/v1/refetch/actions", post(post_refetch_action))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_admin_session,
@@ -95,6 +101,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/watch/modules", get(get_watch_modules))
         .route("/api/v1/watch/modules/protocol", get(get_module_protocol))
         .route("/api/v1/watch/proxy", get(get_watch_proxy))
+        .route("/api/v1/refetch/config", get(get_refetch_config))
+        .route("/api/v1/refetch/status", get(get_refetch_status))
         .merge(admin)
         .route("/api/v1/users", get(get_users).post(create_user))
         .route("/api/v1/users/{id}", put(update_user))
@@ -277,8 +285,11 @@ async fn get_watch_logs(
     }))
 }
 
+/// Open to every member, like the other reads below `require_admin_session`. The
+/// document names its secrets rather than carrying them — except the proxy URL,
+/// which may carry credentials inline, so `published_config` takes those out.
 async fn get_watch_config(State(state): State<AppState>) -> Json<WatchServiceConfig> {
-    Json(state.watch_service.config())
+    Json(state.watch_service.published_config())
 }
 
 async fn put_watch_config(
@@ -299,6 +310,30 @@ async fn post_watch_action(
 ) -> Result<Json<WatchRuntimeStatus>, ApiError> {
     Ok(Json(
         state.watch_service.apply_action(request.action).await?,
+    ))
+}
+
+async fn get_refetch_config(State(state): State<AppState>) -> Json<RefetchServiceConfig> {
+    Json(state.refetch_service.published_config())
+}
+
+async fn put_refetch_config(
+    State(state): State<AppState>,
+    Json(config): Json<RefetchServiceConfig>,
+) -> Result<Json<RefetchServiceConfig>, ApiError> {
+    Ok(Json(state.refetch_service.update_config(config).await?))
+}
+
+async fn get_refetch_status(State(state): State<AppState>) -> Json<RefetchRuntimeStatus> {
+    Json(state.refetch_service.status())
+}
+
+async fn post_refetch_action(
+    State(state): State<AppState>,
+    Json(request): Json<WatchActionRequest>,
+) -> Result<Json<RefetchRuntimeStatus>, ApiError> {
+    Ok(Json(
+        state.refetch_service.apply_action(request.action).await?,
     ))
 }
 
@@ -846,6 +881,10 @@ async fn search(
         received_to: query.received_to,
         played_from: query.played_from,
         played_to: query.played_to,
+        // Built field by field rather than with struct update syntax, so a new
+        // filter has to be added to `SearchQuery` before it can be asked for
+        // here. This one is for the re-fetch walk, not for the console.
+        missing_pb: false,
     };
     let (items, next_cursor) = state
         .catalog

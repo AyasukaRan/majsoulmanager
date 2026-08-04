@@ -7,6 +7,7 @@ import {
   ChartLine,
   CircleGauge,
   Database,
+  History,
   Layers3,
   LogOut,
   Radio,
@@ -23,6 +24,9 @@ const nav = [
   { href: "/players", label: "玩家战绩", icon: UserRound },
   { href: "/records", label: "牌谱索引", icon: Database },
   { href: "/watch", label: "Watch 服务", icon: Radio },
+  // Beside Watch: the other thing that logs into Mahjong Soul and writes to the
+  // corpus, and the page an operator goes looking for right after that one.
+  { href: "/refetch", label: "牌谱补抓", icon: History },
   { href: "/exports", label: "批量导出", icon: Archive },
   // Last, beside 用户管理: the two entries that change how the deployment runs
   // rather than report on it, and the two the page itself refuses to a member.

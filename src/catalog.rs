@@ -144,6 +144,15 @@ pub struct RecordFilter {
     pub received_to: Option<DateTime<Utc>>,
     pub played_from: Option<DateTime<Utc>>,
     pub played_to: Option<DateTime<Utc>>,
+    /// Only records that carry no Mahjong Soul protobuf. Defaulted rather than
+    /// optional so every existing caller and every export job snapshot written
+    /// before it existed keeps meaning "the whole corpus".
+    ///
+    /// It exists for the re-fetch walk, which is looking for exactly those and
+    /// would otherwise page through the million rows that already have one to
+    /// skip them a thousand at a time.
+    #[serde(default)]
+    pub missing_pb: bool,
 }
 
 impl RecordFilter {
@@ -610,6 +619,14 @@ impl Catalog {
             sql.push_str(" AND rule = {rule:String}");
             params.push(("rule", rule.clone()));
         }
+        // Reads the same "no protobuf" as `PbLocation::from_columns`: a stored
+        // entry always has a non-zero size, because a record that was converted
+        // from one has bytes. Correct only under the FINAL above — a record that
+        // has since been re-fetched still has its old zero-sized row in an
+        // unmerged part, and without FINAL the walk would keep finding it.
+        if filter.missing_pb {
+            sql.push_str(" AND pb_size = 0");
+        }
         // Bounds go over the wire as epoch milliseconds: a bare
         // `{x:DateTime64(3)}` would be read in the server timezone, and the
         // `played_at` comparisons are NULL for unset values either way, which
@@ -924,6 +941,30 @@ impl Catalog {
                 compressed_bytes: totals.compressed_bytes,
             },
         })
+    }
+
+    /// How many indexed records carry no Mahjong Soul protobuf: the size of the
+    /// re-fetch backlog.
+    ///
+    /// FINAL, unlike every count in [`Self::stats`]. A record the re-fetch pass
+    /// has already replaced keeps its old zero-sized row until the parts merge,
+    /// and a backlog figure that counts finished work as outstanding would never
+    /// reach zero. Affordable because a re-fetch run asks once at the start, not
+    /// on every console poll.
+    pub async fn count_missing_pb(&self) -> Result<u64, CatalogError> {
+        #[derive(Default, Deserialize)]
+        struct Missing {
+            missing: u64,
+        }
+        let sql = format!("SELECT count() AS missing FROM {RECORDS_TABLE} FINAL WHERE pb_size = 0");
+        Ok(self
+            .index
+            .query::<Missing>(&sql, &[])
+            .await?
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+            .missing)
     }
 
     /// One row per day for the console's trend charts, gap-filled so a caller

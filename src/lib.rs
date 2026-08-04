@@ -15,6 +15,7 @@ pub mod objects;
 pub mod pack;
 pub mod recovery;
 pub mod refetch;
+pub mod refetch_service;
 pub mod replay;
 pub mod watch;
 pub mod watch_log;
@@ -30,6 +31,7 @@ use managed_watch::ManagedWatchDependencies;
 use mihomo::MihomoManager;
 use objects::Objects;
 use pack::PackStore;
+use refetch_service::{RefetchDependencies, RefetchSupervisor};
 use watch::WatchRegistry;
 use watch_log::WatchLogBuffer;
 use watch_service::WatchSupervisor;
@@ -45,9 +47,10 @@ pub struct AppState {
     pub packs: Arc<PackStore>,
     pub watch: Arc<WatchRegistry>,
     pub watch_service: Arc<WatchSupervisor>,
-    /// Where the re-fetch backfill leaves work for a collector to pick up in
-    /// its spare time. Shared rather than owned by either: see `src/refetch.rs`.
+    /// Where the re-fetch walk leaves work. Served by the re-fetch pool's own
+    /// sessions, and by any collector with spare time: see `src/refetch.rs`.
     pub refetch: Arc<refetch::RefetchBroker>,
+    pub refetch_service: Arc<RefetchSupervisor>,
     pub export_dir: PathBuf,
 }
 
@@ -114,8 +117,21 @@ impl AppState {
             &data_dir,
             Arc::clone(&watch),
             dependencies,
-            watch_logs,
+            Arc::clone(&watch_logs),
         )?);
+        // After the collectors, and holding them: the pool asks them which
+        // accounts are spoken for and which protocol modules to use. Nothing
+        // points back the other way, so the two `Arc`s do not form a cycle.
+        let refetch_service = Arc::new(RefetchSupervisor::new(RefetchDependencies {
+            data_dir: data_dir.clone(),
+            catalog: Arc::clone(&catalog),
+            packs: Arc::clone(&packs),
+            kafka: Arc::clone(&kafka),
+            broker: Arc::clone(&refetch),
+            mihomo: Arc::clone(&mihomo),
+            logs: watch_logs,
+            watch: Arc::clone(&watch_service),
+        })?);
         Ok(Self {
             auth,
             packs,
@@ -126,6 +142,7 @@ impl AppState {
             watch,
             watch_service,
             refetch,
+            refetch_service,
             config: Arc::new(config),
             export_dir,
         })
