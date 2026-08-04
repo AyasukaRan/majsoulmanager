@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::warn;
 
 use super::events::{AnGangAddGangType, ChiPengGangType, GameEvent, parse_record_action};
-use super::proto::decode_game_record;
+use super::proto::{GameRecord, decode_game_record};
 
 fn get_dan_name(level_id: u32) -> String {
     match level_id {
@@ -72,13 +72,19 @@ impl MajsoulConverter {
     /// Convert parsed game events to MJAI JSON events
     fn events_to_mjai(
         &self,
-        uuid: &str,
-        start_time: u32,
-        player_names: &[String],
-        player_accounts: &[super::proto::PlayerAccountMeta],
+        record: &GameRecord,
         events: &[GameEvent],
         metadata: Option<&GameMetadata>,
     ) -> Result<Vec<Value>> {
+        let GameRecord {
+            uuid,
+            start_time,
+            player_names,
+            player_accounts,
+            result,
+            ..
+        } = record;
+        let (uuid, start_time) = (uuid.as_str(), *start_time);
         let mut mjai_events = Vec::new();
         let num_players = player_names.len();
 
@@ -124,6 +130,11 @@ impl MajsoulConverter {
         let mut pending_reach: Option<u32> = None;
         // Track last discarder for ron target calculation
         let mut last_discarder: Option<u32> = None;
+        // Indicators already announced this hand. Mahjong Soul reports the
+        // whole face-up set on every event that can change it rather than the
+        // one it just turned, so a `dora` event is emitted for the tail this
+        // has not seen yet. Reset per hand, because the set starts over.
+        let mut revealed_doras: Vec<String> = Vec::new();
 
         for event in events {
             match event {
@@ -158,6 +169,16 @@ impl MajsoulConverter {
                         "scores": nr.scores,
                         "tehais": tehais,
                     }));
+
+                    // The opening indicator is part of `start_kyoku`, so only
+                    // anything beyond it becomes a `dora` event.
+                    revealed_doras = nr.doras.clone();
+                    for marker in nr.doras.iter().skip(1) {
+                        mjai_events.push(json!({
+                            "type": "dora",
+                            "dora_marker": marker,
+                        }));
+                    }
                 }
 
                 GameEvent::DealTile(dt) => {
@@ -174,6 +195,7 @@ impl MajsoulConverter {
                         "actor": dt.seat,
                         "pai": dt.tile,
                     }));
+                    push_new_doras(&mut mjai_events, &mut revealed_doras, &dt.doras);
                 }
 
                 GameEvent::DiscardTile(dt) => {
@@ -206,8 +228,7 @@ impl MajsoulConverter {
                         }));
                     }
 
-                    // Determine who the call was made from
-                    let target = cpg.froms.first().copied().unwrap_or(0);
+                    let target = called_from(&cpg.froms, cpg.seat, last_discarder);
 
                     match cpg.call_type {
                         ChiPengGangType::Chi => {
@@ -259,6 +280,7 @@ impl MajsoulConverter {
                             }));
                         }
                     }
+                    push_new_doras(&mut mjai_events, &mut revealed_doras, &ag.doras);
                 }
 
                 GameEvent::Hule(h) => {
@@ -271,41 +293,59 @@ impl MajsoulConverter {
                     }
 
                     for hule in &h.hules {
-                        if hule.zimo {
-                            mjai_events.push(json!({
-                                "type": "hora",
-                                "actor": hule.seat,
-                                "target": hule.seat,
-                                "pai": hule.hu_tile,
-                                "hora_tehais": hule.hand,
-                                "fu": hule.fu,
-                                "deltas": h.delta_scores,
-                                "scores": h.scores,
-                                "majsoul_points": {
-                                    "ron": hule.point_rong,
-                                    "tsumo_dealer": hule.point_zimo_qin,
-                                    "tsumo_non_dealer": hule.point_zimo_xian,
-                                },
-                            }));
+                        // The only difference between a tsumo and a ron is who
+                        // the target is; everything else was already identical
+                        // in two copies that had to be kept in step by hand.
+                        let target = if hule.zimo {
+                            hule.seat
                         } else {
-                            // Ron - use the tracked last discarder as target
-                            let target = last_discarder.unwrap_or(0);
-                            mjai_events.push(json!({
-                                "type": "hora",
-                                "actor": hule.seat,
-                                "target": target,
-                                "pai": hule.hu_tile,
-                                "hora_tehais": hule.hand,
-                                "fu": hule.fu,
-                                "deltas": h.delta_scores,
-                                "scores": h.scores,
-                                "majsoul_points": {
-                                    "ron": hule.point_rong,
-                                    "tsumo_dealer": hule.point_zimo_qin,
-                                    "tsumo_non_dealer": hule.point_zimo_xian,
-                                },
-                            }));
-                        }
+                            last_discarder.unwrap_or(0)
+                        };
+                        // Per-hand when the game says so, and the round's
+                        // face-up set otherwise: a double ron reports the same
+                        // indicators twice, and one of the two hands may count
+                        // a kan dora the other cannot.
+                        let dora_markers = if hule.doras.is_empty() {
+                            &h.doras
+                        } else {
+                            &hule.doras
+                        };
+                        mjai_events.push(json!({
+                            "type": "hora",
+                            "actor": hule.seat,
+                            "target": target,
+                            "pai": hule.hu_tile,
+                            "hora_tehais": hule.hand,
+                            "fu": hule.fu,
+                            // Han, or the yakuman multiplier when `yakuman` is
+                            // set — Mahjong Soul overloads the one field, and
+                            // splitting them here keeps `fan` comparable.
+                            "fan": hule.han,
+                            "yakuman": hule.yiman,
+                            "riichi": hule.riichi,
+                            "dora_markers": dora_markers,
+                            // The only place these are ever revealed. A record
+                            // without them cannot be scored back to its own
+                            // point total.
+                            "uradora_markers": hule.ura_doras,
+                            // mjai's shape, `[name, value]`, with Mahjong Soul's
+                            // own names — which are localisation keys and change
+                            // with the client, so the stable ids travel beside
+                            // them in the same order.
+                            "yakus": hule
+                                .yakus
+                                .iter()
+                                .map(|yaku| json!([yaku.name, yaku.val]))
+                                .collect::<Vec<_>>(),
+                            "yaku_ids": hule.yakus.iter().map(|yaku| yaku.id).collect::<Vec<_>>(),
+                            "deltas": h.delta_scores,
+                            "scores": h.scores,
+                            "majsoul_points": {
+                                "ron": hule.point_rong,
+                                "tsumo_dealer": hule.point_zimo_qin,
+                                "tsumo_non_dealer": hule.point_zimo_xian,
+                            },
+                        }));
                     }
 
                     mjai_events.push(json!({
@@ -324,6 +364,10 @@ impl MajsoulConverter {
 
                     mjai_events.push(json!({
                         "type": "ryukyoku",
+                        "reason": "fanpai",
+                        // Who was tenpai is what decided the payments, and it
+                        // is the only place a record says so.
+                        "tenpais": nt.tenpai,
                         "scores": nt.scores,
                         "deltas": nt.delta_scores,
                     }));
@@ -370,13 +414,34 @@ impl MajsoulConverter {
                         "pai": "N",
                         "tsumogiri": bb.moqie,
                     }));
+                    push_new_doras(&mut mjai_events, &mut revealed_doras, &bb.doras);
                 }
             }
         }
 
-        // End game event
+        // The settlement, which is the only statement of how the game
+        // finished: a game ending on an exhaustive draw has no trailing event
+        // carrying the closing scores, so `end_game` used to be the empty
+        // object and those standings were unrecoverable.
+        //
+        // `scores` is mjai's own field and holds the raw points; the settled
+        // total and the rank points are Mahjong Soul's and sit under its own
+        // key rather than pretending to be part of the format.
         mjai_events.push(json!({
             "type": "end_game",
+            "scores": result.iter().map(|player| player.part_point_1).collect::<Vec<_>>(),
+            "majsoul_result": result
+                .iter()
+                .map(|player| {
+                    json!({
+                        "seat": player.seat,
+                        "total_point": player.total_point,
+                        "part_point_1": player.part_point_1,
+                        "part_point_2": player.part_point_2,
+                        "grading_score": player.grading_score,
+                    })
+                })
+                .collect::<Vec<_>>(),
         }));
 
         Ok(mjai_events)
@@ -404,6 +469,47 @@ fn generate_ankan_tiles(tile: &str) -> Vec<String> {
 ///
 /// Reads .pb files from `input_dir`, converts to gzip MJAI JSONL in `output_dir`,
 /// and optionally deletes the .pb files after successful conversion.
+/// Which seat a chi, pon or daiminkan took its tile from.
+///
+/// `froms` says where each tile in `tiles` came from, and the called tile is the
+/// last one — which is why `pai` is `tiles.last()`. This used to read the
+/// *first* entry, which is one of the caller's own tiles, so every meld in the
+/// corpus claimed to have been called off its own maker: 3,667 calls in a
+/// 300-game sample, 3,667 of them with `target == actor`.
+///
+/// A record with no `froms` at all falls back to whoever discarded last, which
+/// is who it must have been, and to the caller only if there is no such seat
+/// either — a shape that cannot occur in a real record but should not panic.
+fn called_from(froms: &[u32], seat: u32, last_discarder: Option<u32>) -> u32 {
+    froms
+        .last()
+        .copied()
+        .unwrap_or_else(|| last_discarder.unwrap_or(seat))
+}
+
+/// Announces the indicators in `face_up` that have not been announced yet.
+///
+/// Mahjong Soul reports the whole face-up set on every event that can change it
+/// rather than the one tile it just turned, so the difference is what a reader
+/// of the event stream needs; sending the set would make a hand with two kans
+/// look like it revealed four indicators. Compared by position rather than by
+/// value because the same tile can legitimately be turned twice.
+fn push_new_doras(
+    events: &mut Vec<serde_json::Value>,
+    revealed: &mut Vec<String>,
+    face_up: &[String],
+) {
+    for marker in face_up.iter().skip(revealed.len()) {
+        events.push(json!({
+            "type": "dora",
+            "dora_marker": marker,
+        }));
+    }
+    if face_up.len() > revealed.len() {
+        *revealed = face_up.to_vec();
+    }
+}
+
 pub fn convert_raw_files_with_metadata(
     input_dir: &Path,
     output_dir: &Path,
@@ -420,7 +526,7 @@ pub fn convert_raw_files_with_metadata(
     let pb_files: Vec<PathBuf> = fs::read_dir(input_dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "pb"))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "pb"))
         .collect();
 
     if pb_files.is_empty() {
@@ -677,14 +783,7 @@ pub fn convert_record_bytes(
         }
     }
 
-    let mjai_events = MajsoulConverter.events_to_mjai(
-        &record.uuid,
-        record.start_time,
-        &record.player_names,
-        &record.player_accounts,
-        &events,
-        metadata,
-    )?;
+    let mjai_events = MajsoulConverter.events_to_mjai(&record, &events, metadata)?;
 
     let mut compressed = Vec::new();
     {
@@ -773,13 +872,67 @@ mod tests {
             players: 4,
             year: 2020,
         };
+        let record = GameRecord {
+            uuid: "uuid".to_string(),
+            start_time: 123,
+            player_names: Vec::new(),
+            player_accounts: Vec::new(),
+            result: Vec::new(),
+            records: Vec::new(),
+        };
         let events = MajsoulConverter
-            .events_to_mjai("uuid", 123, &[], &[], &[], Some(&metadata))
+            .events_to_mjai(&record, &[], Some(&metadata))
             .unwrap();
         assert_eq!(events[0]["majsoul"]["mode_id"], 16);
         assert_eq!(events[0]["majsoul"]["room"], "throne");
         assert_eq!(events[0]["majsoul"]["game_length"], "south");
         assert_eq!(events[0]["majsoul"]["players"], 4);
         assert_eq!(events[0]["majsoul"]["year"], 2020);
+    }
+
+    /// A pon of `PPP` where the third tile came off seat 3: the caller's own
+    /// two tiles are listed first, so the entry that names the discarder is the
+    /// last one, the same position `pai` is taken from. Reading the first
+    /// instead named the caller every time.
+    #[test]
+    fn a_call_is_attributed_to_the_seat_the_tile_came_from() {
+        assert_eq!(called_from(&[1, 1, 3], 1, Some(3)), 3);
+        // A chi can only come from the left, and that is still the last entry
+        // rather than the first.
+        assert_eq!(called_from(&[2, 2, 1], 2, Some(1)), 1);
+        // Nothing in a real record, but it must not panic or invent a seat.
+        assert_eq!(called_from(&[], 2, Some(0)), 0);
+        assert_eq!(called_from(&[], 2, None), 2);
+    }
+
+    /// Mahjong Soul reports the whole face-up set every time it changes, so a
+    /// hand with two kans would announce four indicators if the set were
+    /// emitted rather than the difference.
+    #[test]
+    fn only_a_newly_turned_indicator_becomes_an_event() {
+        let mut events = Vec::new();
+        let mut revealed = vec!["1m".to_string()];
+
+        push_new_doras(&mut events, &mut revealed, &["1m".into()]);
+        assert!(events.is_empty(), "the opening indicator is start_kyoku's");
+
+        push_new_doras(&mut events, &mut revealed, &["1m".into(), "2m".into()]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "dora");
+        assert_eq!(events[0]["dora_marker"], "2m");
+
+        // The same set again after some unrelated event announces nothing.
+        push_new_doras(&mut events, &mut revealed, &["1m".into(), "2m".into()]);
+        assert_eq!(events.len(), 1);
+
+        // The same tile can legitimately be turned twice, and the second one is
+        // a real reveal — which is why this compares by position, not by value.
+        push_new_doras(
+            &mut events,
+            &mut revealed,
+            &["1m".into(), "2m".into(), "2m".into()],
+        );
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1]["dora_marker"], "2m");
     }
 }

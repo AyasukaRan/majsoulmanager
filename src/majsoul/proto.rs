@@ -178,7 +178,46 @@ pub struct GameRecord {
     pub start_time: u32,
     pub player_names: Vec<String>,
     pub player_accounts: Vec<PlayerAccountMeta>,
+    /// The settlement, seat-ordered. Empty for a record whose head carries no
+    /// `GameEndResult` — an abandoned game, or a shape this decoder has not
+    /// seen — which is why the conversion treats it as optional rather than
+    /// assuming four entries.
+    pub result: Vec<PlayerResult>,
     pub records: Vec<RecordAction>,
+}
+
+/// One seat's settlement: `lq.GameEndResult.PlayerItem`.
+///
+/// This is the only authoritative statement of how a game finished. The event
+/// stream cannot substitute for it: a game that ends on an exhaustive draw has
+/// no trailing event carrying the closing scores, so without this its final
+/// standings are simply not recoverable.
+#[derive(Debug, Clone, Default)]
+pub struct PlayerResult {
+    pub seat: u32,
+    /// Settled points, uma and oka included, in Mahjong Soul's own scale.
+    pub total_point: i32,
+    /// Raw points at the end of the last hand.
+    pub part_point_1: i32,
+    pub part_point_2: i32,
+    /// Rank points gained or lost, which is what moves the account's level.
+    pub grading_score: i32,
+}
+
+fn decode_player_result(data: &[u8]) -> Result<PlayerResult> {
+    let mut result = PlayerResult::default();
+    for field in FieldIterator::new(data) {
+        let field = field?;
+        match (field.number, field.wire_type) {
+            (1, 0) => result.seat = extract_varint(field.data)? as u32,
+            (2, 0) => result.total_point = extract_varint(field.data)? as i32,
+            (3, 0) => result.part_point_1 = extract_varint(field.data)? as i32,
+            (4, 0) => result.part_point_2 = extract_varint(field.data)? as i32,
+            (5, 0) => result.grading_score = extract_varint(field.data)? as i32,
+            _ => {}
+        }
+    }
+    Ok(result)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -221,21 +260,22 @@ pub fn decode_game_record(raw: &[u8]) -> Result<GameRecord> {
     let mut uuid = String::new();
     let mut start_time = 0u32;
     let mut player_accounts = Vec::new();
+    let mut result = Vec::new();
     let mut compressed_data: Option<Vec<u8>> = None;
 
     for field in FieldIterator::new(raw) {
         let field = field?;
         match field.number {
-            1 if field.wire_type == 2 => {
+            1 if field.wire_type == 2
                 // Error message - check if non-empty
-                if !field.data.is_empty() {
-                    for inner in FieldIterator::new(field.data) {
-                        let inner = inner?;
-                        if inner.number == 1 && inner.wire_type == 0 {
-                            let code = extract_varint(inner.data)?;
-                            if code != 0 {
-                                anyhow::bail!("Game record error code: {}", code);
-                            }
+                && !field.data.is_empty() =>
+            {
+                for inner in FieldIterator::new(field.data) {
+                    let inner = inner?;
+                    if inner.number == 1 && inner.wire_type == 0 {
+                        let code = extract_varint(inner.data)?;
+                        if code != 0 {
+                            anyhow::bail!("Game record error code: {}", code);
                         }
                     }
                 }
@@ -251,6 +291,16 @@ pub fn decode_game_record(raw: &[u8]) -> Result<GameRecord> {
                         }
                         11 if inner.wire_type == 2 => {
                             player_accounts.push(decode_player_account(inner.data)?);
+                        }
+                        // result (GameEndResult), whose only field is a
+                        // repeated PlayerItem.
+                        12 if inner.wire_type == 2 => {
+                            for item in FieldIterator::new(inner.data) {
+                                let item = item?;
+                                if (item.number, item.wire_type) == (1, 2) {
+                                    result.push(decode_player_result(item.data)?);
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -310,11 +360,14 @@ pub fn decode_game_record(raw: &[u8]) -> Result<GameRecord> {
         .map(|account| account.nickname.clone())
         .collect();
 
+    result.sort_by_key(|player| player.seat);
+
     Ok(GameRecord {
         uuid,
         start_time,
         player_names,
         player_accounts,
+        result,
         records,
     })
 }
