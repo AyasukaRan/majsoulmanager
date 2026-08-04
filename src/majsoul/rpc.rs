@@ -239,13 +239,13 @@ mod requests {
     }
 
     fn encode_bool(buf: &mut Vec<u8>, field: u32, value: bool) {
-        let tag = (field << 3) | 0;
+        let tag = field << 3;
         encode_varint(buf, tag as u64);
         buf.push(if value { 1 } else { 0 });
     }
 
     fn encode_varint_field(buf: &mut Vec<u8>, field: u32, value: u64) {
-        let tag = (field << 3) | 0;
+        let tag = field << 3;
         encode_varint(buf, tag as u64);
         encode_varint(buf, value);
     }
@@ -399,15 +399,13 @@ impl MajsoulRpc {
         let read_task = tokio::spawn(async move {
             while let Some(msg) = read.next().await {
                 match msg {
-                    Ok(Message::Binary(data)) if data.len() >= 3 => {
-                        if data[0] == 3 {
-                            // RESPONSE
-                            let idx = u16::from_le_bytes([data[1], data[2]]);
-                            if let Ok((_, response_data)) = wrapper::decode(&data[3..]) {
-                                let mut pending = pending_clone.lock().await;
-                                if let Some(tx) = pending.remove(&idx) {
-                                    let _ = tx.send(response_data);
-                                }
+                    Ok(Message::Binary(data)) if data.len() >= 3 && data[0] == 3 => {
+                        // RESPONSE
+                        let idx = u16::from_le_bytes([data[1], data[2]]);
+                        if let Ok((_, response_data)) = wrapper::decode(&data[3..]) {
+                            let mut pending = pending_clone.lock().await;
+                            if let Some(tx) = pending.remove(&idx) {
+                                let _ = tx.send(response_data);
                             }
                         }
                     }
@@ -452,7 +450,7 @@ impl MajsoulRpc {
             self.write
                 .lock()
                 .await
-                .send(Message::Binary(packet.into()))
+                .send(Message::Binary(packet))
                 .await?;
         }
 

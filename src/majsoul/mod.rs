@@ -3,8 +3,6 @@
 //! The built-in adapter is derived from majsoul2mjai at commit
 //! `da98580990279003f0bf0d636d0d6b8fae19a8cd`. See NOTICE.majsoul2mjai.
 
-#![allow(clippy::all)]
-
 pub mod auth;
 pub mod convert;
 pub mod events;
