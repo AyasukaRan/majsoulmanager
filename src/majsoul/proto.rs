@@ -176,6 +176,14 @@ pub struct RecordAction {
 pub struct GameRecord {
     pub uuid: String,
     pub start_time: u32,
+    /// `head.config.meta.mode_id`, or 0 where the head carries no config — a
+    /// friend room, a contest, or a shape this decoder has not seen.
+    ///
+    /// It is what makes a protobuf self-describing. Everything else the
+    /// converter writes into `start_game.majsoul` is derived from this and the
+    /// uuid, so a record fetched by uuid alone — with no stored row to read a
+    /// header off — still comes out with its room and length on it.
+    pub mode_id: i32,
     pub player_names: Vec<String>,
     pub player_accounts: Vec<PlayerAccountMeta>,
     /// The settlement, seat-ordered. Empty for a record whose head carries no
@@ -256,9 +264,28 @@ fn decode_player_account(data: &[u8]) -> Result<PlayerAccountMeta> {
 }
 
 /// Decode ResGameRecord from raw protobuf bytes
+/// `GameConfig.meta.mode_id`, or 0 when the config carries no `meta` — which is
+/// what a friend room looks like.
+fn decode_config_mode_id(data: &[u8]) -> Result<i32> {
+    for field in FieldIterator::new(data) {
+        let field = field?;
+        // meta (GameMetaData)
+        if (field.number, field.wire_type) == (3, 2) {
+            for meta in FieldIterator::new(field.data) {
+                let meta = meta?;
+                if (meta.number, meta.wire_type) == (2, 0) {
+                    return Ok(extract_varint(meta.data)? as i32);
+                }
+            }
+        }
+    }
+    Ok(0)
+}
+
 pub fn decode_game_record(raw: &[u8]) -> Result<GameRecord> {
     let mut uuid = String::new();
     let mut start_time = 0u32;
+    let mut mode_id = 0i32;
     let mut player_accounts = Vec::new();
     let mut result = Vec::new();
     let mut compressed_data: Option<Vec<u8>> = None;
@@ -289,6 +316,13 @@ pub fn decode_game_record(raw: &[u8]) -> Result<GameRecord> {
                         2 if inner.wire_type == 0 => {
                             start_time = extract_varint(inner.data)? as u32
                         }
+                        // config (GameConfig). Its field number is 5 here and 3
+                        // in `GameLiveHead`, which the live-list parser reads —
+                        // two different messages that both call the field
+                        // `config`, so the two parsers cannot share this line.
+                        // Getting it wrong is silent: the mode simply comes out
+                        // as zero.
+                        5 if inner.wire_type == 2 => mode_id = decode_config_mode_id(inner.data)?,
                         11 if inner.wire_type == 2 => {
                             player_accounts.push(decode_player_account(inner.data)?);
                         }
@@ -310,6 +344,8 @@ pub fn decode_game_record(raw: &[u8]) -> Result<GameRecord> {
                 // data (compressed GameDetailRecords)
                 compressed_data = Some(field.data.to_vec());
             }
+            // Same field number as the head's `config`, one level up: this is
+            // `ResGameRecord.data_url`, not `RecordGame.config`.
             5 if field.wire_type == 2 => {
                 // data_url (string) - alternative way to get data
                 // We skip this for now, as we expect inline data
@@ -365,6 +401,7 @@ pub fn decode_game_record(raw: &[u8]) -> Result<GameRecord> {
     Ok(GameRecord {
         uuid,
         start_time,
+        mode_id,
         player_names,
         player_accounts,
         result,
