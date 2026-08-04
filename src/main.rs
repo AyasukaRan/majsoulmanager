@@ -31,6 +31,16 @@ async fn main() -> anyhow::Result<()> {
     let listen = config.listen.clone();
     let state = AppState::local(config).await?;
     state.watch_service.start_if_enabled().await?;
+    // The re-fetch pool. Off unless a configuration turned it on, because it
+    // logs in with real accounts and asks Mahjong Soul for every record the
+    // corpus is missing an original for; an upgrade must not start that by
+    // itself. Its switch, its pacing and its progress live on the console's
+    // 牌谱补抓 page.
+    if let Err(error) = state.refetch_service.start_if_enabled().await {
+        // Never fatal: a pool that cannot read its account file is a reason to
+        // say so on the console, not a reason to take the whole API down.
+        tracing::error!(%error, "补抓服务没能启动");
+    }
     // All of these run behind the listener rather than in front of it: the
     // legacy upload moves hundreds of megabytes, both backfills read the bytes
     // of every record in the index, and the collector waits on ClickHouse, and
@@ -47,9 +57,6 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(backfill::rewrite_record_metadata(state.clone()));
     tokio::spawn(backfill::write_game_scoped_claims(state.clone()));
     tokio::spawn(backfill::score_indexed_records(state.clone()));
-    // Last, and never marked complete: it depends on a collector being up to
-    // serve it, so a boot where the watch is off has to be able to try again.
-    tokio::spawn(backfill::refetch_majsoul_protobufs(state.clone()));
     tokio::spawn(collect_orphans(state.clone()));
     // What the ingest path's backlog ceiling reads. Nothing samples it in the
     // test suite, which is why an unsampled reading of zero has to mean "no

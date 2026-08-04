@@ -421,7 +421,48 @@ impl WatchServiceConfig {
     }
 }
 
-fn validate_secret_ref(value: &str) -> Result<(), WatchServiceError> {
+/// What replaces a proxy URL's credentials on the way out of the process.
+const REDACTED_USERINFO: &str = "***";
+
+/// A proxy URL as it may be read by anyone holding a console login.
+///
+/// `validate` accepts `http://user:password@host:port`, and `connect` registers
+/// those credentials as a log secret — this codebase already treats the field as
+/// something that can hold one. But the configuration document is served by a
+/// route deliberately open to every member, not just administrators, so what
+/// leaves the process keeps the host and loses the userinfo. An unparsable value
+/// is returned as it stands: it was never a URL, so there is nothing to take out
+/// of it, and hiding it whole would leave an operator unable to see their own
+/// typo.
+pub(crate) fn redacted_proxy(url: Option<&str>) -> Option<String> {
+    let url = url?;
+    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+        return Some(url.to_owned());
+    };
+    if parsed.username().is_empty() && parsed.password().is_none() {
+        return Some(url.to_owned());
+    }
+    let _ = parsed.set_username(REDACTED_USERINFO);
+    let _ = parsed.set_password(None);
+    Some(parsed.to_string())
+}
+
+/// Puts the stored credentials back when a caller hands back exactly what
+/// [`redacted_proxy`] gave it.
+///
+/// The console saves a configuration whole, so without this the first save after
+/// any read would replace the proxy password with three asterisks and the
+/// collectors would stop being able to dial out. Anything else the caller
+/// submits is taken at face value, which is how a proxy is actually changed.
+pub(crate) fn restored_proxy(submitted: Option<String>, stored: Option<&str>) -> Option<String> {
+    let submitted = submitted?;
+    if redacted_proxy(stored).as_deref() == Some(submitted.as_str()) {
+        return stored.map(str::to_owned);
+    }
+    Some(submitted)
+}
+
+pub(crate) fn validate_secret_ref(value: &str) -> Result<(), WatchServiceError> {
     let Some((scheme, target)) = value.split_once(':') else {
         return Err(WatchServiceError::InvalidConfig(
             "account_secret_ref must use file: or env:".into(),
@@ -1022,6 +1063,14 @@ impl WatchSupervisor {
         self.config.read().clone()
     }
 
+    /// The configuration as the API serves it: the same document with the proxy
+    /// credentials taken out. Never used to dial anything.
+    pub fn published_config(&self) -> WatchServiceConfig {
+        let mut config = self.config();
+        config.custom_proxy_url = redacted_proxy(config.custom_proxy_url.as_deref());
+        config
+    }
+
     pub fn dashboard(&self, state: Option<&str>, limit: usize) -> WatchDashboard {
         WatchDashboard {
             records: self.registry.summary(state, limit),
@@ -1040,6 +1089,33 @@ impl WatchSupervisor {
         request: InstallModuleRequest,
     ) -> Result<InstalledModule, WatchServiceError> {
         self.modules.install(request).await
+    }
+
+    /// A fresh pair of module workers for the currently selected modules, or
+    /// `(None, None)` where both are builtin.
+    ///
+    /// The re-fetch pool logs in exactly the way a collector does, so it has to
+    /// go through whatever module a deployment has selected — a builtin login
+    /// that a server has stopped accepting is the reason those modules exist. It
+    /// asks here rather than carrying its own selection because two selections
+    /// for one protocol is a way for them to disagree, and the pool has no
+    /// opinion the collectors do not already have.
+    ///
+    /// A pair per caller, not a shared one: a `PluginWorker` serialises every
+    /// request behind one subprocess's stdin, so pool workers sharing a pair
+    /// would have a concurrency setting that changes nothing.
+    pub(crate) async fn module_workers(
+        &self,
+    ) -> Result<(Option<Arc<PluginWorker>>, Option<Arc<PluginWorker>>), WatchServiceError> {
+        let config = self.config();
+        Ok((
+            self.modules
+                .worker(ModuleKind::Login, &config.login_module)
+                .await?,
+            self.modules
+                .worker(ModuleKind::PbFetch, &config.pb_fetch_module)
+                .await?,
+        ))
     }
 
     pub async fn update_config(
@@ -1073,10 +1149,14 @@ impl WatchSupervisor {
                     current: current.revision,
                 });
             }
+            next.custom_proxy_url =
+                restored_proxy(next.custom_proxy_url, current.custom_proxy_url.as_deref());
             next.revision = current.revision.saturating_add(1);
             persist_json(&self.config_path, &next)?;
             *current = next.clone();
         }
+        // Answered redacted, like every other read of this document.
+        next.custom_proxy_url = redacted_proxy(next.custom_proxy_url.as_deref());
         if next.enabled {
             self.reload().await?;
         } else {
@@ -1285,7 +1365,7 @@ impl WatchSupervisor {
     }
 }
 
-fn persist_json<T: Serialize>(path: &Path, value: &T) -> Result<(), WatchServiceError> {
+pub(crate) fn persist_json<T: Serialize>(path: &Path, value: &T) -> Result<(), WatchServiceError> {
     let parent = path.parent().ok_or_else(|| {
         WatchServiceError::InvalidConfig("configuration path has no parent".into())
     })?;
@@ -1321,6 +1401,45 @@ pub fn module_protocol_contract() -> BTreeMap<&'static str, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `GET /api/v1/watch/config` is open to every console member, and a proxy
+    /// URL is allowed to carry `user:password@`. Saving has to survive the
+    /// redaction: the console reads the whole document, edits one field and
+    /// submits all of it back, so a round trip that took the password out and
+    /// then wrote three asterisks over it would leave every collector unable to
+    /// dial out — with the original gone.
+    #[test]
+    fn a_proxy_password_never_leaves_the_process_and_a_round_trip_keeps_it() {
+        let stored = "http://bot:hunter2@proxy.example:7890";
+        let published = redacted_proxy(Some(stored)).unwrap();
+        assert!(!published.contains("hunter2"), "{published}");
+        assert!(published.contains("proxy.example:7890"), "{published}");
+
+        // Handed straight back: the stored credentials come back.
+        assert_eq!(
+            restored_proxy(Some(published), Some(stored)).as_deref(),
+            Some(stored)
+        );
+        // Actually edited: taken at face value, or a proxy could never change.
+        assert_eq!(
+            restored_proxy(
+                Some("http://other:secret@proxy.example:1080".into()),
+                Some(stored)
+            )
+            .as_deref(),
+            Some("http://other:secret@proxy.example:1080")
+        );
+        // Nothing to hide, nothing to restore.
+        let plain = "http://proxy.example:7890";
+        assert_eq!(redacted_proxy(Some(plain)).as_deref(), Some(plain));
+        assert_eq!(redacted_proxy(None), None);
+        assert_eq!(restored_proxy(None, Some(stored)), None);
+        // A value that is not a URL is shown as typed rather than hidden whole.
+        assert_eq!(
+            redacted_proxy(Some("nonsense")).as_deref(),
+            Some("nonsense")
+        );
+    }
 
     #[test]
     fn rejects_plaintext_secret_in_online_config() {
