@@ -27,9 +27,10 @@ const POSTGRES_SCHEMA: &str = include_str!("../migrations/postgres.sql");
 /// Applied in order at every boot, each statement separately. Splitting the
 /// schema across files rather than growing one keeps a table's definition, its
 /// comments and its later `ALTER`s in one place.
-const CLICKHOUSE_SCHEMA: [&str; 2] = [
+const CLICKHOUSE_SCHEMA: [&str; 3] = [
     include_str!("../migrations/clickhouse/001_records.sql"),
     include_str!("../migrations/clickhouse/002_player_games.sql"),
+    include_str!("../migrations/clickhouse/003_paipuya_games.sql"),
 ];
 
 const RECORDS_TABLE: &str = "mjai.records";
@@ -2025,6 +2026,142 @@ impl Catalog {
             max_han: row.max_han,
         })
     }
+
+    /// Records what 牌谱屋 says exists. Idempotent: the table collapses on
+    /// `uuid` within a `started_at`, so re-syncing a window costs storage until
+    /// the next merge and nothing else.
+    pub async fn insert_paipuya_games(&self, games: &[PaipuyaGame]) -> Result<(), CatalogError> {
+        if games.is_empty() {
+            return Ok(());
+        }
+        let rows: Vec<String> = games
+            .iter()
+            .map(|game| {
+                serde_json::json!({
+                    "uuid": game.uuid,
+                    "mode_id": game.mode_id,
+                    "started_at": game.started_at.timestamp_millis(),
+                    "ended_at": game.ended_at.timestamp_millis(),
+                    "players": game.players,
+                    "account_ids": game.account_ids,
+                    "scores": game.scores,
+                })
+                .to_string()
+            })
+            .collect();
+        self.index.insert(PAIPUYA_TABLE, rows.join("\n")).await?;
+        Ok(())
+    }
+
+    /// How many games 牌谱屋 lists in a window, and how many of them this corpus
+    /// is missing.
+    ///
+    /// The comparison is the whole point of the window: matching is on the start
+    /// time and the set of player names, so both sides can be restricted to the
+    /// same range and the corpus side stays a few thousand rows however large
+    /// the catalogue is. Fetching a uuid from Mahjong Soul costs a request from
+    /// a rate-limited account; answering "do we already have this game" costs
+    /// part of one scan, so it is worth doing first for every game rather than
+    /// last for the ones that turn out to be duplicates.
+    ///
+    /// Names are compared sorted, not seat by seat. Both sides claim to be seat
+    /// ordered, and a mismatch in that claim would otherwise report the entire
+    /// catalogue as missing — a failure that looks exactly like success at
+    /// finding work to do.
+    pub async fn paipuya_gap(&self, window: SeriesWindow) -> Result<PaipuyaGap, CatalogError> {
+        #[derive(Default, Deserialize)]
+        struct Row {
+            listed: u64,
+            missing: u64,
+        }
+        // `NOT IN` over a tuple, with both sides bounded by the same window.
+        // FINAL on the corpus side because a record re-indexed by the re-fetch
+        // pool has an older row beside it until the parts merge, and the older
+        // row carries the same players and start time — harmless here, but
+        // FINAL keeps the count of what is present honest.
+        let sql = format!(
+            "SELECT count() AS listed, \
+             countIf((toUnixTimestamp(started_at), arraySort(players)) NOT IN ( \
+                 SELECT toUnixTimestamp(played_at), arraySort(players) \
+                 FROM {RECORDS_TABLE} FINAL \
+                 WHERE played_at >= fromUnixTimestamp64Milli({{from:Int64}}) \
+                   AND played_at < fromUnixTimestamp64Milli({{to:Int64}}) \
+             )) AS missing \
+             FROM {PAIPUYA_TABLE} FINAL \
+             WHERE started_at >= fromUnixTimestamp64Milli({{from:Int64}}) \
+               AND started_at < fromUnixTimestamp64Milli({{to:Int64}})"
+        );
+        let rows: Vec<Row> = self.index.query(&sql, &window.bounds()).await?;
+        let row = rows.into_iter().next().unwrap_or_default();
+        Ok(PaipuyaGap {
+            listed: row.listed,
+            missing: row.missing,
+        })
+    }
+
+    /// The whole catalogue's size and span, for the console to show without
+    /// asking for a window first.
+    pub async fn paipuya_totals(&self) -> Result<PaipuyaTotals, CatalogError> {
+        #[derive(Default, Deserialize)]
+        struct Row {
+            games: u64,
+            earliest: i64,
+            latest: i64,
+        }
+        // No FINAL: this is a headline count, and the same reasoning `stats`
+        // documents applies — a re-synced window reads a few rows high until
+        // the parts merge.
+        let sql = format!(
+            "SELECT count() AS games, \
+             toUnixTimestamp(min(started_at)) AS earliest, \
+             toUnixTimestamp(max(started_at)) AS latest \
+             FROM {PAIPUYA_TABLE}"
+        );
+        let rows: Vec<Row> = self.index.query(&sql, &[]).await?;
+        let row = rows.into_iter().next().unwrap_or_default();
+        Ok(PaipuyaTotals {
+            games: row.games,
+            earliest: (row.games > 0)
+                .then(|| DateTime::from_timestamp(row.earliest, 0))
+                .flatten(),
+            latest: (row.games > 0)
+                .then(|| DateTime::from_timestamp(row.latest, 0))
+                .flatten(),
+        })
+    }
+}
+
+const PAIPUYA_TABLE: &str = "mjai.paipuya_games";
+
+/// One game as 牌谱屋 lists it. Not a record: this deployment may or may not
+/// have the game itself.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PaipuyaGame {
+    pub uuid: String,
+    pub mode_id: i32,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: DateTime<Utc>,
+    /// Seat-ordered nicknames as they were at the time the game was played.
+    pub players: Vec<String>,
+    #[serde(default)]
+    pub account_ids: Vec<u64>,
+    #[serde(default)]
+    pub scores: Vec<i32>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct PaipuyaGap {
+    /// Games 牌谱屋 lists in the window.
+    pub listed: u64,
+    /// Of those, the ones with no matching record here.
+    pub missing: u64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct PaipuyaTotals {
+    pub games: u64,
+    pub earliest: Option<DateTime<Utc>>,
+    pub latest: Option<DateTime<Utc>>,
 }
 
 fn player_game_json(game: &PlayerGame) -> String {

@@ -37,8 +37,9 @@ use crate::{
     },
     catalog::{
         CatalogError, Cursor, DEFAULT_TREND_SPAN, DownloadCounts, DownloadFormat, DownloadJob,
-        DownloadRequest, JobState, PlayerHit, PlayerSummary, Record, RecordFilter, RecordStats,
-        RuleFilter, Series, SeriesUnit, SeriesWindow, StorageStats,
+        DownloadRequest, JobState, PaipuyaGame, PaipuyaGap, PaipuyaTotals, PlayerHit,
+        PlayerSummary, Record, RecordFilter, RecordStats, RuleFilter, Series, SeriesUnit,
+        SeriesWindow, StorageStats,
     },
     indexer::{self, Claimed, IngestError},
     kafka::MAX_PRODUCE_BATCH_BYTES,
@@ -75,6 +76,9 @@ pub fn router(state: AppState) -> Router {
         // pacing belong to the same people who may start a collector.
         .route("/api/v1/refetch/config", put(put_refetch_config))
         .route("/api/v1/refetch/actions", post(post_refetch_action))
+        // Loading the catalogue changes what the pool will go and fetch, so it
+        // sits with the rest of what an administrator decides.
+        .route("/api/v1/paipuya/games", post(post_paipuya_games))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_admin_session,
@@ -103,6 +107,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/watch/proxy", get(get_watch_proxy))
         .route("/api/v1/refetch/config", get(get_refetch_config))
         .route("/api/v1/refetch/status", get(get_refetch_status))
+        .route("/api/v1/paipuya/gap", get(get_paipuya_gap))
         .merge(admin)
         .route("/api/v1/users", get(get_users).post(create_user))
         .route("/api/v1/users/{id}", put(update_user))
@@ -1273,6 +1278,93 @@ async fn get_series_stats(
         }
     };
     Ok(Json(state.catalog.series(window, &filter).await?))
+}
+
+/// How many games one `POST /api/v1/paipuya/games` may carry.
+///
+/// The catalogue being loaded is hundreds of millions of games, so this is a
+/// chunk size for the caller rather than a ceiling on the job: it bounds what
+/// one request holds in memory and what one failed request has to be retried.
+const MAX_PAIPUYA_BATCH: usize = 100_000;
+
+#[derive(Deserialize)]
+struct PaipuyaBatch {
+    games: Vec<PaipuyaGame>,
+}
+
+#[derive(Serialize)]
+struct PaipuyaAccepted {
+    accepted: usize,
+}
+
+/// Records what 牌谱屋 lists. This stores the catalogue, not the games — a row
+/// here is a claim that a game exists, and nothing about it is fetched until
+/// `paipuya_gap` says this corpus does not already have it.
+async fn post_paipuya_games(
+    State(state): State<AppState>,
+    Json(batch): Json<PaipuyaBatch>,
+) -> Result<Json<PaipuyaAccepted>, ApiError> {
+    if batch.games.len() > MAX_PAIPUYA_BATCH {
+        return Err(ApiError::BadRequest(format!(
+            "a batch must not exceed {MAX_PAIPUYA_BATCH} games"
+        )));
+    }
+    // Refused rather than stored, because a game with no players cannot be
+    // matched against the corpus by anything and would be reported as missing
+    // for ever, sending the pool to fetch a uuid it already has.
+    if let Some(empty) = batch.games.iter().find(|game| game.players.is_empty()) {
+        return Err(ApiError::BadRequest(format!(
+            "game {} lists no players, so nothing could ever match it",
+            empty.uuid
+        )));
+    }
+    state.catalog.insert_paipuya_games(&batch.games).await?;
+    Ok(Json(PaipuyaAccepted {
+        accepted: batch.games.len(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct PaipuyaGapQuery {
+    unit: Option<SeriesUnit>,
+    span: Option<u32>,
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+}
+
+#[derive(Serialize)]
+struct PaipuyaReport {
+    #[serde(flatten)]
+    totals: PaipuyaTotals,
+    #[serde(flatten)]
+    gap: PaipuyaGap,
+}
+
+/// How much of what 牌谱屋 lists in a window this corpus is missing.
+///
+/// The window is the same shape the trend charts use, and it is not optional in
+/// spirit: matching is on start time and player names, so both sides are read
+/// over the same range and the corpus side stays small however large the
+/// catalogue grows.
+async fn get_paipuya_gap(
+    State(state): State<AppState>,
+    Query(query): Query<PaipuyaGapQuery>,
+) -> Result<Json<PaipuyaReport>, ApiError> {
+    let unit = query.unit.unwrap_or(SeriesUnit::Day);
+    let window = match (query.from, query.to) {
+        (Some(from), Some(to)) => SeriesWindow::between(unit, from, to)?,
+        (None, None) => SeriesWindow::recent(unit, query.span.unwrap_or(DEFAULT_TREND_SPAN)),
+        _ => {
+            return Err(ApiError::BadRequest(
+                "from and to have to be given together".into(),
+            ));
+        }
+    };
+    let (totals, gap) = tokio::try_join!(
+        state.catalog.paipuya_totals(),
+        state.catalog.paipuya_gap(window),
+    )?;
+    Ok(Json(PaipuyaReport { totals, gap }))
 }
 
 #[derive(Deserialize)]
