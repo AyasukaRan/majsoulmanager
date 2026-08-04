@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
-    catalog::{Catalog, CatalogError, IdempotencyClaim, KeyScope, Record},
+    catalog::{Catalog, CatalogError, IdempotencyClaim, KeyScope, PbLocation, Record},
     kafka::{IngestMessage, Kafka, KafkaError, PartitionConsumer, commit_offset, load_offset},
     mjai,
     objects::ObjectError,
@@ -139,6 +139,10 @@ pub struct Accepted {
 /// `played_at` is the caller's explicit override and nothing else. The record's
 /// own `majsoul.start_time` is read by the worker out of the raw bytes, so it
 /// does not have to travel.
+///
+/// `majsoul_pb` is the protobuf `raw` was converted from, for the one caller
+/// that has one. It is stored beside the record and never parsed here: the
+/// point of keeping it is precisely that nothing today has to understand it.
 pub async fn claim(
     catalog: &Catalog,
     kafka: &Kafka,
@@ -146,6 +150,7 @@ pub async fn claim(
     idempotency_key: &str,
     played_at: Option<DateTime<Utc>>,
     raw: &[u8],
+    majsoul_pb: Option<&[u8]>,
 ) -> Result<Claimed, IngestError> {
     // Before the claim, so a refused record leaves nothing behind in
     // PostgreSQL. The reading is sampled rather than exact — see
@@ -178,7 +183,13 @@ pub async fn claim(
             id,
             sha256,
             key,
-            message: Some(IngestMessage::new(id, source, played_at, raw.to_vec())),
+            message: Some(IngestMessage::new(
+                id,
+                source,
+                played_at,
+                raw.to_vec(),
+                majsoul_pb.map(<[u8]>::to_vec),
+            )),
         }),
     }
 }
@@ -270,8 +281,18 @@ pub async fn ingest_one(
     idempotency_key: &str,
     played_at: Option<DateTime<Utc>>,
     raw: &[u8],
+    majsoul_pb: Option<&[u8]>,
 ) -> Result<Accepted, IngestError> {
-    let claimed = claim(catalog, kafka, source, idempotency_key, played_at, raw).await?;
+    let claimed = claim(
+        catalog,
+        kafka,
+        source,
+        idempotency_key,
+        played_at,
+        raw,
+        majsoul_pb,
+    )
+    .await?;
     let accepted = Accepted {
         id: claimed.id,
         sha256: claimed.sha256.clone(),
@@ -334,7 +355,31 @@ pub fn append_batch(
             }
         };
         let location = writer.append(message.record_id, &message.raw)?;
+        // Straight after the record's own frame and into the same writer, which
+        // is what lets the index store an offset without a second pack key: a
+        // pack is only ever sealed between batches, never between these two
+        // appends.
+        //
+        // Both frames carry the record's id in their entry header. Nothing
+        // reads the pack back by walking ids except `recovery`, which only
+        // scans the legacy corpus — packs written before object storage
+        // existed, which can never contain one of these. Were such a pack ever
+        // restored into that directory, both of a record's frames would be
+        // skipped as already indexed; the cost is one extra query per pack, not
+        // a wrong row.
+        let majsoul_pb = match message.majsoul_pb.as_deref() {
+            Some(pb) => {
+                let stored = writer.append(message.record_id, pb)?;
+                Some(PbLocation {
+                    offset: stored.offset,
+                    compressed_size: stored.compressed_size,
+                    raw_size: stored.raw_size,
+                })
+            }
+            None => None,
+        };
         rows.push(Record {
+            majsoul_pb,
             id: message.record_id,
             source: message.source.clone(),
             sha256: hex::encode(Sha256::digest(&message.raw)),
@@ -789,7 +834,7 @@ mod tests {
         let mut writer = packs.staging_writer(0).unwrap();
         let messages: Vec<IngestMessage> = ["a", "e"]
             .iter()
-            .map(|name| IngestMessage::new(Uuid::new_v4(), "watch-cn", None, record(name)))
+            .map(|name| IngestMessage::new(Uuid::new_v4(), "watch-cn", None, record(name), None))
             .collect();
         let mut rows = Vec::new();
         append_batch(&mut writer, messages.clone(), &mut rows).unwrap();
@@ -810,6 +855,45 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// The protobuf a record was converted from lands in the record's own pack
+    /// and the row points at it, so that a converter improved later can be run
+    /// over the archive instead of only over what arrives after it.
+    ///
+    /// Both halves are asserted to read back byte for byte, because storing an
+    /// offset that resolves to the wrong frame is exactly as lossy as not
+    /// storing one, and is far harder to notice.
+    #[tokio::test]
+    async fn keeps_the_protobuf_a_record_was_converted_from() {
+        let root = temp_dir();
+        let packs = store(&root);
+        let mut writer = packs.staging_writer(0).unwrap();
+        let pb = b"\x08\x96\x01not really a protobuf, and deliberately not parsed".to_vec();
+        let with = IngestMessage::new(
+            Uuid::new_v4(),
+            "majsoul-watch",
+            None,
+            record("a"),
+            Some(pb.clone()),
+        );
+        let without = IngestMessage::new(Uuid::new_v4(), "collector", None, record("b"), None);
+
+        let mut rows = Vec::new();
+        append_batch(&mut writer, vec![with.clone(), without], &mut rows).unwrap();
+
+        let stored = rows[0].majsoul_pb.as_ref().expect("protobuf was kept");
+        assert_eq!(stored.raw_size as usize, pb.len());
+        // Its own frame, not an alias of the record's.
+        assert_ne!(stored.offset, rows[0].storage.offset);
+        let location = stored.in_pack(&rows[0].storage.pack_key);
+        assert_eq!(packs.read(&location).await.unwrap(), pb);
+        assert_eq!(packs.read(&rows[0].storage).await.unwrap(), with.raw);
+
+        // A path with no protobuf stores none rather than an empty frame, which
+        // is what lets `pb_size = 0` mean "never had one".
+        assert!(rows[1].majsoul_pb.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// The one constraint the whole pipeline rests on: `received_at` is the
     /// message's own timestamp. A worker that stamped its own clock would write
     /// a second row for every replayed record instead of converging onto the
@@ -819,7 +903,7 @@ mod tests {
     fn received_at_comes_from_the_message_and_survives_a_replay() {
         let root = temp_dir();
         let packs = store(&root);
-        let message = IngestMessage::new(Uuid::new_v4(), "watch-cn", None, record("a"));
+        let message = IngestMessage::new(Uuid::new_v4(), "watch-cn", None, record("a"), None);
 
         let mut rows = Vec::new();
         append_batch(
@@ -859,8 +943,8 @@ mod tests {
         append_batch(
             &mut packs.staging_writer(0).unwrap(),
             vec![
-                IngestMessage::new(Uuid::new_v4(), "watch-cn", None, b"not json".to_vec()),
-                IngestMessage::new(Uuid::new_v4(), "watch-cn", None, record("a")),
+                IngestMessage::new(Uuid::new_v4(), "watch-cn", None, b"not json".to_vec(), None),
+                IngestMessage::new(Uuid::new_v4(), "watch-cn", None, record("a"), None),
             ],
             &mut rows,
         )
@@ -883,8 +967,8 @@ mod tests {
         append_batch(
             &mut packs.staging_writer(0).unwrap(),
             vec![
-                IngestMessage::new(Uuid::new_v4(), "s", Some(override_at), record("a")),
-                IngestMessage::new(Uuid::new_v4(), "s", None, record("b")),
+                IngestMessage::new(Uuid::new_v4(), "s", Some(override_at), record("a"), None),
+                IngestMessage::new(Uuid::new_v4(), "s", None, record("b"), None),
             ],
             &mut rows,
         )

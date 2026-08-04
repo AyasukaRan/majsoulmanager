@@ -182,6 +182,25 @@ async fn json_body(response: axum::response::Response) -> Value {
     serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
 }
 
+/// An authenticated GET that asserts the status before the caller looks at the
+/// body, so a route that answered `404` or `500` fails on the status line
+/// rather than several frames later on whatever the error body was not.
+async fn ok(app: &Router, uri: &str) -> axum::response::Response {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "GET {uri}");
+    response
+}
+
 #[tokio::test]
 async fn ingests_and_reads_one_record_without_reading_a_whole_pack() {
     let (state, data_dir) = test_state().await;
@@ -246,6 +265,84 @@ async fn ingests_and_reads_one_record_without_reading_a_whole_pack() {
         .await
         .unwrap();
     assert_eq!(contradicted.status(), StatusCode::CONFLICT);
+
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+/// The live collector's path end to end: the protobuf it converted from
+/// survives the broker header, the pack and the three index columns, and comes
+/// back byte for byte.
+///
+/// Driven through `indexer::ingest_one` rather than the HTTP route because that
+/// is the collector's own entry point and the only one that ever has a
+/// protobuf — an upload is already mjai and whatever it was converted from
+/// happened somewhere this process cannot see.
+///
+/// The bytes deliberately cover the whole `u8` range, including NUL and
+/// sequences that are not valid UTF-8: a protobuf is not text, and every hop
+/// here has at some point been a place where something helpfully treated it as
+/// if it were.
+#[tokio::test]
+async fn keeps_the_protobuf_the_collector_converted_from() {
+    let (state, data_dir) = test_state().await;
+    let source = test_source(&data_dir);
+    let app = api::router(state.clone());
+    let raw = br#"{"type":"start_game","names":["a","b","c","d"],"rule":"tonpu"}
+{"type":"start_kyoku","bakaze":"E","kyoku":1}"#;
+    let pb: Vec<u8> = (0..4096).map(|byte| (byte % 256) as u8).collect();
+
+    let with = mjai_management::indexer::ingest_one(
+        &state.catalog,
+        &state.kafka,
+        &source,
+        "pb-game",
+        None,
+        raw,
+        Some(&pb),
+    )
+    .await
+    .unwrap();
+    let without = mjai_management::indexer::ingest_one(
+        &state.catalog,
+        &state.kafka,
+        &source,
+        "no-pb-game",
+        None,
+        br#"{"type":"start_game","names":["w","x","y","z"],"rule":"tonpu"}"#,
+        None,
+    )
+    .await
+    .unwrap();
+    index_pending(&state).await;
+
+    let stored = ok(&app, &format!("/api/v1/records/{}/majsoul-pb", with.id)).await;
+    assert_eq!(
+        to_bytes(stored.into_body(), usize::MAX).await.unwrap(),
+        pb,
+        "the protobuf did not come back byte for byte"
+    );
+
+    // The record's own frame is untouched by the one sitting next to it: two
+    // offsets into one pack, and a read of either resolves to the right half.
+    let mjai = ok(&app, &format!("/api/v1/records/{}/raw", with.id)).await;
+    assert_eq!(
+        to_bytes(mjai.into_body(), usize::MAX).await.unwrap(),
+        raw.as_slice()
+    );
+
+    // A record that never had one answers `404` rather than an empty body, so a
+    // caller can tell "no protobuf was kept" from "here is a zero-byte one".
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/records/{}/majsoul-pb", without.id))
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     std::fs::remove_dir_all(data_dir).unwrap();
 }
@@ -364,6 +461,7 @@ async fn a_produce_does_not_queue_behind_the_pack_workers_long_poll() {
             "produce-behind-poll",
             None,
             br#"{"type":"start_game","names":["a","b","c","d"]}"#.to_vec(),
+            None,
         ))
         .await
         .unwrap();
@@ -1229,6 +1327,7 @@ fn sample_record(source: &str, index: u32) -> mjai_management::catalog::Record {
         players: vec!["a".into(), "b".into(), "c".into(), "d".into()],
         rule: None,
         event_count: index,
+        majsoul_pb: None,
         storage: mjai_management::pack::PackLocation {
             pack_key: "packs/batch.mjpack".into(),
             offset: u64::from(index),
@@ -1637,6 +1736,7 @@ async fn rewrites_the_metadata_of_a_row_indexed_before_the_parser_fix() {
         players: vec!["p0".into(), "p1".into(), "p2".into(), "p3".into()],
         rule: None,
         event_count: 300,
+        majsoul_pb: None,
         storage,
     };
     state.catalog.insert_batch(&[stale]).await.unwrap();

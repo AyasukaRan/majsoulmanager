@@ -838,7 +838,11 @@ async fn watch_session(
             let metadata = metadata_for(&game)?;
             match async {
                 let (_, compressed) = convert_record_bytes(&raw, Some(&metadata))?;
-                ingest(&game.uuid, &compressed, dependencies).await
+                // `raw` is the protobuf the conversion read, and this is the
+                // only moment it exists — nothing fetches it again. It goes to
+                // ingest alongside the mjai so that whatever the converter does
+                // not understand today is still recoverable tomorrow.
+                ingest(&game.uuid, &compressed, &raw, dependencies).await
             }
             .await
             {
@@ -892,6 +896,7 @@ async fn watch_session(
 async fn ingest(
     game_uuid: &str,
     compressed: &[u8],
+    majsoul_pb: &[u8],
     dependencies: &ManagedWatchDependencies,
 ) -> Result<Uuid> {
     let mut decoder = GzDecoder::new(compressed);
@@ -904,6 +909,7 @@ async fn ingest(
         game_uuid,
         None,
         &raw,
+        Some(majsoul_pb),
     )
     .await?;
     Ok(accepted.id)

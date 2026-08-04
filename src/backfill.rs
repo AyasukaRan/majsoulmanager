@@ -491,6 +491,7 @@ mod tests {
             players: vec!["p0".into(), "p1".into(), "p2".into()],
             rule: None,
             event_count: 300,
+            majsoul_pb: None,
             storage: PackLocation {
                 pack_key: "packs/2026/07/16/0-record.mjpack".into(),
                 offset: 4096,
