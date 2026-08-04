@@ -136,11 +136,12 @@ impl Default for WatchInstance {
             enabled: true,
             // Every ranked room, because the two mistakes are not symmetric. A
             // room collected and later discarded is a `WHERE rule =` away; a
-            // room never watched is games that no longer exist, since Majsoul
-            // serves a replay only for a while after it ends. Defaulting to one
-            // room read as a starting point rather than a restriction and cost
-            // this deployment several days of ranked play it can never get
-            // back, so narrowing is the choice an operator makes deliberately.
+            // room never watched is games this deployment never learns the uuid
+            // of, because uuids only ever arrive from `fetchGameLiveList` and
+            // that list is per room. Defaulting to one room read as a starting
+            // point rather than a restriction and cost this deployment several
+            // days of ranked play, so narrowing is the choice an operator makes
+            // deliberately.
             room: "all".into(),
             players: 4,
             modes: vec!["east".into(), "south".into()],
@@ -1462,9 +1463,9 @@ mod tests {
     }
 
     /// The default reaches every instance created without a room being chosen,
-    /// and a room it leaves out cannot be filled in later: Majsoul serves a
-    /// replay only for a while after the game ends, so an unwatched room is
-    /// games that no longer exist. Two instances ran for days on a single-room
+    /// and a room it leaves out is one this deployment never learns the uuids of
+    /// — they come from `fetchGameLiveList`, one call per room, and a game is
+    /// only in that list while it is being played. Two instances ran for days on a single-room
     /// default and collected 61,934 games from a third of the ladder before the
     /// index carried the room at all, which is why this is pinned rather than
     /// left to whoever edits the struct next.

@@ -386,8 +386,12 @@ impl RefetchSupervisor {
         // deployment tracks this: the backlog is not a marker in PostgreSQL like
         // the boot passes, it is the `pb_size = 0` rows themselves, and the
         // overview's counts deliberately leave them out. Without this line an
-        // upgraded deployment goes quiet about a debt that only grows harder to
-        // settle — Mahjong Soul serves a replay for a while, not forever.
+        // upgraded deployment goes quiet about a debt nothing else will mention.
+        //
+        // Whether that debt has a deadline is not known. Nobody here has
+        // measured how long Mahjong Soul serves a replay by uuid, and the
+        // comments that used to assert it does not serve them forever were
+        // repeating a sentence written to justify something else. See #81.
         match self.dependencies.catalog.count_missing_pb().await {
             Ok(0) => {}
             Ok(backlog) => {
@@ -412,10 +416,13 @@ impl RefetchSupervisor {
     /// spend the rest of the day kicking each other off. A disabled collector
     /// counts, because an operator may enable it at any moment while this runs.
     ///
-    /// Live collection is the thing that cannot be redone — Mahjong Soul serves
-    /// a replay only for a while after the game ends — so this errs towards
-    /// giving the pool nothing rather than towards giving it one account too
-    /// many.
+    /// Live collection is the half that cannot be redone, and not because a
+    /// replay expires — nobody has measured that (#81). It is that a uuid only
+    /// ever reaches this deployment through `fetchGameLiveList`, which lists a
+    /// game while it is being played and never again: a collector that was
+    /// locked out for an hour did not fall behind, it never learned those games
+    /// existed. So this errs towards giving the pool nothing rather than
+    /// towards giving it one account too many.
     fn usable_accounts(
         &self,
         config: &RefetchServiceConfig,
