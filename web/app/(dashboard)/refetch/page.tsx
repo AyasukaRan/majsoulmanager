@@ -1,3 +1,4 @@
+import { PaipuyaGapCard } from "@/components/paipuya-gap";
 import { RefetchPanel } from "@/components/refetch-panel";
 import { WatchLogPanel } from "@/components/watch-log-panel";
 
@@ -12,6 +13,7 @@ export default function RefetchPage() {
           这里用一批独立账号按 uuid 把它们重新抓回来、用当前转换器重转，并替换索引里那一行。
         </p>
       </div>
+      <PaipuyaGapCard />
       <RefetchPanel />
       <WatchLogPanel
         source="refetch"

@@ -262,6 +262,23 @@ export type RefetchStatus = {
   progress: RefetchProgress;
 };
 
+/**
+ * How much of what 牌谱屋 lists this corpus is missing.
+ *
+ * `listed`/`missing` are for the requested window; `games`/`earliest`/`latest`
+ * describe the whole synced catalogue. Matching is on start time and the set of
+ * player names, so a game counts as present without anyone having compared
+ * uuids — which is the point: a uuid is only worth fetching for the ones that
+ * do not match.
+ */
+export type PaipuyaReport = {
+  games: number;
+  earliest: string | null;
+  latest: string | null;
+  listed: number;
+  missing: number;
+};
+
 export type InstalledWatchModule = {
   kind: "login" | "pb_fetch";
   name: string;
