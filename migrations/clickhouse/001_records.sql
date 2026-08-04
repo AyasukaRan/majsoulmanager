@@ -17,6 +17,18 @@ CREATE TABLE IF NOT EXISTS mjai.records
     raw_size UInt32,
     codec Enum8('zstd' = 1),
 
+    -- The Mahjong Soul protobuf the record was converted from, as a second
+    -- zstd frame in the same pack. No `pb_pack_key`: both frames are appended
+    -- to one writer inside a single `append_batch`, which never seals between
+    -- them, so a record's protobuf is always in the record's own pack.
+    --
+    -- `pb_size = 0` means no protobuf was stored — every record indexed before
+    -- this column existed, and every record that did not come from the live
+    -- collector (a historical import is already mjai and never had one).
+    pb_offset UInt64 DEFAULT 0,
+    pb_compressed_size UInt32 DEFAULT 0,
+    pb_size UInt32 DEFAULT 0,
+
     indexed_at DateTime64(3, 'UTC') DEFAULT now64(3),
     INDEX players_bloom players TYPE bloom_filter(0.01) GRANULARITY 4,
     INDEX sha256_bloom sha256 TYPE bloom_filter(0.001) GRANULARITY 4,
@@ -38,4 +50,13 @@ SETTINGS index_granularity = 8192;
 -- not on every restart, and only the application can tell those apart.
 ALTER TABLE mjai.records
     ADD INDEX IF NOT EXISTS record_id_bloom record_id TYPE bloom_filter(0.01) GRANULARITY 4;
+
+-- Same reason as the index above: the CREATE cannot reach a table that already
+-- exists. Defaulting to zero rather than Nullable keeps the read path a plain
+-- comparison and costs nothing — an offset of zero is not a valid location,
+-- because every pack begins with its own magic header.
+ALTER TABLE mjai.records
+    ADD COLUMN IF NOT EXISTS pb_offset UInt64 DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS pb_compressed_size UInt32 DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS pb_size UInt32 DEFAULT 0;
 

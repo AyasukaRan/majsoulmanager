@@ -78,6 +78,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/records/batch", post(ingest_batch))
         .route("/api/v1/records/{id}", get(get_record))
         .route("/api/v1/records/{id}/raw", get(get_raw))
+        .route("/api/v1/records/{id}/majsoul-pb", get(get_majsoul_pb))
         .route("/api/v1/stats", get(get_stats))
         .route("/api/v1/stats/series", get(get_series_stats))
         .route(
@@ -471,6 +472,8 @@ async fn ingest_one(
     body: &[u8],
 ) -> Result<IngestResponse, ApiError> {
     check_record_size(state, body)?;
+    // No protobuf: an upload is already mjai, and whatever it was converted
+    // from happened somewhere this process cannot see.
     let accepted = indexer::ingest_one(
         &state.catalog,
         &state.kafka,
@@ -478,6 +481,7 @@ async fn ingest_one(
         idempotency_key,
         played_at,
         body,
+        None,
     )
     .await?;
     Ok(IngestResponse {
@@ -697,6 +701,7 @@ async fn process_batch_archive(
                         &item_key,
                         played_at,
                         &raw,
+                        None,
                     )
                     .await
                     .map_err(ApiError::from),
@@ -880,6 +885,44 @@ async fn get_raw(
     response.headers_mut().insert(
         CONTENT_DISPOSITION,
         HeaderValue::from_str(&format!("attachment; filename=\"{id}.mjson\""))
+            .map_err(|error| ApiError::Internal(error.to_string()))?,
+    );
+    Ok(response)
+}
+
+/// The Mahjong Soul protobuf the record was converted from, byte for byte.
+///
+/// `404` when the record has none, which is every record indexed before the
+/// converter stopped discarding it and every record that never was a protobuf.
+/// No checksum to compare against, unlike `/raw`: `sha256` is the mjai's. The
+/// stored length is checked instead, which is what a truncated pack read would
+/// break.
+async fn get_majsoul_pb(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<Uuid>,
+) -> Result<Response, ApiError> {
+    let record = state.catalog.get(id).await?.ok_or(ApiError::NotFound)?;
+    let location = record
+        .majsoul_pb
+        .as_ref()
+        .ok_or(ApiError::NotFound)?
+        .in_pack(&record.storage.pack_key);
+    let raw = state
+        .packs
+        .read(&location)
+        .await
+        .map_err(|error| ApiError::Internal(error.to_string()))?;
+    if raw.len() != location.raw_size as usize {
+        return Err(ApiError::Internal("protobuf length mismatch".into()));
+    }
+    let mut response = raw.into_response();
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    response.headers_mut().insert(
+        CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!("attachment; filename=\"{id}.pb\""))
             .map_err(|error| ApiError::Internal(error.to_string()))?,
     );
     Ok(response)

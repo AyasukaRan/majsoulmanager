@@ -128,6 +128,11 @@ pub struct IngestMessage {
     /// only the override has to be carried.
     pub played_at: Option<DateTime<Utc>>,
     pub raw: Vec<u8>,
+    /// The Mahjong Soul protobuf `raw` was converted from, for the paths that
+    /// have one. It rides along rather than being fetched again later because
+    /// this is the only moment it exists: the converter is handed these bytes
+    /// and nothing else keeps them.
+    pub majsoul_pb: Option<Vec<u8>>,
     received_at: DateTime<Utc>,
 }
 
@@ -140,17 +145,23 @@ impl IngestMessage {
     /// message timestamp has on the wire, so the value here is the value the
     /// consumer will read back rather than one that quietly loses digits in
     /// transit. The index columns are `DateTime64(3)` for the same reason.
+    ///
+    /// `majsoul_pb` is a parameter rather than a builder call on purpose. Every
+    /// ingest path has to answer it, because the one that quietly answered
+    /// "none" for a year is what this field exists to fix.
     pub fn new(
         record_id: Uuid,
         source: &str,
         played_at: Option<DateTime<Utc>>,
         raw: Vec<u8>,
+        majsoul_pb: Option<Vec<u8>>,
     ) -> Self {
         Self {
             record_id,
             source: source.to_owned(),
             played_at: played_at.map(|at| at.trunc_subsecs(3)),
             raw,
+            majsoul_pb,
             received_at: Utc::now().trunc_subsecs(3),
         }
     }
@@ -164,6 +175,13 @@ impl IngestMessage {
         let mut headers = BTreeMap::from([("source".to_owned(), self.source.into_bytes())]);
         if let Some(played_at) = self.played_at {
             headers.insert("played_at".to_owned(), played_at.to_rfc3339().into_bytes());
+        }
+        // A header rather than a second topic or a framed value: the protobuf
+        // belongs to exactly one record, and `approximate_size` counts header
+        // bytes, so `produce_chunks` keeps honouring the broker's batch bound
+        // without knowing this field exists.
+        if let Some(pb) = self.majsoul_pb {
+            headers.insert("majsoul_pb".to_owned(), pb);
         }
         Record {
             // The canonical hyphenated form rather than the sixteen raw bytes,
@@ -201,10 +219,17 @@ impl IngestMessage {
             .and_then(|at| std::str::from_utf8(at).ok())
             .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
             .map(|at| at.with_timezone(&Utc));
+        // Absent for every record produced before the converter started
+        // keeping it, and for every path that never had one. Not validated as
+        // protobuf here: this half is stored, never parsed, and a consumer that
+        // refused bytes it cannot interpret would be the same mistake as
+        // discarding them.
+        let majsoul_pb = record.headers.get("majsoul_pb").cloned();
         Ok(Self {
             record_id,
             source,
             played_at,
+            majsoul_pb,
             raw: record
                 .value
                 .ok_or_else(|| KafkaError::Malformed(format!("{record_id} has no body")))?,
@@ -652,7 +677,7 @@ mod tests {
     const MEASURED_SIZES: [usize; 4] = [11_352, 53_668, 80_374, 106_157];
 
     fn message(size: usize) -> IngestMessage {
-        IngestMessage::new(Uuid::new_v4(), "test", None, vec![b'x'; size])
+        IngestMessage::new(Uuid::new_v4(), "test", None, vec![b'x'; size], None)
     }
 
     fn records(sizes: impl IntoIterator<Item = usize>) -> Vec<Record> {
@@ -788,7 +813,8 @@ mod tests {
                 .unwrap()
                 .with_timezone(&Utc),
         );
-        let message = IngestMessage::new(Uuid::new_v4(), "watch-cn", played_at, b"{}".to_vec());
+        let message =
+            IngestMessage::new(Uuid::new_v4(), "watch-cn", played_at, b"{}".to_vec(), None);
         let record = message.clone().into_record();
         assert_eq!(record.timestamp, message.received_at());
         assert_eq!(IngestMessage::from_record(record).unwrap(), message);

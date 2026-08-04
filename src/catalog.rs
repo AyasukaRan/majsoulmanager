@@ -28,7 +28,8 @@ const CLICKHOUSE_SCHEMA: &str = include_str!("../migrations/clickhouse/001_recor
 
 const RECORDS_TABLE: &str = "mjai.records";
 const RECORD_COLUMNS: &str = "record_id, source, sha256, received_at, played_at, players, rule, \
-                              event_count, pack_key, pack_offset, compressed_size, raw_size";
+                              event_count, pack_key, pack_offset, compressed_size, raw_size, \
+                              pb_offset, pb_compressed_size, pb_size";
 
 /// docs/architecture.md line 76 — a query either carries a time range or is
 /// bounded by a server-side maximum window.
@@ -82,6 +83,47 @@ pub struct Record {
     pub rule: Option<String>,
     pub event_count: u32,
     pub storage: PackLocation,
+    /// Where the Mahjong Soul protobuf this record was converted from sits in
+    /// the same pack, when one was kept. Absent for every record indexed before
+    /// the converter stopped discarding it, and for every record that never had
+    /// one: an imported mjai log was never a protobuf.
+    pub majsoul_pb: Option<PbLocation>,
+}
+
+/// The protobuf half of a record, in the record's own pack. Deliberately not a
+/// `PackLocation`: it has no `pack_key` of its own — see the column comments in
+/// `migrations/clickhouse/001_records.sql` for why it cannot need one — and
+/// giving it one would invite a caller to set the two keys apart.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PbLocation {
+    pub offset: u64,
+    pub compressed_size: u32,
+    pub raw_size: u32,
+}
+
+impl PbLocation {
+    /// Reads the three stored columns back, treating the all-zero row the
+    /// `ALTER` left behind on existing installations as "no protobuf". A stored
+    /// entry can never look like that: `offset` counts from the start of a pack
+    /// whose first bytes are its magic header, so a real one is never zero.
+    fn from_columns(offset: u64, compressed_size: u32, raw_size: u32) -> Option<Self> {
+        (raw_size > 0 && offset > 0).then_some(Self {
+            offset,
+            compressed_size,
+            raw_size,
+        })
+    }
+
+    /// The location a pack read wants, borrowing the record's own pack key.
+    pub fn in_pack(&self, pack_key: &str) -> PackLocation {
+        PackLocation {
+            pack_key: pack_key.to_owned(),
+            offset: self.offset,
+            compressed_size: self.compressed_size,
+            raw_size: self.raw_size,
+            codec: "zstd",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -1037,6 +1079,15 @@ fn record_json(
         "compressed_size": record.storage.compressed_size,
         "raw_size": record.storage.raw_size,
         "codec": record.storage.codec,
+        // Zero for a record that has no protobuf, which is what the column
+        // default already says; written explicitly because a partial column
+        // list would make every insert here disagree with `RECORD_COLUMNS`.
+        "pb_offset": record.majsoul_pb.as_ref().map_or(0, |pb| pb.offset),
+        "pb_compressed_size": record
+            .majsoul_pb
+            .as_ref()
+            .map_or(0, |pb| pb.compressed_size),
+        "pb_size": record.majsoul_pb.as_ref().map_or(0, |pb| pb.raw_size),
     })
     .to_string()
 }
@@ -1123,6 +1174,9 @@ struct RecordRow {
     pack_offset: u64,
     compressed_size: u32,
     raw_size: u32,
+    pb_offset: u64,
+    pb_compressed_size: u32,
+    pb_size: u32,
 }
 
 impl From<RecordRow> for Record {
@@ -1136,6 +1190,11 @@ impl From<RecordRow> for Record {
             players: row.players,
             rule: (!row.rule.is_empty()).then_some(row.rule),
             event_count: row.event_count,
+            majsoul_pb: PbLocation::from_columns(
+                row.pb_offset,
+                row.pb_compressed_size,
+                row.pb_size,
+            ),
             storage: PackLocation {
                 pack_key: row.pack_key,
                 offset: row.pack_offset,

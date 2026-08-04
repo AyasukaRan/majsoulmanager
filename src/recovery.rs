@@ -74,6 +74,10 @@ pub async fn recover(catalog: &Catalog, packs: &PackStore) -> anyhow::Result<usi
                 players: metadata.players,
                 rule: metadata.rule,
                 event_count: metadata.event_count,
+                // The legacy corpus this walks predates object storage, so it
+                // predates keeping the protobuf by much further still. Nothing
+                // in these packs has one.
+                majsoul_pb: None,
                 storage: location,
             });
         }

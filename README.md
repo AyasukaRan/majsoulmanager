@@ -10,6 +10,7 @@
 - `POST /api/v1/records`：接收单个 mjai/NDJSON 文件，支持幂等键和 SHA-256 校验。
 - `POST /api/v1/records/batch`：接收 tar/tar.gz 批次，每个 member 是一份 mjson，member 本身是 gzip 的也直接接收；`played_at` 逐条取自 `majsoul.start_time`。
 - `GET /api/v1/records`：按来源、时间、玩家筛选，使用游标分页。
+- `GET /api/v1/records/{id}/majsoul-pb`：这条记录转换自的雀魂原始 protobuf，原样返回。内置采集器转换时把 PB 和 mjai 一起存进同一个 pack，索引里 `pb_offset`/`pb_compressed_size`/`pb_size` 三列指向它。转换是有损的——雀魂给的字段远多于 mjai 事件承载的——所以留一份原件，转换器改进之后可以对存档重跑，而不是只对之后收到的记录生效。没有原件的记录返回 `404`：上传进来的本来就是 mjai，转换发生在这个进程看不见的地方；这三列出现之前入库的记录也没有。
 - `POST /api/v1/downloads`：创建异步批量导出任务。
 - `GET /api/v1/downloads/{job_id}`：查询导出进度和下载地址。
 - `GET /api/v1/downloads`：按创建时间倒序列出最近的导出任务。
