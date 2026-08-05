@@ -219,18 +219,13 @@ export type WatchServiceConfig = {
 };
 
 /**
- * The re-fetch pool. It logs in with accounts of its own rather than borrowing a
- * collector's session, so `concurrency` is how many sessions run at once — and
- * it cannot exceed the number of accounts, because Mahjong Soul allows one
- * session per account. The backend reports what it settled on as
- * `RefetchStatus.workers`.
- */
-/**
  * One Mahjong Soul account the console manages. `password` is never returned in
  * full — a stored one reads back as `"***"`, and handing that back on save keeps
  * it, so editing any other field does not wipe it.
  */
 export type StoredAccount = {
+  /** Assigned by the backend. Carries the password across a rename. */
+  id: string;
   username: string;
   password: string;
   /** Which half may log in with it. One account cannot serve both. */
@@ -245,6 +240,13 @@ export type AccountDocument = {
   updated_at: string | null;
 };
 
+/**
+ * The re-fetch pool. It logs in with accounts of its own rather than borrowing a
+ * collector's session, so `concurrency` is how many sessions run at once — and
+ * it cannot exceed the number of accounts, because Mahjong Soul allows one
+ * session per account. The backend reports what it settled on as
+ * `RefetchStatus.workers`.
+ */
 export type RefetchServiceConfig = {
   revision: number;
   enabled: boolean;
@@ -261,7 +263,7 @@ export type RefetchServiceConfig = {
   server: "cn" | "en" | "jp";
   proxy_mode: "direct" | "mihomo" | "custom";
   custom_proxy_url: string | null;
-  /** `file:` or `env:`, one `username,password` per line. Never the accounts themselves. */
+  /** `pool:refetch`, or `file:`/`env:` naming one `username,password` per line. */
   account_secret_ref: string;
   concurrency: number;
   request_delay_ms: number;
@@ -376,7 +378,11 @@ export type MihomoLaneStatus = {
   lane: MihomoLane;
   group: string;
   proxy_url: string;
+  /** Verbatim. `"MAJSOUL"` means "follow whatever the deployment is on". */
   selected_node: string | null;
+  /** What that resolves to — the shared group's node when following it. */
+  effective_node: string | null;
+  follows_shared: boolean;
   available: boolean;
 };
 
@@ -393,7 +399,7 @@ export type MihomoStatus = {
   subscription_configured: boolean;
   subscription_host: string | null;
   update_interval_secs: number;
-  /** The live-collection lane's node, kept for anything reading the old shape. */
+  /** What the shared `MAJSOUL` group is on; both lanes follow it by default. */
   selected_node: string | null;
   lanes: MihomoLaneStatus[];
   proxy_url: string;

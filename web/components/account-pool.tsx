@@ -154,7 +154,14 @@ export function AccountPoolCard() {
                 </label>
                 <label className="space-y-1 text-xs font-medium md:space-y-0">
                   <span className="md:hidden">密码</span>
+                  {/* A real secret field, like every other one in this
+                      console. It holds `***` for a stored account, so nothing
+                      is hidden that was not already hidden — but a plain input
+                      invites a browser to offer it to a password manager and
+                      shows it to whoever is behind the operator. */}
                   <Input
+                    type="password"
+                    autoComplete="new-password"
                     value={account.password}
                     placeholder="密码"
                     onChange={(event) =>
@@ -227,6 +234,8 @@ export function AccountPoolCard() {
                 accounts: [
                   ...accounts,
                   {
+                    // Empty: the backend assigns one on save and hands it back.
+                    id: "",
                     username: "",
                     password: "",
                     purpose: "refetch",

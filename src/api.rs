@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
-    accounts::AccountDocument,
+    accounts::{AccountDocument, AccountPurpose},
     auth::{
         AuthError, AuthSettings, CreateUserRequest, LoginRequest, LoginResponse, RegisterRequest,
         RegistrationStatus, UpdateUserRequest, UserView, VerifyEmailRequest,
@@ -80,7 +80,12 @@ pub fn router(state: AppState) -> Router {
         // reason starting a collector is: what it decides is which Mahjong Soul
         // accounts this deployment logs in with, and one of the two halves it
         // feeds cannot be redone if it is disconnected.
-        .route("/api/v1/accounts", put(put_accounts))
+        // Read as well as written by administrators only. The passwords are
+        // redacted, but a Mahjong Soul login is half a credential and the rest
+        // of this codebase treats it that way — `masked_account` exists so the
+        // console's log panel, which every member can read, never shows one in
+        // full. Serving the whole list to the same members would undo that.
+        .route("/api/v1/accounts", get(get_accounts).put(put_accounts))
         .route("/api/v1/refetch/config", put(put_refetch_config))
         .route("/api/v1/refetch/actions", post(post_refetch_action))
         // Loading the catalogue changes what the pool will go and fetch, so it
@@ -114,9 +119,6 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/watch/modules", get(get_watch_modules))
         .route("/api/v1/watch/modules/protocol", get(get_module_protocol))
         .route("/api/v1/watch/proxy", get(get_watch_proxy))
-        // Readable by every console member, and the passwords are not in it:
-        // `AccountDocument::published` replaces each with three asterisks.
-        .route("/api/v1/accounts", get(get_accounts))
         .route("/api/v1/refetch/config", get(get_refetch_config))
         .route("/api/v1/refetch/status", get(get_refetch_status))
         .route("/api/v1/paipuya/gap", get(get_paipuya_gap))
@@ -340,7 +342,50 @@ async fn put_accounts(
     State(state): State<AppState>,
     Json(document): Json<AccountDocument>,
 ) -> Result<Json<AccountDocument>, ApiError> {
-    Ok(Json(state.accounts.update(document)?))
+    // An account a collector is pointed at cannot be taken away from it here.
+    // Live collection reads its credentials once, when the instance starts, and
+    // keeps using them for the life of the process — so switching one off,
+    // deleting it, or moving it to the re-fetch pool does not stop the session,
+    // it only stops anything from knowing the session exists. The pool would
+    // then be handed an account that is still logged in, the two would kick
+    // each other off, and the games being played meanwhile are the ones nothing
+    // lists twice. Refusing is the only answer that is true to the button.
+    let in_use = state.watch_service.referenced_accounts(&state.accounts);
+    for account in &document.accounts {
+        let still_collecting = in_use.contains(&account.username.to_lowercase());
+        if still_collecting && (!account.enabled || account.purpose != AccountPurpose::Watch) {
+            return Err(WatchServiceError::InvalidConfig(format!(
+                "账号 {} 正被采集实例使用，不能在这里停用或改用途；\
+                 先去 Watch 设置把那个实例指向别的账号或停掉它",
+                account.username
+            ))
+            .into());
+        }
+    }
+    let removed: Vec<&String> = in_use
+        .iter()
+        .filter(|username| {
+            !document
+                .accounts
+                .iter()
+                .any(|account| account.username.to_lowercase() == ***username)
+        })
+        .collect();
+    if let Some(username) = removed.first() {
+        return Err(WatchServiceError::InvalidConfig(format!(
+            "有采集实例正指向账号 {username}，不能删除；先改那个实例的账号引用"
+        ))
+        .into());
+    }
+
+    let saved = state.accounts.update(document)?;
+    // Registered after the write, not at boot: a password added from the
+    // console has to reach the redactor before anything can echo it, and the
+    // one-shot registration in `AppState::local` ran before it existed.
+    for password in state.accounts.secrets() {
+        state.watch_service.log_buffer().register_secret(password);
+    }
+    Ok(Json(saved))
 }
 
 async fn get_refetch_config(State(state): State<AppState>) -> Json<RefetchServiceConfig> {

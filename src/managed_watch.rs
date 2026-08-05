@@ -1168,7 +1168,7 @@ fn event(
 /// same format from one place is what lets an operator point both at a single
 /// file and have the collector claim line one while the pool works through what
 /// is left — the pool drops any account a collector already holds.
-pub(crate) fn load_accounts(
+pub fn load_accounts(
     secret_ref: &str,
     pool: &crate::accounts::AccountPool,
 ) -> Result<Vec<(String, String)>> {
@@ -1229,7 +1229,7 @@ pub(crate) fn load_accounts(
 /// A Mahjong Soul username is half a credential, and `/api/v1/watch/logs` is
 /// open to every member. Enough is kept to tell two accounts apart, which is all
 /// a log line needs it for.
-pub(crate) fn masked_account(username: &str) -> String {
+pub fn masked_account(username: &str) -> String {
     let (local, domain) = match username.split_once('@') {
         Some((local, domain)) => (local, format!("@{domain}")),
         None => (username, String::new()),

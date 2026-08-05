@@ -56,6 +56,17 @@ impl AccountPurpose {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StoredAccount {
+    /// Assigned here when a row arrives without one, and never changed after.
+    ///
+    /// It exists so a password survives a rename. The restore that keeps a
+    /// stored password when the console hands back `***` has to know which
+    /// stored row the submitted one is, and the only other candidate — the
+    /// username — is the field an operator renames. Matching on that made
+    /// correcting a typo in an account name silently resolve to "no stored
+    /// password", which the validator then rejected as 没有密码 while the box
+    /// on screen showed `***`.
+    #[serde(default)]
+    pub id: String,
     pub username: String,
     /// Served as `***` and never in full. A save that hands the asterisks back
     /// keeps whatever is stored, so editing the note does not wipe the password.
@@ -112,7 +123,11 @@ impl AccountDocument {
             // for. The whole point of the split is that a session is exclusive;
             // an account listed under both purposes is the collision this file
             // exists to prevent, spelled out.
-            if !seen.insert(username.to_owned()) {
+            // Compared case-insensitively: these are e-mail logins, Mahjong
+            // Soul treats them as one account, and a pair differing only in
+            // case is the collision this check exists to catch wearing a
+            // disguise.
+            if !seen.insert(username.to_lowercase()) {
                 return Err(WatchServiceError::InvalidConfig(format!(
                     "账号 {username} 出现了两次；雀魂一个账号只能开一个会话，\
                      两处同时用会互相把对方踢下线"
@@ -195,16 +210,32 @@ impl AccountPool {
         let stored: Vec<(String, String)> = document
             .accounts
             .iter()
-            .map(|account| (account.username.clone(), account.password.clone()))
+            .map(|account| (account.id.clone(), account.password.clone()))
             .collect();
         for account in &mut next.accounts {
             account.username = account.username.trim().to_owned();
             let previous = stored
                 .iter()
-                .find(|(username, _)| *username == account.username)
+                .find(|(id, _)| !id.is_empty() && *id == account.id)
                 .map(|(_, password)| password.as_str());
             account.password =
                 restored_secret(Some(account.password.clone()), previous).unwrap_or_default();
+            if account.id.is_empty() {
+                account.id = uuid::Uuid::new_v4().to_string();
+            }
+        }
+        // A row the console handed back with `***` and no matching stored row is
+        // a new account with no password typed into it. Saying so beats the
+        // validator's 没有密码, which points at a box that is not empty.
+        if let Some(account) = next
+            .accounts
+            .iter()
+            .find(|account| account.password == "***")
+        {
+            return Err(WatchServiceError::InvalidConfig(format!(
+                "账号 {} 是新加的，密码栏里的 *** 不是密码，请输入真正的密码",
+                account.username
+            )));
         }
         next.validate()?;
         next.revision = document.revision.saturating_add(1);
@@ -225,8 +256,13 @@ impl AccountPool {
             .filter(|account| account.enabled)
             .filter(|account| match reference {
                 PoolRef::All(purpose) => account.purpose == *purpose,
+                // Case-insensitive, the same as the rule that stops one account
+                // being filed twice. These are e-mail logins; a reference that
+                // differs only in case names the same session, and resolving it
+                // to nothing would make a collector fail to start over a capital
+                // letter.
                 PoolRef::One(purpose, username) => {
-                    account.purpose == *purpose && account.username == *username
+                    account.purpose == *purpose && account.username.eq_ignore_ascii_case(username)
                 }
             })
             .map(|account| (account.username.clone(), account.password.clone()))
@@ -261,20 +297,6 @@ impl AccountPool {
             .map(|account| account.password.clone())
             .collect()
     }
-
-    /// How many enabled accounts each purpose has, for the console to show
-    /// beside the services that use them.
-    pub fn counts(&self) -> (usize, usize) {
-        let document = self.document.read();
-        let count = |purpose: AccountPurpose| {
-            document
-                .accounts
-                .iter()
-                .filter(|account| account.enabled && account.purpose == purpose)
-                .count()
-        };
-        (count(AccountPurpose::Watch), count(AccountPurpose::Refetch))
-    }
 }
 
 /// Written `0600`, like the mihomo subscription: the file holds passwords in
@@ -302,6 +324,7 @@ mod tests {
 
     fn account(username: &str, purpose: AccountPurpose) -> StoredAccount {
         StoredAccount {
+            id: String::new(),
             username: username.to_owned(),
             password: format!("{username}-password"),
             purpose,
@@ -363,6 +386,40 @@ mod tests {
         );
     }
 
+    /// Renaming an account keeps its password.
+    ///
+    /// The console only ever holds `***`, so a rename that lost the match to
+    /// the stored row would submit three asterisks as the password — which the
+    /// validator then rejects, pointing at a field the operator can see is not
+    /// empty. Correcting a typo in an account name has to work.
+    #[test]
+    fn renaming_an_account_keeps_the_password_it_never_saw() {
+        let store = pool(vec![account("typo@example.com", AccountPurpose::Refetch)]);
+        let mut published = store.published();
+        assert_eq!(published.accounts[0].password, "***");
+        assert!(!published.accounts[0].id.is_empty(), "an id was assigned");
+        published.accounts[0].username = "fixed@example.com".into();
+        store.update(published).unwrap();
+
+        assert_eq!(
+            store.resolve(&PoolRef::All(AccountPurpose::Refetch)),
+            [(
+                "fixed@example.com".to_owned(),
+                "typo@example.com-password".to_owned()
+            )]
+        );
+
+        // A genuinely new row carrying the asterisks says so, rather than
+        // failing as "no password" on a box that shows three characters.
+        let mut published = store.published();
+        published.accounts.push(StoredAccount {
+            password: "***".into(),
+            ..account("fresh@example.com", AccountPurpose::Refetch)
+        });
+        let refused = store.update(published).unwrap_err().to_string();
+        assert!(refused.contains("fresh@example.com"), "{refused}");
+    }
+
     /// One account cannot be in both halves. Mahjong Soul allows one session
     /// per account, so the two would kick each other off for as long as both
     /// ran, and what is lost meanwhile is live games nothing can fetch twice.
@@ -372,7 +429,9 @@ mod tests {
             revision: 0,
             accounts: vec![
                 account("shared@example.com", AccountPurpose::Watch),
-                account("shared@example.com", AccountPurpose::Refetch),
+                // Differing only in case. These are e-mail logins and Mahjong
+                // Soul treats them as one account.
+                account("Shared@Example.com", AccountPurpose::Refetch),
             ],
             updated_at: None,
         };

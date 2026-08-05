@@ -120,13 +120,23 @@ export function WatchProxyCard({
               {proxy?.subscription_host ?? "未配置"}
             </span>
           </div>
+          <div className="mt-2 flex justify-between gap-3">
+            <span className="text-muted-foreground">全局</span>
+            <span className="truncate font-medium">
+              {proxy?.selected_node ?? "DIRECT"}
+            </span>
+          </div>
           {(proxy?.lanes ?? []).map((lane) => (
             <div key={lane.lane} className="mt-2 flex justify-between gap-3">
               <span className="text-muted-foreground">
                 {LANE_LABELS[lane.lane]}
               </span>
               <span className="truncate font-medium">
-                {lane.available ? (lane.selected_node ?? "DIRECT") : "分组未生效"}
+                {!lane.available
+                  ? "分组未生效"
+                  : lane.follows_shared
+                    ? `跟随全局（${lane.effective_node ?? "DIRECT"}）`
+                    : (lane.selected_node ?? "DIRECT")}
               </span>
             </div>
           ))}
@@ -163,11 +173,20 @@ export function WatchProxyCard({
             {LANE_LABELS[lane.lane]}出站节点
             <select
               className={selectClass}
-              value={lane.selected_node ?? "DIRECT"}
+              // "跟随全局" when mihomo has no group for this lane either: the
+              // half really is going out through the shared port and the shared
+              // group, which is what that option means.
+              value={lane.selected_node ?? "MAJSOUL"}
               onChange={(event) => void selectNode(lane.lane, event.target.value)}
               disabled={!proxy?.available || !lane.available || busy}
             >
-              <option value="DIRECT">DIRECT</option>
+              {/* The default, and the reason an upgrade changes nothing: a lane
+                  that has never been picked follows the group the deployment
+                  was already on. */}
+              <option value="MAJSOUL">
+                跟随全局（{proxy?.selected_node ?? "DIRECT"}）
+              </option>
+              <option value="DIRECT">DIRECT（本机出口）</option>
               {proxy?.nodes.map((node) => (
                 <option key={node.name} value={node.name}>
                   {node.name}
@@ -179,7 +198,7 @@ export function WatchProxyCard({
             <span className="block font-normal text-muted-foreground">
               {lane.available
                 ? `走 ${lane.proxy_url}`
-                : `mihomo 里没有 ${lane.group} 这个分组——它没接受本进程生成的配置，这一半还在走原来的出站`}
+                : `mihomo 里还没有 ${lane.group} 这个分组，这一半仍然走 ${proxy?.proxy_url ?? "共用出站"}——和分流之前一样，不会断`}
             </span>
           </label>
         ))}

@@ -1087,6 +1087,33 @@ impl WatchSupervisor {
         self.logs.entries_after(after, limit)
     }
 
+    /// The accounts the configured collectors would log in with, lowercased.
+    ///
+    /// Asked by anything about to take an account away — the account pool page
+    /// is the only caller today. Every instance counts, enabled or not: a
+    /// disabled one is enabled again with a click, and the window between the
+    /// two is exactly when a second login costs live games.
+    ///
+    /// A reference that will not resolve contributes nothing, which is right
+    /// here and wrong elsewhere: this answers "is this account spoken for", and
+    /// a reference nobody can read names no account. The re-fetch pool asks the
+    /// opposite question — "may I take this" — and refuses to start rather than
+    /// guess; see `RefetchSupervisor::collector_accounts`.
+    pub fn referenced_accounts(
+        &self,
+        accounts: &crate::accounts::AccountPool,
+    ) -> std::collections::HashSet<String> {
+        self.config()
+            .instances
+            .iter()
+            .filter_map(|instance| {
+                crate::managed_watch::load_accounts(&instance.account_secret_ref, accounts)
+                    .ok()
+                    .map(|mut resolved| resolved.swap_remove(0).0.to_lowercase())
+            })
+            .collect()
+    }
+
     pub fn log_buffer(&self) -> Arc<WatchLogBuffer> {
         Arc::clone(&self.logs)
     }
@@ -1157,6 +1184,34 @@ impl WatchSupervisor {
         // Before validation, which rejects an instance with no key at all.
         next.mint_missing_keys();
         next.validate()?;
+        // Two collectors on one account is the failure this service refuses
+        // hardest, and `validate` can only compare the reference strings it is
+        // given. Two spellings — `pool:watch/live@example.com` and an `env:`
+        // variable whose first line is that account — reach the same session
+        // and pass that check. Resolving them is the only way to see it, and
+        // resolving needs the store, which `validate` does not have.
+        {
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for instance in &next.instances {
+                // Unreadable is not wrong: an operator may point an instance at
+                // an account a moment before adding it, and `validate_secret_ref`
+                // deliberately checks shape only.
+                let Ok(mut resolved) = crate::managed_watch::load_accounts(
+                    &instance.account_secret_ref,
+                    &self.dependencies.accounts,
+                ) else {
+                    continue;
+                };
+                let username = resolved.swap_remove(0).0.to_lowercase();
+                if !seen.insert(username.clone()) {
+                    return Err(WatchServiceError::InvalidConfig(format!(
+                        "有两个采集实例最终会用同一个账号（{}）；雀魂一个账号只能开一个会话，\
+                         它们会互相把对方踢下线",
+                        crate::managed_watch::masked_account(&username)
+                    )));
+                }
+            }
+        }
         self.probe_modules(&next).await?;
         let submitted = next.revision;
         {

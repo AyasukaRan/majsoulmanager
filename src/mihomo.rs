@@ -18,6 +18,13 @@ const PROVIDER_NAME: &str = "majsoul";
 const GROUP_NAME: &str = "MAJSOUL";
 const HEALTH_URL: &str = "https://www.gstatic.com/generate_204";
 
+/// How many times the boot pass asks mihomo to load the lane groups, and how
+/// long it waits between asks. Sized to cover a mihomo that is still starting —
+/// it waits for this API to report healthy before it starts at all, so on a
+/// fresh deployment it is genuinely not there for the first few seconds.
+const LANE_ATTEMPTS: u32 = 12;
+const LANE_RETRY_DELAY: Duration = Duration::from_secs(5);
+
 /// Which half of the deployment a request belongs to.
 ///
 /// Live collection and the re-fetch pool go out of separate listeners bound to
@@ -107,7 +114,16 @@ pub struct MihomoLaneStatus {
     pub lane: MihomoLane,
     pub group: String,
     pub proxy_url: String,
+    /// What this lane is set to, verbatim. `MAJSOUL` — the name of the shared
+    /// group — is the default and means "whatever the deployment is on".
     pub selected_node: Option<String>,
+    /// What that resolves to. Equal to `selected_node` unless the lane is
+    /// following the shared group, in which case it is that group's node. The
+    /// console shows both, because "跟随全局" and the node it lands on are two
+    /// different things an operator needs to see at once.
+    pub effective_node: Option<String>,
+    /// Whether this lane follows the shared group rather than naming a node.
+    pub follows_shared: bool,
     pub available: bool,
 }
 
@@ -126,8 +142,9 @@ pub struct MihomoStatus {
     pub subscription_configured: bool,
     pub subscription_host: Option<String>,
     pub update_interval_secs: u64,
-    /// What the live-collection lane is on. Kept under its old name so a
-    /// console that has not been updated still shows something true.
+    /// What the shared `MAJSOUL` group is on, which is what this field has
+    /// always meant. Both lanes follow it until somebody picks otherwise, so it
+    /// is still the one answer to "where does this deployment go out from".
     pub selected_node: Option<String>,
     /// One entry per lane, keyed by its `snake_case` name.
     pub lanes: Vec<MihomoLaneStatus>,
@@ -156,6 +173,20 @@ pub struct MihomoManager {
     controller_url: Url,
     controller_secret: String,
     proxy_url: String,
+    /// Whether mihomo is actually running the per-lane groups this process
+    /// generated, rather than whatever configuration it was started with.
+    ///
+    /// It has to be a fact read back from the controller, not an assumption,
+    /// and the reason is an upgrade. The mihomo container is not recreated when
+    /// only the API image changes, so it goes on serving the configuration it
+    /// booted with — one `mixed-port: 7890` and no lane listeners — until
+    /// something reloads it. Meanwhile `main.rs` starts the collectors, and a
+    /// collector handed `:7891` before that reload dials a port nothing is
+    /// listening on and fails every login. Live collection is the half that
+    /// cannot be redone, so until the lanes are confirmed present both halves
+    /// get the shared port, which is exactly what they used before this
+    /// existed.
+    lanes_ready: std::sync::atomic::AtomicBool,
     subscription: RwLock<Option<StoredSubscription>>,
     client: Client,
 }
@@ -185,6 +216,7 @@ impl MihomoManager {
             controller_url,
             controller_secret,
             proxy_url,
+            lanes_ready: std::sync::atomic::AtomicBool::new(false),
             subscription: RwLock::new(subscription),
             client,
         };
@@ -199,10 +231,20 @@ impl MihomoManager {
     /// Where one half of the deployment dials.
     ///
     /// Derived from the shared proxy URL's host so a deployment that moved
-    /// mihomo somewhere else does not have to say so three times. Falls back to
-    /// the shared port if that URL cannot be parsed, which keeps a malformed
-    /// setting costing the split rather than costing all outbound traffic.
+    /// mihomo somewhere else does not have to say so three times. Two things
+    /// make it fall back to the shared port, and both are the same rule: never
+    /// hand out an address nothing is listening on. A URL that will not parse
+    /// costs the split rather than all outbound traffic, and a mihomo that has
+    /// not picked up the lane groups yet costs the split rather than every
+    /// collector login. See [`Self::lanes_ready`].
+    ///
+    /// A collector that started before the lanes came up keeps the shared port
+    /// until it reconnects, which is correct: that port works, and moving a
+    /// live session's exit underneath it would buy nothing.
     pub fn proxy_url_for(&self, lane: MihomoLane) -> String {
+        if !self.lanes_ready.load(std::sync::atomic::Ordering::Relaxed) {
+            return self.proxy_url.clone();
+        }
         let with_port = || {
             let mut url = Url::parse(&self.proxy_url).ok()?;
             url.set_port(Some(lane.port())).ok()?;
@@ -211,16 +253,24 @@ impl MihomoManager {
         with_port().unwrap_or_else(|| self.proxy_url.clone())
     }
 
+    /// Whether the lanes are live, for anything that has to explain itself.
+    pub fn lanes_ready(&self) -> bool {
+        self.lanes_ready.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub async fn status(&self) -> MihomoStatus {
         match self.read_nodes().await {
-            Ok((lanes, nodes)) => self.status_value(true, lanes, nodes, None),
-            Err(error) => self.status_value(false, Vec::new(), Vec::new(), Some(error.to_string())),
+            Ok((selected, lanes, nodes)) => self.status_value(true, selected, lanes, nodes, None),
+            Err(error) => {
+                self.status_value(false, None, Vec::new(), Vec::new(), Some(error.to_string()))
+            }
         }
     }
 
     fn status_value(
         &self,
         available: bool,
+        selected_node: Option<String>,
         lanes: Vec<MihomoLaneStatus>,
         nodes: Vec<MihomoNode>,
         error: Option<String>,
@@ -235,10 +285,7 @@ impl MihomoManager {
             update_interval_secs: subscription
                 .map(|value| value.update_interval_secs)
                 .unwrap_or(default_update_interval()),
-            selected_node: lanes
-                .iter()
-                .find(|lane| lane.lane == MihomoLane::Watch)
-                .and_then(|lane| lane.selected_node.clone()),
+            selected_node,
             lanes,
             proxy_url: self.proxy_url.clone(),
             nodes,
@@ -247,20 +294,62 @@ impl MihomoManager {
         }
     }
 
-    /// Makes mihomo read the configuration this process just wrote.
+    /// Makes mihomo read the configuration this process just wrote, and does
+    /// not claim the lanes work until it can see them.
     ///
-    /// Called once behind the listener at boot, because the file is generated
-    /// here and mihomo only reads it when it starts or when it is told to. An
-    /// upgrade that adds a group — which is what the per-half split is — would
-    /// otherwise not take effect until somebody restarted the container, and
-    /// the console would show two lanes that are not there. Failure is reported
-    /// and swallowed: mihomo may simply not be up yet, and the deployment runs
-    /// on the configuration it already has either way.
+    /// Called behind the listener at boot, because the file is generated here
+    /// and mihomo only reads it when it starts or when it is told to. On an
+    /// upgrade the mihomo container is not recreated — only the API image
+    /// changed — so this reload is the only thing that puts the lane listeners
+    /// up, and until it lands nothing is listening on their ports.
+    ///
+    /// It retries rather than trying once. The one-shot version had a failure
+    /// with no floor under it: mihomo not up yet, the controller refusing, a
+    /// secret that does not match, and every collector would spend the life of
+    /// the process dialling a closed port. Retrying costs a few seconds of
+    /// sleeping on a task nothing waits for.
     pub async fn apply_runtime_config(&self) {
-        match self.reload_config().await {
-            Ok(()) => tracing::info!("mihomo 已重新读取本进程生成的配置"),
-            Err(error) => tracing::warn!(%error, "mihomo 没有重新读取配置，出站分组可能还是旧的"),
+        for attempt in 1..=LANE_ATTEMPTS {
+            if let Err(error) = self.reload_config().await {
+                tracing::warn!(attempt, %error, "mihomo 还没接受重载，稍后再试");
+            } else if self.lane_groups_present().await {
+                self.lanes_ready
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(
+                    attempt,
+                    "mihomo 已加载分流出站，实时采集走 {}，补抓走 {}",
+                    self.proxy_url_for(MihomoLane::Watch),
+                    self.proxy_url_for(MihomoLane::Refetch)
+                );
+                return;
+            } else {
+                tracing::warn!(attempt, "mihomo 重载了但还没有分流出站的策略组");
+            }
+            tokio::time::sleep(LANE_RETRY_DELAY).await;
         }
+        // Not fatal, and deliberately so: without the lanes both halves keep
+        // using the shared port, which is what they used before the split
+        // existed. The console says which of the two is happening.
+        tracing::error!(
+            "mihomo 没能加载分流出站的策略组，实时采集和补抓继续共用 {}；\
+             控制台「mihomo 代理」卡片会显示分组未生效",
+            self.proxy_url
+        );
+    }
+
+    /// Whether mihomo currently has every lane's group. Read from the
+    /// controller, because what this process wrote to a file and what mihomo
+    /// accepted are different questions.
+    async fn lane_groups_present(&self) -> bool {
+        let Ok(value) = self.controller_json(Method::GET, "/proxies", None).await else {
+            return false;
+        };
+        let Some(proxies) = value.get("proxies").and_then(serde_json::Value::as_object) else {
+            return false;
+        };
+        MihomoLane::ALL
+            .into_iter()
+            .all(|lane| proxies.contains_key(lane.group()))
     }
 
     pub async fn update_subscription(
@@ -345,7 +434,10 @@ impl MihomoManager {
         Ok(())
     }
 
-    async fn read_nodes(&self) -> Result<(Vec<MihomoLaneStatus>, Vec<MihomoNode>), MihomoError> {
+    #[allow(clippy::type_complexity)]
+    async fn read_nodes(
+        &self,
+    ) -> Result<(Option<String>, Vec<MihomoLaneStatus>, Vec<MihomoNode>), MihomoError> {
         let value = self.controller_json(Method::GET, "/proxies", None).await?;
         let proxies = value
             .get("proxies")
@@ -355,26 +447,44 @@ impl MihomoManager {
         // generates the configuration but mihomo decides whether to accept it,
         // and a lane whose group is absent is a lane whose picker would change
         // nothing.
+        let shared = proxies
+            .get(GROUP_NAME)
+            .and_then(|group| group.get("now"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
         let lanes: Vec<MihomoLaneStatus> = MihomoLane::ALL
             .into_iter()
             .map(|lane| {
                 let group = proxies.get(lane.group());
+                let selected = group
+                    .and_then(|group| group.get("now"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                let follows_shared = selected.as_deref() == Some(GROUP_NAME);
                 MihomoLaneStatus {
                     lane,
                     group: lane.group().to_owned(),
                     proxy_url: self.proxy_url_for(lane),
-                    selected_node: group
-                        .and_then(|group| group.get("now"))
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned),
+                    effective_node: if follows_shared {
+                        shared.clone()
+                    } else {
+                        selected.clone()
+                    },
+                    selected_node: selected,
+                    follows_shared,
                     available: group.is_some(),
                 }
             })
             .collect();
-        let selected = lanes
-            .iter()
-            .find(|lane| lane.lane == MihomoLane::Watch)
-            .and_then(|lane| lane.selected_node.clone());
+        // Every console poll re-answers the question the boot pass asked, so a
+        // mihomo that was restarted, or reloaded by hand, or simply slow, turns
+        // the lanes on without this process being restarted — and one that lost
+        // them turns them back off before a collector is handed a dead port.
+        self.lanes_ready.store(
+            lanes.iter().all(|lane| lane.available),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let selected = shared;
         let provider_names = self.provider_node_names().await.unwrap_or_default();
         let mut nodes = Vec::new();
         for name in provider_names {
@@ -411,7 +521,7 @@ impl MihomoManager {
                     &right.name,
                 ))
         });
-        Ok((lanes, nodes))
+        Ok((selected, lanes, nodes))
     }
 
     async fn provider_node_names(&self) -> Result<Vec<String>, MihomoError> {
@@ -505,11 +615,21 @@ proxy-providers:
         // additive; if mihomo rejects them it keeps the configuration it has,
         // which is why `MihomoLaneStatus::available` is read back from the
         // controller rather than assumed.
+        // The first entry is what a group with no stored choice resolves to, and
+        // for a lane that must be the group it splits — not `DIRECT`. These two
+        // names have never been chosen before, so on the boot that introduces
+        // them `store-selected` has nothing to restore and mihomo falls through
+        // to `proxies[0]`. With `DIRECT` there, an upgrade would quietly move
+        // live collection off the subscription node the operator picked and out
+        // of the host's own address, for bot accounts that were deliberately
+        // behind a proxy, with nothing said anywhere. Naming `MAJSOUL` instead
+        // means an unpicked lane follows whatever the deployment was already
+        // on, and the split costs nothing until somebody asks for it.
         let lane_groups: String = MihomoLane::ALL
             .into_iter()
             .map(|lane| {
                 format!(
-                    "  - name: {}\n    type: select\n    proxies:\n      - DIRECT\n{provider_use}",
+                    "  - name: {}\n    type: select\n    proxies:\n      - {GROUP_NAME}\n      - DIRECT\n{provider_use}",
                     lane.group()
                 )
             })
@@ -533,6 +653,13 @@ mode: rule
 log-level: info
 ipv6: false
 external-controller: 0.0.0.0:9090
+# Selections survive a restart. Without it mihomo resets every select group to
+# its first entry — DIRECT — whenever the container comes back, so a deployment
+# would silently start collecting from the host's own address until somebody
+# noticed and re-picked. That was true of the single group before the split and
+# would have been true of all three after it.
+profile:
+  store-selected: true
 secret: {}
 {}
 proxy-groups:
@@ -666,6 +793,25 @@ mod lane_tests {
         // not move a running collector's exit as a side effect.
         assert!(config.contains("mixed-port: 7890"), "{config}");
         assert!(config.contains("  - MATCH,MAJSOUL\n"), "{config}");
+        // Each lane follows the group the deployment is already on rather than
+        // DIRECT, which is what makes the split cost nothing until it is asked
+        // for. Verified against metacubex/mihomo v1.19.27: a fresh container
+        // reports `MAJSOUL-WATCH now = MAJSOUL`, moving MAJSOUL to another node
+        // moves both lanes with it, an explicit per-lane pick overrides only
+        // that lane, and all three survive a restart.
+        for lane in MihomoLane::ALL {
+            assert!(
+                config.contains(&format!(
+                    "  - name: {}\n    type: select\n    proxies:\n      - {GROUP_NAME}\n",
+                    lane.group()
+                )),
+                "{lane:?} does not default to the shared group: {config}"
+            );
+        }
+        // And a selection outlives a restart. Without this every select group
+        // resets to its first entry, which is DIRECT — the deployment would
+        // quietly start reaching Mahjong Soul from the host's own address.
+        assert!(config.contains("store-selected: true"), "{config}");
 
         for lane in MihomoLane::ALL {
             assert!(
@@ -680,8 +826,21 @@ mod lane_tests {
                 config.contains(&format!("    proxy: {}\n", lane.group())),
                 "{lane:?}'s listener is not bound to its group: {config}"
             );
-            // And the URL each half dials is that listener, on the host the
-            // shared setting names.
+            // And until mihomo is confirmed to have the group, each half dials
+            // the shared port — the one that worked before this existed. This
+            // is the assertion that fails if the fail-safe is ever removed: an
+            // upgrade hands the collectors `:7891` while the mihomo container,
+            // which is not recreated when only the API image changes, is still
+            // listening on `:7890` alone.
+            assert!(!manager.lanes_ready());
+            assert_eq!(manager.proxy_url_for(lane), "http://mihomo:7890");
+        }
+
+        // Once they are confirmed, each half dials its own listener.
+        manager
+            .lanes_ready
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        for lane in MihomoLane::ALL {
             assert_eq!(
                 manager.proxy_url_for(lane),
                 format!("http://mihomo:{}/", lane.port())
