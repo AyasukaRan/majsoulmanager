@@ -36,6 +36,9 @@ async fn main() -> anyhow::Result<()> {
     // corpus is missing an original for; an upgrade must not start that by
     // itself. Its switch, its pacing and its progress live on the console's
     // 牌谱补抓 page.
+    if let Err(error) = state.paipuya.start_if_enabled().await {
+        tracing::error!(%error, "牌谱屋同步没能启动");
+    }
     if let Err(error) = state.refetch_service.start_if_enabled().await {
         // Never fatal: a pool that cannot read its account file is a reason to
         // say so on the console, not a reason to take the whole API down.

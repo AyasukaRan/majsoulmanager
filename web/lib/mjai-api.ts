@@ -279,6 +279,40 @@ export type PaipuyaReport = {
   missing: number;
 };
 
+/**
+ * The 牌谱屋 sync. `api_key` is never returned in full: a stored key reads back
+ * as `"***"`, and handing that back on save keeps the stored one — so editing
+ * any other field does not wipe it.
+ */
+export type PaipuyaConfig = {
+  revision: number;
+  enabled: boolean;
+  base_url: string;
+  api_key: string | null;
+  api_key_header: string;
+  modes: number[];
+  start_from: string;
+  /** Floor on the gap between two requests, counting every worker together. */
+  request_interval_ms: number;
+  concurrency: number;
+  page_size: number;
+};
+
+export type PaipuyaStatus = {
+  phase: WatchRuntimeStatus["phase"];
+  active_revision: number | null;
+  updated_at: string;
+  last_error: string | null;
+  has_key: boolean;
+  progress: {
+    synced: number;
+    without_uuid: number;
+    requests: number;
+    refused: number;
+    cursors: Record<string, string>;
+  };
+};
+
 export type InstalledWatchModule = {
   kind: "login" | "pb_fetch";
   name: string;

@@ -13,6 +13,7 @@ pub mod mihomo;
 pub mod mjai;
 pub mod objects;
 pub mod pack;
+pub mod paipuya;
 pub mod recovery;
 pub mod refetch;
 pub mod refetch_service;
@@ -31,6 +32,7 @@ use managed_watch::ManagedWatchDependencies;
 use mihomo::MihomoManager;
 use objects::Objects;
 use pack::PackStore;
+use paipuya::{PaipuyaDependencies, PaipuyaSupervisor};
 use refetch_service::{RefetchDependencies, RefetchSupervisor};
 use watch::WatchRegistry;
 use watch_log::WatchLogBuffer;
@@ -51,6 +53,7 @@ pub struct AppState {
     /// sessions, and by any collector with spare time: see `src/refetch.rs`.
     pub refetch: Arc<refetch::RefetchBroker>,
     pub refetch_service: Arc<RefetchSupervisor>,
+    pub paipuya: Arc<PaipuyaSupervisor>,
     pub export_dir: PathBuf,
 }
 
@@ -129,8 +132,15 @@ impl AppState {
             kafka: Arc::clone(&kafka),
             broker: Arc::clone(&refetch),
             mihomo: Arc::clone(&mihomo),
-            logs: watch_logs,
+            logs: Arc::clone(&watch_logs),
             watch: Arc::clone(&watch_service),
+        })?);
+        // Its own service, sharing only the log buffer: it never touches
+        // Mahjong Soul, and the catalogue it writes is not the corpus.
+        let paipuya = Arc::new(PaipuyaSupervisor::new(PaipuyaDependencies {
+            data_dir: data_dir.clone(),
+            catalog: Arc::clone(&catalog),
+            logs: watch_logs,
         })?);
         Ok(Self {
             auth,
@@ -143,6 +153,7 @@ impl AppState {
             watch_service,
             refetch,
             refetch_service,
+            paipuya,
             config: Arc::new(config),
             export_dir,
         })
