@@ -619,12 +619,16 @@ proxy-providers:
         // for a lane that must be the group it splits — not `DIRECT`. These two
         // names have never been chosen before, so on the boot that introduces
         // them `store-selected` has nothing to restore and mihomo falls through
-        // to `proxies[0]`. With `DIRECT` there, an upgrade would quietly move
-        // live collection off the subscription node the operator picked and out
-        // of the host's own address, for bot accounts that were deliberately
-        // behind a proxy, with nothing said anywhere. Naming `MAJSOUL` instead
-        // means an unpicked lane follows whatever the deployment was already
-        // on, and the split costs nothing until somebody asks for it.
+        // to `proxies[0]`.
+        //
+        // The rule this serves is not that `DIRECT` is wrong. It may well be
+        // fine — this deployment's operator says live collection works from the
+        // host's own address — and either lane can be pointed at it from the
+        // console. It is that adding a feature must not move where a running
+        // deployment reaches Mahjong Soul from, silently, as a side effect of
+        // an upgrade nobody aimed at the proxy. Naming `MAJSOUL` means an
+        // unpicked lane follows whatever the deployment was already on, so the
+        // split costs nothing until somebody asks for it.
         let lane_groups: String = MihomoLane::ALL
             .into_iter()
             .map(|lane| {
