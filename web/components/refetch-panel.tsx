@@ -59,39 +59,73 @@ function count(value: number) {
   return value.toLocaleString("zh-CN");
 }
 
+/** Where the sweep has read to. A date, because the catalogue is time ordered. */
+function moment(value: string) {
+  return new Date(value).toLocaleString("zh-CN", {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
+}
+
 /**
  * Live numbers for a run.
  *
- * `backlog` is read once when a run starts and never again, so the bar measures
- * this run against the work it set out to do rather than against a figure that
- * moves under it. Records the walk skipped — Mahjong Soul no longer serves them,
- * or the re-conversion came out shorter than what is already stored — stay in
- * the backlog forever, which is why the bar is not the only thing shown.
+ * Two shapes, because the two backlogs are not the same kind of thing. The pb
+ * repair has an end: `backlog` is read once when a run starts, so the bar
+ * measures this run against the work it set out to do rather than against a
+ * figure that moves under it, and records the walk skipped stay in it forever,
+ * which is why the bar is not the only thing shown. The 牌谱屋 sweep has no end
+ * to measure against, so it reports where in the catalogue it has read to.
  */
 function RefetchStatusCard({
   status,
+  work,
   onRefresh,
 }: {
   status: RefetchStatus | null;
+  work: RefetchServiceConfig["work"];
   onRefresh: () => void;
 }) {
   const progress = status?.progress;
   const backlog = status?.backlog ?? null;
   const done = progress?.replaced ?? 0;
+  const sweeping = work === "paipuya_gap";
+  // No bar for the sweep, and not because one is hard to draw. 牌谱屋 lists
+  // three orders of magnitude more games than this corpus holds, so a
+  // percentage would be this run's fetches over a number no year of fetching
+  // approaches — 0.0% for the life of the deployment. What the walk actually
+  // has is a position in the catalogue, and that is what is shown instead.
   const percent =
-    backlog && backlog > 0 ? Math.min(100, (done / backlog) * 100) : null;
+    !sweeping && backlog && backlog > 0
+      ? Math.min(100, (done / backlog) * 100)
+      : null;
 
-  const tiles = [
-    // What is left, not what there was. The bar above already states the figure
-    // the run started from, and a tile that repeated it beside a bar reading
-    // 31% looked like the two disagreed.
-    { label: "剩余待补", value: backlog === null ? null : Math.max(0, backlog - done) },
-    { label: "已替换", value: done },
-    { label: "已扫描", value: progress?.scanned ?? 0 },
-    { label: "雀魂拒绝", value: progress?.refused ?? 0 },
-    { label: "无法替换", value: progress?.unconvertible ?? 0 },
-    { label: "读不到字节", value: progress?.unreadable ?? 0 },
-  ];
+  const tiles = sweeping
+    ? [
+        { label: "已走查", value: progress?.scanned ?? 0 },
+        { label: "本地已有", value: progress?.present ?? 0 },
+        { label: "已入库", value: done },
+        { label: "雀魂拒绝", value: progress?.refused ?? 0 },
+        { label: "转换失败", value: progress?.unconvertible ?? 0 },
+        // Should stay near zero: a game only reaches here if its claim landed
+        // after its page was compared. A number that climbs means requests are
+        // being spent on games the corpus already has.
+        { label: "抓回来是重复", value: progress?.duplicates ?? 0 },
+      ]
+    : [
+        // What is left, not what there was. The bar above already states the
+        // figure the run started from, and a tile that repeated it beside a bar
+        // reading 31% looked like the two disagreed.
+        {
+          label: "剩余待补",
+          value: backlog === null ? null : Math.max(0, backlog - done),
+        },
+        { label: "已替换", value: done },
+        { label: "已扫描", value: progress?.scanned ?? 0 },
+        { label: "雀魂拒绝", value: progress?.refused ?? 0 },
+        { label: "无法替换", value: progress?.unconvertible ?? 0 },
+        { label: "读不到字节", value: progress?.unreadable ?? 0 },
+      ];
 
   return (
     // No `border-b` on the header: this card is all header, and the rule drew a
@@ -123,8 +157,14 @@ function RefetchStatusCard({
               {status?.last_error
                 ? status.last_error
                 : status && status.progress.pass > 0
-                  ? `第 ${status.progress.pass} 轮 · 可用账号 ${status.accounts} 个`
-                  : "按 uuid 重新抓取雀魂原始牌谱，用当前转换器重转并替换索引里那一行"}
+                  ? `第 ${status.progress.pass} 轮 · 可用账号 ${status.accounts} 个${
+                      progress?.position
+                        ? ` · 已走到 ${moment(progress.position)}`
+                        : ""
+                    }`
+                  : sweeping
+                    ? "按开局时间走查牌谱屋的收录，本地没有的才按 uuid 抓回来"
+                    : "按 uuid 重新抓取雀魂原始牌谱，用当前转换器重转并替换索引里那一行"}
             </CardDescription>
           </div>
           <Button variant="outline" size="sm" className="gap-2" onClick={onRefresh}>
@@ -230,6 +270,55 @@ function RefetchConfigCard({
         </div>
       </CardHeader>
       <CardContent className="space-y-4 pt-5">
+        <label className="block space-y-1.5 text-xs font-medium">
+          抓什么
+          <select
+            className={selectClass}
+            value={config.work}
+            onChange={(event) =>
+              onChange({
+                ...config,
+                work: event.target.value as RefetchServiceConfig["work"],
+              })
+            }
+          >
+            <option value="missing_pb">补索引里缺的原始牌谱</option>
+            <option value="paipuya_gap">抓牌谱屋收录、本地没有的对局</option>
+          </select>
+          <span className="block font-normal text-muted-foreground">
+            {config.work === "paipuya_gap"
+              ? "按开局时间走查上面同步下来的收录，每页先查一次「这局存过没有」，只有没存过的才发雀魂请求。走到哪存在库里，重启接着走；走完一遍回到开头重试被拒的。牌谱屋收录五亿多局，这个走查不会「跑完」。"
+              : "重新抓取转换器修好之前入库那批记录的原始牌谱，替换索引里那一行。这一批是有限的，抓完就停。"}
+          </span>
+        </label>
+
+        {config.work === "paipuya_gap" ? (
+          <label className="block space-y-1.5 text-xs font-medium">
+            从哪一天开始走
+            {/* Only the field is narrow. Constraining the label narrowed the
+                note under it too, into a column half the width of every other
+                note on the page. */}
+            <Input
+              className="sm:max-w-[220px]"
+              type="date"
+              value={config.paipuya_from?.slice(0, 10) ?? ""}
+              onChange={(event) =>
+                onChange({
+                  ...config,
+                  paipuya_from: event.target.value
+                    ? `${event.target.value}T00:00:00Z`
+                    : null,
+                })
+              }
+            />
+            <span className="block font-normal text-muted-foreground">
+              只在没有走查位置时用一次，之后以库里存的位置为准。
+              牌谱屋从 2019 年起收录，本地语料从 2026-07 才开始——不填就是从 2019
+              走起，那一段本地一局都没有、也没人量过雀魂还给不给这么早的牌谱，额度会先花在那里。
+            </span>
+          </label>
+        ) : null}
+
         <div className="grid gap-3 sm:grid-cols-[180px_1fr]">
           <label className="space-y-1.5 text-xs font-medium">
             服务器
@@ -456,7 +545,14 @@ export function RefetchPanel() {
 
   return (
     <div className="space-y-6">
-      <RefetchStatusCard status={status} onRefresh={() => void loadStatus()} />
+      <RefetchStatusCard
+        status={status}
+        // What is running, falling back to the form only before a first run.
+        // Otherwise opening the dropdown would relabel a pb repair's counters
+        // as a catalogue sweep's without anything having changed.
+        work={status?.active_work ?? config.work}
+        onRefresh={() => void loadStatus()}
+      />
       <RefetchConfigCard
         config={config}
         onChange={setConfig}

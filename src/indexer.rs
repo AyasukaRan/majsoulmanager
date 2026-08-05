@@ -68,6 +68,20 @@ pub fn game_scope_key(majsoul_uuid: &str) -> String {
     format!("{MAJSOUL_GAME_SCOPE}\0{majsoul_uuid}")
 }
 
+/// What `ingest_idempotency.key_hash` holds for a game, so that "has this game
+/// ever been stored" can be asked of a whole page of uuids at once instead of
+/// one insert at a time.
+///
+/// Hashed here rather than by PostgreSQL because the key carries a NUL byte in
+/// the middle and `text` cannot: every statement that passes one over the wire
+/// has to bind it as `bytea`, and hashing on this side keeps the array a plain
+/// list of digests that `key_hash = ANY(...)` can probe the primary key with.
+/// It goes through `game_scope_key` for the reason that function exists — the
+/// scope prefix is joined to the uuid in exactly one place.
+pub fn game_claim_hash(majsoul_uuid: &str) -> Vec<u8> {
+    Sha256::digest(game_scope_key(majsoul_uuid).as_bytes()).to_vec()
+}
+
 #[derive(Debug, Error)]
 pub enum IngestError {
     /// The caller's record is bad. Nothing was claimed and nothing was
@@ -810,6 +824,29 @@ mod tests {
 
     use super::*;
     use crate::{objects::Objects, pack::PackStore};
+
+    /// What a game's claim hashes to, pinned to a literal.
+    ///
+    /// Two different things compute this: PostgreSQL's `sha256($1)` over the
+    /// key bytes, when a record is claimed, and `game_claim_hash` in this
+    /// process, when a page of catalogued uuids is asked whether it has been
+    /// stored. If they ever disagree the second one answers "never stored" for
+    /// the entire corpus, and a sweep re-fetches every game it already has and
+    /// writes a second row for each — `record_id` is in the sorting key, so
+    /// nothing collapses them afterwards. A recomputed expectation would agree
+    /// with any drift; the literal is `sha256("majsoul-watch\0{uuid}")` computed
+    /// outside this codebase.
+    #[test]
+    fn a_game_claim_hashes_to_what_postgres_stored_for_it() {
+        let uuid = "260716-abcdef01-2345-6789-abcd-ef0123456789";
+        assert_eq!(
+            hex::encode(game_claim_hash(uuid)),
+            "cb478e876415ad203aa6f31526053aa490b827f06880be1a1c12a1d5e1480c94"
+        );
+        // And the NUL is really in there, which is why the key can only ever
+        // cross the wire as `bytea`: PostgreSQL rejects it in `text`.
+        assert!(game_scope_key(uuid).contains('\0'));
+    }
 
     /// The size target and the age limit still decide on their own, the idle
     /// clause only fires once the worker has caught up, and it never overrides
