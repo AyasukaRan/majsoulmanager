@@ -322,6 +322,7 @@ pub struct RefetchDependencies {
     pub packs: Arc<PackStore>,
     pub kafka: Arc<Kafka>,
     pub broker: Arc<RefetchBroker>,
+    pub accounts: Arc<crate::accounts::AccountPool>,
     pub mihomo: Arc<MihomoManager>,
     pub logs: Arc<WatchLogBuffer>,
     /// Asked for the login and PB modules a deployment has selected, and for
@@ -497,7 +498,7 @@ impl RefetchSupervisor {
         &self,
         config: &RefetchServiceConfig,
     ) -> Result<Vec<(String, String)>, WatchServiceError> {
-        let accounts = load_accounts(&config.account_secret_ref)
+        let accounts = load_accounts(&config.account_secret_ref, &self.dependencies.accounts)
             .map_err(|error| WatchServiceError::InvalidConfig(format!("{error:#}")))?;
         Ok(pool_accounts(accounts, &self.collector_accounts()))
     }
@@ -517,27 +518,38 @@ impl RefetchSupervisor {
     /// right answer — it cannot log in either — but it is said out loud, because
     /// the alternative reading is that the pool is about to take its account.
     fn collector_accounts(&self) -> HashSet<String> {
-        self.dependencies
-            .watch
-            .config()
-            .instances
-            .iter()
-            .filter_map(
-                |instance| match load_accounts(&instance.account_secret_ref) {
-                    // The first line, byte for byte what `load_first_account` gives
-                    // the collector itself.
-                    Ok(mut accounts) => Some(accounts.swap_remove(0).0),
-                    Err(error) => {
-                        tracing::warn!(
-                            instance = %instance.id,
-                            %error,
-                            "读不到采集实例的账号，无法确认补抓池是否会和它抢账号"
-                        );
-                        None
+        // Every account the console filed under live collection, whether an
+        // instance points at it today or not and whether it is switched on or
+        // not. Filing it is the reservation: an operator adds a second collector
+        // account before adding the collector, and taking it in between would
+        // put the pool on it exactly when the instance appears.
+        let mut held = self
+            .dependencies
+            .accounts
+            .reserved(crate::accounts::AccountPurpose::Watch);
+        held.extend(
+            self.dependencies
+                .watch
+                .config()
+                .instances
+                .iter()
+                .filter_map(|instance| {
+                    match load_accounts(&instance.account_secret_ref, &self.dependencies.accounts) {
+                        // The first line, byte for byte what `load_first_account`
+                        // gives the collector itself.
+                        Ok(mut accounts) => Some(accounts.swap_remove(0).0),
+                        Err(error) => {
+                            tracing::warn!(
+                                instance = %instance.id,
+                                %error,
+                                "读不到采集实例的账号，无法确认补抓池是否会和它抢账号"
+                            );
+                            None
+                        }
                     }
-                },
-            )
-            .collect()
+                }),
+        );
+        held
     }
 
     async fn start(self: &Arc<Self>) -> Result<(), WatchServiceError> {
@@ -671,7 +683,11 @@ impl RefetchSupervisor {
     fn proxy_url(&self, config: &RefetchServiceConfig) -> Option<String> {
         match config.proxy_mode {
             WatchProxyMode::Direct => None,
-            WatchProxyMode::Mihomo => Some(self.dependencies.mihomo.proxy_url().to_owned()),
+            WatchProxyMode::Mihomo => Some(
+                self.dependencies
+                    .mihomo
+                    .proxy_url_for(crate::mihomo::MihomoLane::Refetch),
+            ),
             WatchProxyMode::Custom => config.custom_proxy_url.clone(),
         }
     }

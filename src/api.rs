@@ -31,6 +31,7 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
+    accounts::AccountDocument,
     auth::{
         AuthError, AuthSettings, CreateUserRequest, LoginRequest, LoginResponse, RegisterRequest,
         RegistrationStatus, UpdateUserRequest, UserView, VerifyEmailRequest,
@@ -75,6 +76,11 @@ pub fn router(state: AppState) -> Router {
         // The re-fetch pool logs in with its own accounts and hammers Mahjong
         // Soul for as long as the backlog lasts, so starting it and choosing its
         // pacing belong to the same people who may start a collector.
+        // The account pool. Writing it is an administrator's job for the same
+        // reason starting a collector is: what it decides is which Mahjong Soul
+        // accounts this deployment logs in with, and one of the two halves it
+        // feeds cannot be redone if it is disconnected.
+        .route("/api/v1/accounts", put(put_accounts))
         .route("/api/v1/refetch/config", put(put_refetch_config))
         .route("/api/v1/refetch/actions", post(post_refetch_action))
         // Loading the catalogue changes what the pool will go and fetch, so it
@@ -108,6 +114,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/watch/modules", get(get_watch_modules))
         .route("/api/v1/watch/modules/protocol", get(get_module_protocol))
         .route("/api/v1/watch/proxy", get(get_watch_proxy))
+        // Readable by every console member, and the passwords are not in it:
+        // `AccountDocument::published` replaces each with three asterisks.
+        .route("/api/v1/accounts", get(get_accounts))
         .route("/api/v1/refetch/config", get(get_refetch_config))
         .route("/api/v1/refetch/status", get(get_refetch_status))
         .route("/api/v1/paipuya/gap", get(get_paipuya_gap))
@@ -321,6 +330,17 @@ async fn post_watch_action(
     Ok(Json(
         state.watch_service.apply_action(request.action).await?,
     ))
+}
+
+async fn get_accounts(State(state): State<AppState>) -> Json<AccountDocument> {
+    Json(state.accounts.published())
+}
+
+async fn put_accounts(
+    State(state): State<AppState>,
+    Json(document): Json<AccountDocument>,
+) -> Result<Json<AccountDocument>, ApiError> {
+    Ok(Json(state.accounts.update(document)?))
 }
 
 async fn get_refetch_config(State(state): State<AppState>) -> Json<RefetchServiceConfig> {

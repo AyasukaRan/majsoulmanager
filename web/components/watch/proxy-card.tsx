@@ -3,7 +3,11 @@
 import { useState } from "react";
 import { Cable, Gauge, RefreshCw } from "lucide-react";
 
-import { jsonRequest, type MihomoStatus } from "@/lib/mjai-api";
+import {
+  jsonRequest,
+  type MihomoLane,
+  type MihomoStatus,
+} from "@/lib/mjai-api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -16,6 +20,11 @@ import {
 import { Input } from "@/components/ui/input";
 import { selectClass } from "@/lib/utils";
 import type { RunAction } from "@/components/watch/busy-action";
+
+const LANE_LABELS: Record<MihomoLane, string> = {
+  watch: "实时采集",
+  refetch: "批量补抓",
+};
 
 export function WatchProxyCard({
   proxy,
@@ -66,15 +75,15 @@ export function WatchProxyCard({
     });
   }
 
-  async function selectNode(name: string) {
+  async function selectNode(lane: MihomoLane, name: string) {
     await run("节点切换失败", async () => {
       onProxy(
         await jsonRequest<MihomoStatus>("/api/watch/proxy/selection", {
           method: "PUT",
-          body: JSON.stringify({ name }),
+          body: JSON.stringify({ lane, name }),
         }),
       );
-      return `已切换到 ${name}`;
+      return `${LANE_LABELS[lane]}已切换到 ${name}`;
     });
   }
 
@@ -88,7 +97,7 @@ export function WatchProxyCard({
               mihomo 代理
             </CardTitle>
             <CardDescription className="mt-1">
-              订阅由后端保密保存，Watch 通过专用策略组出站
+              订阅由后端保密保存。实时采集和批量补抓各走一条自己的出站，可以选不同节点
             </CardDescription>
           </div>
           <Badge
@@ -111,12 +120,16 @@ export function WatchProxyCard({
               {proxy?.subscription_host ?? "未配置"}
             </span>
           </div>
-          <div className="mt-2 flex justify-between gap-3">
-            <span className="text-muted-foreground">当前节点</span>
-            <span className="truncate font-medium">
-              {proxy?.selected_node ?? "DIRECT"}
-            </span>
-          </div>
+          {(proxy?.lanes ?? []).map((lane) => (
+            <div key={lane.lane} className="mt-2 flex justify-between gap-3">
+              <span className="text-muted-foreground">
+                {LANE_LABELS[lane.lane]}
+              </span>
+              <span className="truncate font-medium">
+                {lane.available ? (lane.selected_node ?? "DIRECT") : "分组未生效"}
+              </span>
+            </div>
+          ))}
         </div>
 
         <label className="block space-y-1.5 text-xs font-medium">
@@ -139,24 +152,37 @@ export function WatchProxyCard({
           </div>
         </label>
 
-        <label className="block space-y-1.5 text-xs font-medium">
-          节点
-          <select
-            className={selectClass}
-            value={proxy?.selected_node ?? "DIRECT"}
-            onChange={(event) => void selectNode(event.target.value)}
-            disabled={!proxy?.available || busy}
-          >
-            <option value="DIRECT">DIRECT</option>
-            {proxy?.nodes.map((node) => (
-              <option key={node.name} value={node.name}>
-                {node.name}
-                {node.delay_ms !== null ? ` · ${node.delay_ms} ms` : ""}
-                {node.alive === false ? " · 不可用" : ""}
-              </option>
-            ))}
-          </select>
-        </label>
+        {/* One picker per half. They are separate because the two log in with
+            different accounts and behave visibly differently — the re-fetch pool
+            is the half that looks like a script — and putting both on one exit
+            is a choice, not a default worth hiding. A lane whose group mihomo
+            did not accept says so rather than offering a picker that changes
+            nothing. */}
+        {(proxy?.lanes ?? []).map((lane) => (
+          <label key={lane.lane} className="block space-y-1.5 text-xs font-medium">
+            {LANE_LABELS[lane.lane]}出站节点
+            <select
+              className={selectClass}
+              value={lane.selected_node ?? "DIRECT"}
+              onChange={(event) => void selectNode(lane.lane, event.target.value)}
+              disabled={!proxy?.available || !lane.available || busy}
+            >
+              <option value="DIRECT">DIRECT</option>
+              {proxy?.nodes.map((node) => (
+                <option key={node.name} value={node.name}>
+                  {node.name}
+                  {node.delay_ms !== null ? ` · ${node.delay_ms} ms` : ""}
+                  {node.alive === false ? " · 不可用" : ""}
+                </option>
+              ))}
+            </select>
+            <span className="block font-normal text-muted-foreground">
+              {lane.available
+                ? `走 ${lane.proxy_url}`
+                : `mihomo 里没有 ${lane.group} 这个分组——它没接受本进程生成的配置，这一半还在走原来的出站`}
+            </span>
+          </label>
+        ))}
 
         <div className="flex flex-wrap gap-2">
           <Button

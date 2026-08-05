@@ -225,6 +225,26 @@ export type WatchServiceConfig = {
  * session per account. The backend reports what it settled on as
  * `RefetchStatus.workers`.
  */
+/**
+ * One Mahjong Soul account the console manages. `password` is never returned in
+ * full — a stored one reads back as `"***"`, and handing that back on save keeps
+ * it, so editing any other field does not wipe it.
+ */
+export type StoredAccount = {
+  username: string;
+  password: string;
+  /** Which half may log in with it. One account cannot serve both. */
+  purpose: "watch" | "refetch";
+  note: string;
+  enabled: boolean;
+};
+
+export type AccountDocument = {
+  revision: number;
+  accounts: StoredAccount[];
+  updated_at: string | null;
+};
+
 export type RefetchServiceConfig = {
   revision: number;
   enabled: boolean;
@@ -344,6 +364,22 @@ export type InstalledWatchModule = {
   active: boolean;
 };
 
+/** Which half of the deployment an outbound path belongs to. */
+export type MihomoLane = "watch" | "refetch";
+
+/**
+ * One half's own exit. `available` is false when mihomo does not have the
+ * group — it kept the configuration it had — in which case the picker would
+ * change nothing and says so instead.
+ */
+export type MihomoLaneStatus = {
+  lane: MihomoLane;
+  group: string;
+  proxy_url: string;
+  selected_node: string | null;
+  available: boolean;
+};
+
 export type MihomoNode = {
   name: string;
   node_type: string;
@@ -357,7 +393,9 @@ export type MihomoStatus = {
   subscription_configured: boolean;
   subscription_host: string | null;
   update_interval_secs: number;
+  /** The live-collection lane's node, kept for anything reading the old shape. */
   selected_node: string | null;
+  lanes: MihomoLaneStatus[];
   proxy_url: string;
   nodes: MihomoNode[];
   updated_at: string;

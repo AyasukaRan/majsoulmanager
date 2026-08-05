@@ -486,17 +486,26 @@ pub(crate) fn restored_secret(submitted: Option<String>, stored: Option<&str>) -
 }
 
 pub(crate) fn validate_secret_ref(value: &str) -> Result<(), WatchServiceError> {
+    const SHAPE: &str = "account_secret_ref must use file:, env: or pool:";
     let Some((scheme, target)) = value.split_once(':') else {
-        return Err(WatchServiceError::InvalidConfig(
-            "account_secret_ref must use file: or env:".into(),
-        ));
+        return Err(WatchServiceError::InvalidConfig(SHAPE.into()));
     };
-    if target.is_empty() || !matches!(scheme, "file" | "env") {
-        return Err(WatchServiceError::InvalidConfig(
-            "account_secret_ref must use file: or env:".into(),
-        ));
+    if target.is_empty() {
+        return Err(WatchServiceError::InvalidConfig(SHAPE.into()));
     }
-    Ok(())
+    match scheme {
+        "file" | "env" => Ok(()),
+        // Checked for shape only. Whether the accounts it names exist is a
+        // question for the moment of logging in, not for the moment of saving:
+        // an operator legitimately points a collector at an account a second
+        // before adding it, and refusing the configuration then would make the
+        // order of two console pages load bearing.
+        "pool" if crate::accounts::PoolRef::parse(target).is_some() => Ok(()),
+        "pool" => Err(WatchServiceError::InvalidConfig(
+            "pool: 引用要写成 pool:watch/账号 或 pool:refetch".into(),
+        )),
+        _ => Err(WatchServiceError::InvalidConfig(SHAPE.into())),
+    }
 }
 
 fn validate_module_ref(value: &ModuleRef) -> Result<(), WatchServiceError> {
