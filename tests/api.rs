@@ -11,7 +11,9 @@ use mjai_management::auth::{
     AuthError, AuthSettings, CreateUserRequest, LoginRequest, RegisterRequest, UserRole,
     VerifyEmailRequest,
 };
-use mjai_management::catalog::{Catalog, Cursor, RecordFilter};
+use mjai_management::catalog::{
+    Catalog, Cursor, PaipuyaGame, PaipuyaPosition, RecordFilter, SeriesUnit, SeriesWindow,
+};
 use mjai_management::objects::Objects;
 use mjai_management::pack::PackStore;
 use mjai_management::watch::{WatchEvent, WatchEventKind};
@@ -2845,5 +2847,149 @@ async fn updates_and_persists_online_watch_configuration() {
     let modules: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(modules.as_array().unwrap().len(), 2);
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+/// The 牌谱屋 walk's ClickHouse half, against a real ClickHouse.
+///
+/// Everything asserted here fails silently rather than loudly, which is why it
+/// is worth a container. The keyset page returns a plausible page whichever way
+/// it is wrong: alias the millisecond conversion back onto `started_at` and
+/// ClickHouse binds the `WHERE` to the alias, comparing milliseconds against
+/// seconds, so every row passes and page two is page one — for ever, with the
+/// walk reporting the catalogue swept. Drop the tuple and games sharing a second
+/// are skipped. Drop the scalar and it is only slow. Nothing raises an error.
+///
+/// The comparison card is here for the other half of that: it referenced
+/// `{from:Int64}` while binding `start`/`end`, so every click answered
+/// `UNKNOWN_QUERY_PARAMETER` and no test noticed.
+#[tokio::test]
+async fn walks_the_paipuya_catalogue_by_keyset_and_skips_the_games_already_claimed() {
+    let (state, data_dir) = test_state().await;
+    let catalog = &state.catalog;
+    // Its own second range, because the suite shares one ClickHouse and this
+    // table has no filter but the cursor. Well past anything the other tests
+    // insert, and unique per run.
+    let base = DateTime::from_timestamp(
+        4_000_000_000 + i64::from(Uuid::new_v4().as_fields().0 % 1_000_000) * 100,
+        0,
+    )
+    .unwrap();
+    // Numbered inside the uuid, so uuid order is index order. That is what
+    // makes the duplicated game the *first* of the pair sharing a second, and
+    // therefore what puts both of its copies inside one page where `dedup_by`
+    // has to collapse them. With random uuids it was a coin toss, and on the
+    // toss where the copies land either side of a page boundary the cursor's
+    // strict tuple comparison hides the second one — so the dedup this fixture
+    // exists to prove would go untested on half the runs that passed.
+    let run = Uuid::new_v4();
+    let uuid = |n: usize| format!("260716-{run}-{n:02}");
+
+    // The first two share a second, which is the case a cursor of seconds alone
+    // gets wrong in one direction or the other.
+    let games: Vec<PaipuyaGame> = (0..6)
+        .map(|n| PaipuyaGame {
+            uuid: uuid(n),
+            mode_id: 16,
+            started_at: base + TimeDelta::seconds(if n == 0 { 0 } else { n as i64 - 1 }),
+            ended_at: base + TimeDelta::seconds(n as i64 + 600),
+            players: vec![format!("p{n}a"), format!("p{n}b")],
+            account_ids: vec![n as u64, n as u64 + 100],
+            scores: vec![25_000, 25_000],
+        })
+        .collect();
+    catalog.insert_paipuya_games(&games).await.unwrap();
+    // Written twice, exactly as the sync does at every page boundary: it
+    // re-requests from the last game's own second so nothing is skipped. The
+    // page must not hand the walk the same game twice.
+    catalog.insert_paipuya_games(&games[..1]).await.unwrap();
+
+    let mut ordered: Vec<(DateTime<Utc>, String)> = games
+        .iter()
+        .map(|game| (game.started_at, game.uuid.clone()))
+        .collect();
+    ordered.sort();
+
+    // Start one game short of the range so the first page is this test's rows.
+    let mut cursor = Some(PaipuyaPosition {
+        started_at: base - TimeDelta::seconds(1),
+        uuid: String::new(),
+    });
+    let mut seen: Vec<(DateTime<Utc>, String)> = Vec::new();
+    // Paged until this run's rows are all in hand rather than a fixed number of
+    // times: a page that `dedup_by` shortens is one row nearer the end than it
+    // looks, and the suite shares this table, so a page may also carry another
+    // run's rows. Only this run's are collected — a repeat of one of them still
+    // shows up, which is what the assertion is for.
+    for page_number in 1..=12 {
+        assert!(
+            page_number < 12,
+            "the walk did not reach the end of its rows"
+        );
+        let page = catalog.paipuya_listings(cursor.as_ref(), 2).await.unwrap();
+        if page.is_empty() {
+            break;
+        }
+        cursor = page.last().map(|listing| listing.position.clone());
+        seen.extend(
+            page.into_iter()
+                .map(|listing| (listing.position.started_at, listing.position.uuid))
+                .filter(|(_, uuid)| uuid.contains(&run.to_string())),
+        );
+        if seen.len() >= ordered.len() {
+            break;
+        }
+    }
+    // Every game once, in the table's own order. This is the assertion the alias
+    // shadow fails — with it, page two is page one again — and the one a missing
+    // keyset tuple fails, because the two games sharing a second would be
+    // skipped or repeated.
+    assert_eq!(seen, ordered);
+
+    // The cursor the walk actually keeps, round-tripped. It is the difference
+    // between a restart costing one page and a restart costing the catalogue.
+    let resume = PaipuyaPosition {
+        started_at: ordered[2].0,
+        uuid: ordered[2].1.clone(),
+    };
+    let walk = format!("test-{run}");
+    assert!(catalog.refetch_cursor(&walk).await.unwrap().is_none());
+    catalog.set_refetch_cursor(&walk, &resume).await.unwrap();
+    assert_eq!(catalog.refetch_cursor(&walk).await.unwrap(), Some(resume));
+    catalog.clear_refetch_cursor(&walk).await.unwrap();
+    assert!(catalog.refetch_cursor(&walk).await.unwrap().is_none());
+
+    // What decides whether a request is spent. A game with a claim is one this
+    // corpus has stored; the hash has to be the one PostgreSQL wrote, not one
+    // this process agrees with itself about.
+    let stored = &ordered[1].1;
+    let raw = format!(
+        r#"{{"type":"start_game","names":["a","b","c","d"],"majsoul":{{"uuid":"{stored}","start_time":1784178000}}}}"#
+    );
+    let response = api::router(state.clone())
+        .oneshot(ingest_request(&test_source(&data_dir), stored, &raw))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let hashes: Vec<Vec<u8>> = ordered
+        .iter()
+        .map(|(_, uuid)| mjai_management::indexer::game_claim_hash(uuid))
+        .collect();
+    let held = catalog.claimed_games(&hashes).await.unwrap();
+    assert_eq!(
+        held,
+        [mjai_management::indexer::game_claim_hash(stored)]
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>(),
+        "only the ingested game is claimed"
+    );
+    assert!(catalog.claimed_games(&[]).await.unwrap().is_empty());
+
+    // And the console's comparison card runs at all.
+    let window = SeriesWindow::recent(SeriesUnit::Day, 7);
+    let gap = catalog.paipuya_gap(window).await.unwrap();
+    assert!(gap.missing <= gap.listed);
+
     std::fs::remove_dir_all(data_dir).unwrap();
 }

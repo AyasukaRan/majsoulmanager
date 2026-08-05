@@ -1662,6 +1662,43 @@ pub struct DownloadJob {
 mod tests {
     use super::*;
 
+    /// Three rules the catalogue page depends on, none of which announces
+    /// itself when it is broken.
+    ///
+    /// The alias is the sharp one and it was reproduced rather than reasoned
+    /// about: ClickHouse binds a bare identifier in `WHERE` to a `SELECT` alias
+    /// before it binds it to the column of the same name, so aliasing the
+    /// millisecond conversion onto `started_at` compares milliseconds with
+    /// seconds — true for every row — and the walk returns page one for ever
+    /// while reporting the catalogue swept.
+    #[test]
+    fn the_catalogue_page_keeps_its_index_and_does_not_shadow_its_own_column() {
+        let paged = paipuya_listings_sql(true);
+        assert!(
+            paged.contains("AS started_ms") && !paged.contains("AS started_at"),
+            "the conversion must not be aliased onto the column it reads: {paged}"
+        );
+        // Redundant to the meaning, required for the cost: ClickHouse has no
+        // primary-key condition for `greater(tuple, const)`, so without the
+        // scalar every page reads the table from the beginning.
+        assert!(
+            paged.contains("started_at >= fromUnixTimestamp64Milli({after_ms:Int64})"),
+            "the keyset tuple alone does not prune the primary key: {paged}"
+        );
+        assert!(
+            paged.contains("(started_at, uuid) >"),
+            "the scalar alone would skip or repeat games sharing one second: {paged}"
+        );
+        // FINAL does not stop early for a LIMIT — it reads the rest of the key
+        // range — which at half a billion rows is the whole table, once a page.
+        for sql in [paged.as_str(), &paipuya_listings_sql(false)] {
+            assert!(!sql.contains("FINAL"), "{sql}");
+            assert!(sql.contains("ORDER BY started_at, uuid"), "{sql}");
+        }
+        // The first page has no cursor and therefore no predicate at all.
+        assert!(!paipuya_listings_sql(false).contains("WHERE"));
+    }
+
     #[test]
     fn an_unconstrained_mode_filter_adds_no_clause() {
         // Not "every token I know about": a record whose converter wrote a mode
@@ -2181,17 +2218,25 @@ impl Catalog {
         // pool has an older row beside it until the parts merge, and the older
         // row carries the same players and start time — harmless here, but
         // FINAL keeps the count of what is present honest.
+        //
+        // Bound with `toDateTime({start}, 'UTC')` like every other windowed
+        // query in this file, because that is what `SeriesWindow::bounds`
+        // actually supplies: it yields `start`/`end` as `YYYY-MM-DD` strings.
+        // This asked for `{from:Int64}` millisecond substitutions that nothing
+        // ever sent, so ClickHouse answered `UNKNOWN_QUERY_PARAMETER` to every
+        // click on the console's comparison card — the one tool the "compare
+        // before you fetch" rule is supposed to be read off.
         let sql = format!(
             "SELECT count() AS listed, \
              countIf((toUnixTimestamp(started_at), arraySort(players)) NOT IN ( \
                  SELECT toUnixTimestamp(played_at), arraySort(players) \
                  FROM {RECORDS_TABLE} FINAL \
-                 WHERE played_at >= fromUnixTimestamp64Milli({{from:Int64}}) \
-                   AND played_at < fromUnixTimestamp64Milli({{to:Int64}}) \
+                 WHERE played_at >= toDateTime({{start:String}}, 'UTC') \
+                   AND played_at < toDateTime({{end:String}}, 'UTC') \
              )) AS missing \
              FROM {PAIPUYA_TABLE} FINAL \
-             WHERE started_at >= fromUnixTimestamp64Milli({{from:Int64}}) \
-               AND started_at < fromUnixTimestamp64Milli({{to:Int64}})"
+             WHERE started_at >= toDateTime({{start:String}}, 'UTC') \
+               AND started_at < toDateTime({{end:String}}, 'UTC')"
         );
         let rows: Vec<Row> = self.index.query(&sql, &window.bounds()).await?;
         let row = rows.into_iter().next().unwrap_or_default();
@@ -2267,6 +2312,150 @@ impl Catalog {
                 .flatten(),
         })
     }
+
+    /// One page of the catalogue in its own sorting-key order, for the walk that
+    /// hands uuids to the re-fetch pool.
+    ///
+    /// Three things here are load-bearing and each of them is a silent failure
+    /// rather than an error when it is got wrong.
+    ///
+    /// The alias is `started_ms`, not `started_at`. ClickHouse resolves a bare
+    /// identifier in `WHERE` to a `SELECT` alias in preference to the column of
+    /// the same name — which is what `prefer_column_name_to_alias` exists to
+    /// invert — so aliasing the millisecond conversion back onto the column name
+    /// would make the keyset comparison read epoch milliseconds against a
+    /// `DateTime64` whose numeric value is seconds. That is true for every row
+    /// after 1970: the walk would return the same first page for ever, never see
+    /// a short page, and report the whole catalogue swept.
+    ///
+    /// The scalar `started_at >=` beside the tuple is redundant to the meaning
+    /// and required for the cost. ClickHouse expands tuple comparisons only for
+    /// equality, and its primary-key condition has no atom for `greater(tuple,
+    /// const)`, so the tuple alone leaves the index unused and every page reads
+    /// the whole table from the beginning. The scalar is what turns that into a
+    /// binary search; the tuple is what keeps games sharing one second from
+    /// being skipped or repeated.
+    ///
+    /// No `FINAL`. It does not stop early for a `LIMIT` — it reads the rest of
+    /// the key range to decide what to collapse — which at half a billion rows
+    /// is the whole table per page. What it would have hidden is the duplicate
+    /// the sync writes at each of its own page boundaries by design, and that is
+    /// one adjacent pair in an ordered page, so the caller drops it.
+    pub async fn paipuya_listings(
+        &self,
+        after: Option<&PaipuyaPosition>,
+        limit: usize,
+    ) -> Result<Vec<PaipuyaListing>, CatalogError> {
+        #[derive(Deserialize)]
+        struct Row {
+            uuid: String,
+            started_ms: i64,
+        }
+        let sql = paipuya_listings_sql(after.is_some());
+        let mut params: Vec<(&str, String)> = vec![("limit", limit.to_string())];
+        if let Some(after) = after {
+            params.push(("after_ms", after.started_at.timestamp_millis().to_string()));
+            params.push(("after_uuid", after.uuid.clone()));
+        }
+        let rows: Vec<Row> = self.index.query(&sql, &params).await?;
+        let mut listings: Vec<PaipuyaListing> = rows
+            .into_iter()
+            .filter_map(|row| {
+                Some(PaipuyaListing {
+                    position: PaipuyaPosition {
+                        started_at: DateTime::from_timestamp_millis(row.started_ms)?,
+                        uuid: row.uuid,
+                    },
+                })
+            })
+            .collect();
+        // Adjacent, because the page is ordered by the pair a ReplacingMergeTree
+        // row is identified by.
+        listings.dedup_by(|a, b| a.position == b.position);
+        Ok(listings)
+    }
+
+    /// Which of these games have ever been stored, asked of the one place that
+    /// records it.
+    ///
+    /// A `Game`-scoped claim is written for every record carrying a Mahjong Soul
+    /// uuid and never expires, so this is exactly the question `claim` would
+    /// answer a page later and one request each more expensively — except that
+    /// by then the request has been spent. Digests rather than keys because the
+    /// key carries a NUL byte and PostgreSQL rejects that in `text`; `= ANY` on
+    /// a `bytea[]` of them probes the primary key directly.
+    pub async fn claimed_games(
+        &self,
+        hashes: &[Vec<u8>],
+    ) -> Result<std::collections::HashSet<Vec<u8>>, CatalogError> {
+        if hashes.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let rows: Vec<(Vec<u8>,)> =
+            sqlx::query_as("SELECT key_hash FROM ingest_idempotency WHERE key_hash = ANY($1)")
+                .bind(hashes)
+                .fetch_all(&self.postgres)
+                .await?;
+        Ok(rows.into_iter().map(|row| row.0).collect())
+    }
+
+    /// Where a named walk left off, or `None` if it has never run or has
+    /// finished a full pass over its source.
+    pub async fn refetch_cursor(
+        &self,
+        walk: &str,
+    ) -> Result<Option<PaipuyaPosition>, CatalogError> {
+        let row: Option<(DateTime<Utc>, String)> =
+            sqlx::query_as("SELECT started_at, uuid FROM refetch_cursor WHERE walk = $1")
+                .bind(walk)
+                .fetch_optional(&self.postgres)
+                .await?;
+        Ok(row.map(|(started_at, uuid)| PaipuyaPosition { started_at, uuid }))
+    }
+
+    /// Moves that bookmark, after the page it describes has been fetched.
+    pub async fn set_refetch_cursor(
+        &self,
+        walk: &str,
+        position: &PaipuyaPosition,
+    ) -> Result<(), CatalogError> {
+        sqlx::query(
+            "INSERT INTO refetch_cursor (walk, started_at, uuid) VALUES ($1, $2, $3) \
+             ON CONFLICT (walk) DO UPDATE SET started_at = EXCLUDED.started_at, \
+             uuid = EXCLUDED.uuid, updated_at = now()",
+        )
+        .bind(walk)
+        .bind(position.started_at)
+        .bind(&position.uuid)
+        .execute(&self.postgres)
+        .await?;
+        Ok(())
+    }
+
+    /// Sends a walk back to the start of its source, which is what reaching the
+    /// end of the catalogue means: the games it could not fetch this time are
+    /// only ever retried by another pass.
+    pub async fn clear_refetch_cursor(&self, walk: &str) -> Result<(), CatalogError> {
+        sqlx::query("DELETE FROM refetch_cursor WHERE walk = $1")
+            .bind(walk)
+            .execute(&self.postgres)
+            .await?;
+        Ok(())
+    }
+
+    /// Whether a startup backfill has run to completion. Read by anything whose
+    /// correctness depends on one having finished — the marker is written only
+    /// after the pass covered every record, so this is the difference between
+    /// "the answer is complete" and "the answer is whatever has been reached".
+    pub async fn backfill_completed(&self, name: &str) -> Result<bool, CatalogError> {
+        Ok(
+            sqlx::query("SELECT 1 FROM completed_backfills WHERE name = $1")
+                .bind(name)
+                .fetch_optional(&self.postgres)
+                .await?
+                .is_some(),
+        )
+    }
 }
 
 const PAIPUYA_TABLE: &str = "mjai.paipuya_games";
@@ -2285,6 +2474,42 @@ pub struct PaipuyaGame {
     pub account_ids: Vec<u64>,
     #[serde(default)]
     pub scores: Vec<i32>,
+}
+
+/// The statement [`Catalog::paipuya_listings`] sends, apart from its bindings.
+///
+/// Split out so the three rules its doc comment states can be asserted, because
+/// every one of them fails silently: the alias shadow returns a correct-looking
+/// page for ever, the missing scalar bound is only slow, and `FINAL` is only
+/// slower. None of them raises an error, and none of them is visible in a result.
+fn paipuya_listings_sql(with_cursor: bool) -> String {
+    let mut sql = format!(
+        "SELECT uuid, toUnixTimestamp64Milli(started_at) AS started_ms FROM {PAIPUYA_TABLE}"
+    );
+    if with_cursor {
+        sql.push_str(
+            " WHERE started_at >= fromUnixTimestamp64Milli({after_ms:Int64}) \
+             AND (started_at, uuid) > \
+             (fromUnixTimestamp64Milli({after_ms:Int64}), {after_uuid:String})",
+        );
+    }
+    sql.push_str(" ORDER BY started_at, uuid LIMIT {limit:UInt32}");
+    sql
+}
+
+/// A keyset position in `mjai.paipuya_games`, which is its whole sorting key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaipuyaPosition {
+    pub started_at: DateTime<Utc>,
+    pub uuid: String,
+}
+
+/// One catalogued game as the walk reads it: enough to fetch it and enough to
+/// say where the walk has got to. The players and the mode stay in ClickHouse —
+/// the protobuf that comes back describes itself.
+#[derive(Clone, Debug)]
+pub struct PaipuyaListing {
+    pub position: PaipuyaPosition,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]

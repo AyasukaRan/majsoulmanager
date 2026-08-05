@@ -589,14 +589,8 @@ async fn score(state: &AppState) -> anyhow::Result<Progress> {
     Ok(progress)
 }
 
-async fn already_done(state: &AppState, name: &str) -> Result<bool, sqlx::Error> {
-    Ok(
-        sqlx::query("SELECT 1 FROM completed_backfills WHERE name = $1")
-            .bind(name)
-            .fetch_optional(state.catalog.postgres())
-            .await?
-            .is_some(),
-    )
+async fn already_done(state: &AppState, name: &str) -> Result<bool, crate::catalog::CatalogError> {
+    state.catalog.backfill_completed(name).await
 }
 
 /// `ON CONFLICT DO NOTHING` because two API replicas boot against one database

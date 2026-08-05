@@ -228,6 +228,16 @@ export type WatchServiceConfig = {
 export type RefetchServiceConfig = {
   revision: number;
   enabled: boolean;
+  /**
+   * Where the walk gets its uuids. `missing_pb` repairs rows already in the
+   * index and finishes; `paipuya_gap` sweeps what 牌谱屋 lists and does not.
+   */
+  work: "missing_pb" | "paipuya_gap";
+  /**
+   * Where the 牌谱屋 walk starts when it has no stored position. Only a seed —
+   * once the walk has a cursor this is ignored.
+   */
+  paipuya_from: string | null;
   server: "cn" | "en" | "jp";
   proxy_mode: "direct" | "mihomo" | "custom";
   custom_proxy_url: string | null;
@@ -242,6 +252,16 @@ export type RefetchProgress = {
   pass: number;
   scanned: number;
   replaced: number;
+  /** 牌谱屋 walk: catalogued games recognised as already held, before any request. */
+  present: number;
+  /** 牌谱屋 walk: games fetched that turned out to be held after all. */
+  duplicates: number;
+  /**
+   * 牌谱屋 walk: how far into the catalogue it has read. The only honest
+   * measure of progress over half a billion games — there is no percentage to
+   * quote, because the denominator is not what this run set out to fetch.
+   */
+  position: string | null;
   refused: number;
   unreadable: number;
   unconvertible: number;
@@ -250,6 +270,8 @@ export type RefetchProgress = {
 export type RefetchStatus = {
   phase: WatchRuntimeStatus["phase"];
   active_revision: number | null;
+  /** What the run in progress is doing, as opposed to what the form says. */
+  active_work: RefetchServiceConfig["work"] | null;
   started_at: string | null;
   updated_at: string;
   last_error: string | null;

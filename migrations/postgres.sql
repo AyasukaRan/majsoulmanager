@@ -103,3 +103,22 @@ CREATE TABLE IF NOT EXISTS paipuya_cursor (
     synced_games bigint NOT NULL DEFAULT 0,
     updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- How far the re-fetch pool has walked the 牌谱屋 catalogue. Separate from
+-- `paipuya_cursor` above, which belongs to the sync: one says how much of the
+-- catalogue has been *learned about*, this says how much of it has been *looked
+-- for*, and the two move at wildly different speeds — a page of five hundred
+-- listings arrives in one request and takes hours to fetch through a pool of
+-- rate-limited accounts.
+--
+-- It is a keyset position in `mjai.paipuya_games`'s own sorting key, both halves
+-- of it, because at a couple of games a second a whole page inside one second is
+-- ordinary and a cursor of seconds alone would either skip games or re-read the
+-- same ones forever. Keyed by walk name so a second walk does not need a
+-- migration; the row is deleted when a walk reaches the end of the catalogue.
+CREATE TABLE IF NOT EXISTS refetch_cursor (
+    walk text PRIMARY KEY,
+    started_at timestamptz NOT NULL,
+    uuid text NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now()
+);

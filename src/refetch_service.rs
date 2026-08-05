@@ -34,7 +34,7 @@ use tokio::{sync::Mutex, task::JoinHandle};
 
 use crate::{
     catalog::{Catalog, Record, RecordFilter},
-    indexer,
+    indexer::{self, game_claim_hash},
     kafka::Kafka,
     majsoul::convert::GameMetadata,
     managed_watch::{
@@ -103,6 +103,34 @@ const LOG_SOURCE: &str = "refetch";
 const MAX_CONCURRENCY: usize = 16;
 const MAX_REQUEST_DELAY_MS: u64 = 60_000;
 
+/// The name the 牌谱屋 walk keeps its position under. One row in
+/// `refetch_cursor`; the `MissingPb` walk has none, because its own filter is
+/// its position — a record it has repaired stops matching `pb_size = 0`.
+const PAIPUYA_WALK: &str = "paipuya";
+
+/// What `records.source` says about a game this pool went and got because 牌谱屋
+/// listed it. Not `majsoul-watch`: nobody here was in the game, and the column
+/// is how an export tells "collected live" from "swept afterwards" apart. It has
+/// no bearing on deduplication — that is scoped by the game's own uuid, under a
+/// namespace constant that deliberately does not follow this name.
+const PAIPUYA_SOURCE: &str = "paipuya";
+
+/// Where the walk gets its uuids.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RefetchWork {
+    /// Records already in the index that carry no Mahjong Soul protobuf. The
+    /// repair this pool was built for, and the default, because it is the one
+    /// that finishes.
+    #[default]
+    MissingPb,
+    /// Games 牌谱屋 lists that this corpus has never stored. Unbounded by
+    /// comparison — the catalogue is three orders of magnitude larger than the
+    /// corpus — so it is a sweep that runs until it is stopped, not a repair
+    /// that completes.
+    PaipuyaGap,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RefetchServiceConfig {
     pub revision: u64,
@@ -111,6 +139,23 @@ pub struct RefetchServiceConfig {
     /// records, which is not something a deployment should begin doing because
     /// it was upgraded.
     pub enabled: bool,
+    /// Which backlog the pool works through. Defaulted rather than optional so
+    /// a configuration written before it existed keeps meaning the repair it
+    /// was written for.
+    #[serde(default)]
+    pub work: RefetchWork,
+    /// Where the 牌谱屋 walk starts when it has no stored position. Ignored once
+    /// it has one — the cursor is the position, this is only its seed.
+    ///
+    /// It matters more than a start date usually does. The catalogue runs from
+    /// 2019 and this corpus begins in 2026-07, so a walk left to start at the
+    /// beginning spends years on games that were never going to be here, none
+    /// of which the claim check can skip, and all of which are the population
+    /// nobody has measured Mahjong Soul's retention for (#81). Pointing it at
+    /// the recent end first is how a deployment finds out whether the old end
+    /// is worth walking at all.
+    #[serde(default)]
+    pub paipuya_from: Option<DateTime<Utc>>,
     pub server: String,
     #[serde(default)]
     pub proxy_mode: WatchProxyMode,
@@ -133,6 +178,8 @@ impl Default for RefetchServiceConfig {
         Self {
             revision: 1,
             enabled: false,
+            work: RefetchWork::MissingPb,
+            paipuya_from: None,
             server: "cn".into(),
             proxy_mode: WatchProxyMode::Mihomo,
             custom_proxy_url: None,
@@ -196,6 +243,20 @@ pub struct RefetchProgress {
     pub pass: u32,
     pub scanned: u64,
     pub replaced: u64,
+    /// 牌谱屋 walk only: catalogued games this corpus already holds, recognised
+    /// before any request was sent. The number the whole "compare first, fetch
+    /// second" arrangement exists to make large.
+    pub present: u64,
+    /// 牌谱屋 walk only: games fetched that turned out to be held after all,
+    /// because a claim landed between this page being compared and its games
+    /// being fetched. Rare by construction, and worth its own counter precisely
+    /// for that: a large one means the comparison is not working and the pool is
+    /// spending rate-limited requests on games it already has.
+    pub duplicates: u64,
+    /// 牌谱屋 walk only: how far into the catalogue the walk has read. The only
+    /// honest measure of progress over half a billion games — a percentage would
+    /// be this run's fetches over a total nothing in a year will approach.
+    pub position: Option<DateTime<Utc>>,
     /// Mahjong Soul answered and would not give the record: it has aged out, or
     /// the game never had a paipu. Also counts a fetch whose session died — the
     /// record stays untouched and the next pass asks again.
@@ -212,6 +273,11 @@ pub struct RefetchProgress {
 pub struct RefetchRuntimeStatus {
     pub phase: ServicePhase,
     pub active_revision: Option<u64>,
+    /// What the run in progress is actually doing. The console has a dropdown
+    /// for this too, but that one is the operator's unsaved edit — labelling a
+    /// running pb repair with the sweep's counters because somebody opened the
+    /// select is how a number comes to mean something it does not.
+    pub active_work: Option<RefetchWork>,
     pub started_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
     pub last_error: Option<String>,
@@ -234,6 +300,7 @@ impl Default for RefetchRuntimeStatus {
         Self {
             phase: ServicePhase::Stopped,
             active_revision: None,
+            active_work: None,
             started_at: None,
             updated_at: Utc::now(),
             last_error: None,
@@ -395,7 +462,10 @@ impl RefetchSupervisor {
         match self.dependencies.catalog.count_missing_pb().await {
             Ok(0) => {}
             Ok(backlog) => {
-                self.runtime.write().backlog = Some(backlog);
+                // Said, not stored. `backlog` is documented as what a *run* set
+                // out to do, and the console divides by it: seeding it here put
+                // a figure under a progress bar for a run that had not started,
+                // and in 牌谱屋 mode it would be a figure in the wrong units.
                 self.report(
                     WatchLogLevel::Warn,
                     format!(
@@ -496,6 +566,7 @@ impl RefetchSupervisor {
             let mut runtime = self.runtime.write();
             runtime.phase = ServicePhase::Starting;
             runtime.active_revision = Some(config.revision);
+            runtime.active_work = Some(config.work);
             runtime.started_at = Some(Utc::now());
             runtime.updated_at = Utc::now();
             runtime.last_error = None;
@@ -544,8 +615,9 @@ impl RefetchSupervisor {
         }
         *self.sessions_tasks.lock().await = sessions;
         let supervisor = Arc::clone(self);
+        let work = config.work;
         *self.walk_task.lock().await = Some(tokio::spawn(async move {
-            supervisor.run_walk(generation).await;
+            supervisor.run_walk(generation, work).await;
         }));
 
         let mut runtime = self.runtime.write();
@@ -565,6 +637,7 @@ impl RefetchSupervisor {
         let mut runtime = self.runtime.write();
         runtime.phase = ServicePhase::Stopped;
         runtime.active_revision = None;
+        runtime.active_work = None;
         runtime.workers = 0;
         runtime.updated_at = Utc::now();
         drop(runtime);
@@ -778,8 +851,8 @@ impl RefetchSupervisor {
     }
 
     /// The corpus walk: repeats until a pass moves nothing, then stops.
-    async fn run_walk(self: Arc<Self>, generation: u64) {
-        let outcome = self.walk(generation).await;
+    async fn run_walk(self: Arc<Self>, generation: u64, work: RefetchWork) {
+        let outcome = self.walk(generation, work).await;
         // However this run ended, the sessions go with it. A pool that has run
         // out of work — or hit something it cannot get past — has no reason to
         // keep several accounts logged into Mahjong Soul, and leaving them there
@@ -796,40 +869,52 @@ impl RefetchSupervisor {
     /// The walk itself: `Ok` carries why it stopped, `Err` why it could not go
     /// on. Split from `run_walk` so that ending the sessions is one statement
     /// covering every way out rather than one before each `return`.
-    async fn walk(&self, generation: u64) -> anyhow::Result<String> {
-        match self.dependencies.catalog.count_missing_pb().await {
-            Ok(backlog) => {
-                self.runtime.write().backlog = Some(backlog);
-                self.report(
-                    WatchLogLevel::Info,
-                    format!("索引里有 {backlog} 条记录没有雀魂原始牌谱，开始补抓"),
-                );
-                if backlog == 0 {
-                    return Ok("没有需要补抓的记录".to_owned());
-                }
-            }
-            // Not fatal: the backlog is a number for the console, and the walk
-            // finds its own work.
-            Err(error) => self.report(
-                WatchLogLevel::Warn,
-                format!("读不到待补抓的记录条数，进度只报绝对值：{error}"),
-            ),
+    async fn walk(&self, generation: u64, work: RefetchWork) -> anyhow::Result<String> {
+        if let Some(done) = match work {
+            RefetchWork::MissingPb => self.announce_missing_pb().await?,
+            RefetchWork::PaipuyaGap => self.announce_paipuya_gap().await?,
+        } {
+            return Ok(done);
         }
 
         for pass in 1..=MAX_PASSES {
             self.progress.write().pass = pass;
-            let (scanned, replaced) = self.one_pass().await?;
+            let (scanned, replaced) = match work {
+                RefetchWork::MissingPb => self.one_pass(generation).await?,
+                RefetchWork::PaipuyaGap => self.one_paipuya_pass(generation).await?,
+            };
             self.report(
                 WatchLogLevel::Info,
-                format!("第 {pass} 轮补抓结束：扫描 {scanned} 条，替换 {replaced} 条"),
+                match work {
+                    RefetchWork::MissingPb => {
+                        format!("第 {pass} 轮补抓结束：扫描 {scanned} 条，替换 {replaced} 条")
+                    }
+                    RefetchWork::PaipuyaGap => {
+                        format!("第 {pass} 轮补抓结束：走查 {scanned} 局，入库 {replaced} 局")
+                    }
+                },
             );
             // Nothing moved, so another pass would meet the same records and be
             // refused the same way.
             if replaced == 0 {
-                return Ok(if scanned == 0 {
-                    "补抓完成：索引里已经没有缺少原始牌谱的记录".to_owned()
-                } else {
-                    "补抓结束：剩下的记录雀魂都不再提供，或者重转结果不能替换原记录".to_owned()
+                return Ok(match (work, scanned) {
+                    (RefetchWork::MissingPb, 0) => {
+                        "补抓完成：索引里已经没有缺少原始牌谱的记录".to_owned()
+                    }
+                    (RefetchWork::MissingPb, _) => {
+                        "补抓结束：剩下的记录雀魂都不再提供，或者重转结果不能替换原记录".to_owned()
+                    }
+                    // Deliberately not "the corpus holds everything 牌谱屋
+                    // lists". A pass that resumed near the end of the catalogue
+                    // and ran off it looks identical from here, and saying the
+                    // gap is closed on the strength of the last few thousand
+                    // rows would be a claim about half a billion games.
+                    (RefetchWork::PaipuyaGap, 0) => {
+                        "本轮没有要抓的对局：走到的这一段牌谱屋收录的本地都有了".to_owned()
+                    }
+                    (RefetchWork::PaipuyaGap, _) => {
+                        "补抓结束：这一轮缺的对局雀魂都不再提供".to_owned()
+                    }
                 });
             }
             if self.generation.load(Ordering::SeqCst) != generation {
@@ -840,6 +925,90 @@ impl RefetchSupervisor {
         Ok(format!(
             "补抓已跑满 {MAX_PASSES} 轮仍有记录在变，先停下来；重新启动会接着跑"
         ))
+    }
+
+    /// The `MissingPb` walk's opening figure. `Some` means there is nothing to
+    /// do and the run is over before it starts.
+    async fn announce_missing_pb(&self) -> anyhow::Result<Option<String>> {
+        match self.dependencies.catalog.count_missing_pb().await {
+            Ok(backlog) => {
+                self.runtime.write().backlog = Some(backlog);
+                self.report(
+                    WatchLogLevel::Info,
+                    format!("索引里有 {backlog} 条记录没有雀魂原始牌谱，开始补抓"),
+                );
+                Ok((backlog == 0).then(|| "没有需要补抓的记录".to_owned()))
+            }
+            // Not fatal: the backlog is a number for the console, and the walk
+            // finds its own work.
+            Err(error) => {
+                self.report(
+                    WatchLogLevel::Warn,
+                    format!("读不到待补抓的记录条数，进度只报绝对值：{error}"),
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// The 牌谱屋 walk's two preconditions, both of which are silent damage
+    /// rather than a visible failure if they are skipped.
+    ///
+    /// An empty catalogue would otherwise walk zero pages and report that this
+    /// corpus holds everything 牌谱屋 lists, which on a deployment that has
+    /// never synced is the opposite of true.
+    ///
+    /// The claims backfill is the sharper one. This walk asks
+    /// `ingest_idempotency` whether a game has ever been stored, and that answer
+    /// is only complete once `write_game_scoped_claims` has covered every record
+    /// already in the index. It re-runs on every boot until it does, and
+    /// `main.rs` starts this pool *before* it spawns — so a run that started on
+    /// a boot where the backfill still had work would see no claim for a million
+    /// records this corpus already holds, fetch every one of them again, and
+    /// write a second row per game that nothing can ever collapse: `record_id`
+    /// is in the sorting key. Refusing to start is the only safe answer, and it
+    /// costs one indexed lookup.
+    async fn announce_paipuya_gap(&self) -> anyhow::Result<Option<String>> {
+        if !self
+            .dependencies
+            .catalog
+            .backfill_completed(crate::backfill::GAME_CLAIMS_NAME)
+            .await?
+        {
+            anyhow::bail!(
+                "对局幂等认领回填还没跑完，现在按牌谱屋缺口补抓会把已有的对局再存一份且无法合并；\
+                 等这次启动的回填结束后再启动（日志里搜「对局幂等认领」）"
+            );
+        }
+        // No `backlog`: `start()` already cleared it, and there is no figure to
+        // put there. The catalogue's size is not what this run set out to fetch
+        // — three orders of magnitude of it is already held or never served —
+        // so a bar drawn against it would read zero for the life of the sweep.
+        // The walk reports where it has read to instead.
+        let totals = self.dependencies.catalog.paipuya_totals().await?;
+        if totals.games == 0 {
+            return Ok(Some(
+                "牌谱屋的对局信息还没同步过，没有缺口可抓；先在上面把「牌谱屋同步」跑起来"
+                    .to_owned(),
+            ));
+        }
+        let resuming = self
+            .dependencies
+            .catalog
+            .refetch_cursor(PAIPUYA_WALK)
+            .await?;
+        self.report(
+            WatchLogLevel::Info,
+            match &resuming {
+                Some(position) => format!(
+                    "牌谱屋已同步 {} 局，从上次走到的 {} 接着比对",
+                    totals.games,
+                    position.started_at.format("%Y-%m-%d %H:%M:%S")
+                ),
+                None => format!("牌谱屋已同步 {} 局，从头开始比对", totals.games),
+            },
+        );
+        Ok(None)
     }
 
     /// Ends a run that finished on its own terms rather than by failing.
@@ -854,7 +1023,7 @@ impl RefetchSupervisor {
 
     /// One walk over every record that has no protobuf. Returns how many rows it
     /// looked at and how many it replaced.
-    async fn one_pass(&self) -> anyhow::Result<(u64, u64)> {
+    async fn one_pass(&self, generation: u64) -> anyhow::Result<(u64, u64)> {
         let filter = RecordFilter {
             missing_pb: true,
             ..RecordFilter::default()
@@ -863,6 +1032,15 @@ impl RefetchSupervisor {
         let (mut scanned, mut replaced) = (0u64, 0u64);
         let mut reported = 0u64;
         loop {
+            // Per page rather than per pass. `start()` does not serialise
+            // against itself, so a second one can leave this walk running
+            // detached, and a pass is not a unit of time here — the 牌谱屋 sweep
+            // is half a billion games at a rate-limited pace, so a superseded
+            // walk checking only between passes would go on spending the
+            // account pool for as long as the deployment lives.
+            if self.generation.load(Ordering::SeqCst) != generation {
+                return Ok((scanned, replaced));
+            }
             // Paged newest-first, and safe beside live ingest for the reason
             // every walk here is: a row written while this is in flight either
             // sorts above the cursor and is never read, or is read like any
@@ -896,9 +1074,15 @@ impl RefetchSupervisor {
                             replaced += 1;
                             progress.replaced += 1;
                         }
-                        Outcome::Refused => progress.refused += 1,
+                        // The repair walk treats the two the same: the record
+                        // keeps its `pb_size = 0` row either way, so the next
+                        // pass finds it again without anything being remembered.
+                        Outcome::Refused | Outcome::Unserved => progress.refused += 1,
                         Outcome::Unreadable => progress.unreadable += 1,
                         Outcome::Unconvertible => progress.unconvertible += 1,
+                        // The repair walk replaces a row it already found, so
+                        // it never claims and never meets this.
+                        Outcome::Duplicate => progress.duplicates += 1,
                     }
                 }
             }
@@ -920,6 +1104,212 @@ impl RefetchSupervisor {
             match next {
                 Some(next) => cursor = Some(next),
                 None => return Ok((scanned, replaced)),
+            }
+        }
+    }
+
+    /// One walk over the 牌谱屋 catalogue: page it in its own order, drop the
+    /// games this corpus already holds, fetch what is left.
+    ///
+    /// The cursor is durable and the page is the unit of commitment. It advances
+    /// to the last row of the page — held or fetched or refused alike — only
+    /// after that page's fetches have finished, so a restart re-walks at most one
+    /// page and the claim check makes re-walking it free. Reaching the end of the
+    /// catalogue clears it, which is what makes the next pass retry everything
+    /// Mahjong Soul would not serve this time.
+    ///
+    /// A page nobody answered is the exception, and the distinction is the whole
+    /// reason `RefetchError` has two arms. Refused means Mahjong Soul answered
+    /// and would not give the game: an answer, and the cursor moves on. Unserved
+    /// means nothing answered at all, which says nothing about the game — and
+    /// unlike the pb repair, whose work is re-derived from `pb_size = 0` on every
+    /// pass, nothing here would ever record that those games were skipped. So the
+    /// pass stops where it is and leaves the cursor for the next one.
+    async fn one_paipuya_pass(&self, generation: u64) -> anyhow::Result<(u64, u64)> {
+        let catalog = &self.dependencies.catalog;
+        let mut cursor = catalog.refetch_cursor(PAIPUYA_WALK).await?.or_else(|| {
+            // A seed, not a filter: an empty uuid sorts below every real one, so
+            // this is the position just before the first game of that second.
+            self.config()
+                .paipuya_from
+                .map(|started_at| crate::catalog::PaipuyaPosition {
+                    started_at,
+                    uuid: String::new(),
+                })
+        });
+        let (mut scanned, mut replaced) = (0u64, 0u64);
+        let mut reported = 0u64;
+        loop {
+            if self.generation.load(Ordering::SeqCst) != generation {
+                return Ok((scanned, replaced));
+            }
+            let page = catalog.paipuya_listings(cursor.as_ref(), PAGE_SIZE).await?;
+            let Some(last) = page.last().map(|listing| listing.position.clone()) else {
+                // The end of the catalogue. Back to the beginning, so the next
+                // pass asks Mahjong Soul again for whatever it refused.
+                catalog.clear_refetch_cursor(PAIPUYA_WALK).await?;
+                return Ok((scanned, replaced));
+            };
+            scanned += page.len() as u64;
+
+            // One indexed lookup for the whole page, before a single Mahjong
+            // Soul request is spent. This is the comparison that matters: the
+            // console's card answers "how big is the gap" by start time and
+            // player names, which is the right question for a human and the
+            // wrong one to bet an account's rate limit on, because a renamed
+            // player or a rounded second reads as missing. A game uuid does not
+            // drift.
+            let uuids: Vec<String> = page
+                .iter()
+                .map(|listing| listing.position.uuid.clone())
+                .collect();
+            let hashes: Vec<Vec<u8>> = uuids.iter().map(|uuid| game_claim_hash(uuid)).collect();
+            let held = catalog.claimed_games(&hashes).await?;
+            let wanted = unclaimed(uuids, &held);
+            {
+                let mut progress = self.progress.write();
+                progress.scanned += page.len() as u64;
+                progress.present += (page.len() - wanted.len()) as u64;
+                progress.position = Some(last.started_at);
+            }
+
+            let in_flight = self.runtime.read().workers.max(1);
+            let outcomes = futures_util::stream::iter(wanted)
+                .map(|uuid| self.one_game(uuid))
+                .buffer_unordered(in_flight)
+                .collect::<Vec<_>>()
+                .await;
+            let mut unserved = 0u64;
+            {
+                let mut progress = self.progress.write();
+                for outcome in outcomes {
+                    match outcome? {
+                        Outcome::Replaced => {
+                            replaced += 1;
+                            progress.replaced += 1;
+                        }
+                        Outcome::Duplicate => progress.duplicates += 1,
+                        Outcome::Refused => progress.refused += 1,
+                        Outcome::Unserved => {
+                            unserved += 1;
+                            progress.refused += 1;
+                        }
+                        Outcome::Unconvertible => progress.unconvertible += 1,
+                        // No stored bytes are read on this path.
+                        Outcome::Unreadable => progress.unreadable += 1,
+                    }
+                }
+            }
+            if unserved > 0 {
+                // Left where it was, so the next pass asks these again. Every
+                // game on the page that did land is claimed by now, so walking
+                // it a second time costs one indexed lookup and no request.
+                self.report(
+                    WatchLogLevel::Warn,
+                    format!(
+                        "有 {unserved} 局没有会话接手，本页不推进游标，本轮到此为止；下一轮从同一处再走"
+                    ),
+                );
+                return Ok((scanned, replaced));
+            }
+            // After the page's fetches, never before: a cursor that ran ahead of
+            // them would skip whatever was in flight when the process stopped.
+            catalog.set_refetch_cursor(PAIPUYA_WALK, &last).await?;
+            cursor = Some(last);
+
+            if scanned - reported >= PROGRESS_EVERY {
+                reported = scanned;
+                let progress = *self.progress.read();
+                self.report(
+                    WatchLogLevel::Info,
+                    format!(
+                        "牌谱屋补抓中：走查 {} 局，本地已有 {} 局，入库 {} 局，雀魂拒绝 {} 局，转换失败 {} 局（已走到 {}）",
+                        progress.scanned,
+                        progress.present,
+                        progress.replaced,
+                        progress.refused,
+                        progress.unconvertible,
+                        progress
+                            .position
+                            .map(|at| at.format("%Y-%m-%d %H:%M:%S").to_string())
+                            .unwrap_or_default()
+                    ),
+                );
+            }
+        }
+    }
+
+    /// One catalogued game this corpus has never stored: fetch it, convert it,
+    /// ingest it as a new record.
+    ///
+    /// `ingest_one`, never `reindex_one`. There is no row to replace, so the
+    /// record needs a claim — and the claim is the only thing anywhere that says
+    /// this game has been stored, because the uuid is not a column of the index.
+    /// `reindex_one` takes none, so using it here would put a second row in the
+    /// index for every game the sweep ever met twice, with `record_id` in the
+    /// sorting key and nothing able to collapse them.
+    async fn one_game(&self, uuid: String) -> anyhow::Result<Outcome> {
+        let pb = match self.dependencies.broker.fetch(&uuid).await {
+            Ok(pb) => pb,
+            Err(RefetchError::Unserved) => {
+                if self.sessions.load(Ordering::Relaxed) == 0 {
+                    anyhow::bail!(
+                        "没有会话接手补抓请求（等了 {} 秒，当前登录会话为 0）",
+                        CLAIM_TIMEOUT.as_secs()
+                    );
+                }
+                tracing::info!(%uuid, "补抓请求超时，留给下一轮");
+                return Ok(Outcome::Unserved);
+            }
+            Err(RefetchError::Refused(why)) => {
+                tracing::info!(%uuid, %why, "雀魂没有提供这局的牌谱");
+                return Ok(Outcome::Refused);
+            }
+        };
+        // Off the async runtime for the same reason `one_record` is: a
+        // conversion decodes a protobuf, walks every event and gzips the result.
+        let expected = uuid.clone();
+        let (pb, converted) = tokio::task::spawn_blocking(move || {
+            let converted = converted_fresh(&pb, &expected);
+            (pb, converted)
+        })
+        .await?;
+        let Some(mjai) = converted else {
+            return Ok(Outcome::Unconvertible);
+        };
+
+        loop {
+            // Behind the same ceiling live ingest answers `503` on. Waiting is
+            // free here: the backlog is somebody else's work being done, and the
+            // records at risk if the topic overruns are the collectors' — the
+            // ones nobody can fetch a second time.
+            while self.dependencies.kafka.lag() >= self.dependencies.kafka.max_lag() / 2 {
+                tracing::info!("打包队列积压，补抓让出写入位置");
+                tokio::time::sleep(BACKLOG_BACKOFF).await;
+            }
+            match indexer::ingest_one(
+                &self.dependencies.catalog,
+                &self.dependencies.kafka,
+                PAIPUYA_SOURCE,
+                &uuid,
+                None,
+                &mjai,
+                Some(&pb),
+            )
+            .await
+            {
+                Ok(accepted) if accepted.duplicate => return Ok(Outcome::Duplicate),
+                Ok(_) => return Ok(Outcome::Replaced),
+                // The gate above reads the same sampled lag `claim` does, so
+                // this only happens when the backlog crossed the whole distance
+                // from half the ceiling to the ceiling inside one sample. The
+                // protobuf is already paid for and still in hand; failing the
+                // run over a number that moves on its own would throw it away.
+                Err(indexer::IngestError::Backlogged(lag)) => {
+                    tracing::info!(lag, "入库时打包队列已经到顶，等一轮再试");
+                    tokio::time::sleep(BACKLOG_BACKOFF).await;
+                }
+                Err(error) => return Err(error.into()),
             }
         }
     }
@@ -963,7 +1353,7 @@ impl RefetchSupervisor {
                     );
                 }
                 tracing::info!(record = %row.id, "补抓请求超时，留给下一轮");
-                return Ok(Outcome::Refused);
+                return Ok(Outcome::Unserved);
             }
             Err(RefetchError::Refused(why)) => {
                 tracing::info!(record = %row.id, %why, "雀魂没有提供这局的牌谱");
@@ -1003,6 +1393,57 @@ enum Outcome {
     Refused,
     Unreadable,
     Unconvertible,
+    /// A game fetched and then found already claimed. Only the 牌谱屋 walk can
+    /// produce it, and only when a claim appeared after its page was compared.
+    Duplicate,
+    /// Nothing answered the request. Counted with the refusals on the console —
+    /// an operator wants one "did not get it" number — but kept apart here,
+    /// because it is the one outcome that says nothing about the game and so is
+    /// the one the 牌谱屋 walk must not move its cursor past.
+    Unserved,
+}
+
+/// The games in a catalogue page worth spending a Mahjong Soul request on:
+/// everything whose game-scoped claim is not already in `held`.
+///
+/// Kept apart from the page read and the lookup because this is the decision the
+/// whole arrangement exists to make, and it is one an integration test could not
+/// pin: `held` is what PostgreSQL answered, and getting the filter backwards
+/// would look exactly like a corpus that is missing everything.
+fn unclaimed(uuids: Vec<String>, held: &HashSet<Vec<u8>>) -> Vec<String> {
+    uuids
+        .into_iter()
+        .filter(|uuid| !held.contains(&game_claim_hash(uuid)))
+        .collect()
+}
+
+/// A protobuf fetched by uuid alone, converted with today's converter, or `None`
+/// if it is not safe to store.
+///
+/// `None` for the header, deliberately: this game has never been in the index,
+/// so there is no stored row to take one from, and since the decoder stopped
+/// skipping `head.config` the protobuf says which mode it was — which is what
+/// keeps the record from landing with an empty `rule` and vanishing from every
+/// query that filters on one.
+///
+/// The identity check is the same one the repair walk makes and for the same
+/// reason: the request travelled through a queue and, where an external module
+/// is in use, through a subprocess that was handed the uuid and trusted with it.
+/// Here a mismatch would not overwrite anything — it would store somebody else's
+/// game under a claim naming this one, and neither would ever be fetched again.
+fn converted_fresh(pb: &[u8], expected_uuid: &str) -> Option<Vec<u8>> {
+    use std::io::Read;
+
+    let (uuid, compressed) = crate::majsoul::convert::convert_record_bytes(pb, None).ok()?;
+    if uuid != expected_uuid {
+        tracing::error!(%uuid, %expected_uuid, "补抓拿回来的是另一局，拒绝入库");
+        return None;
+    }
+    let mut mjai = Vec::new();
+    flate2::read::GzDecoder::new(compressed.as_slice())
+        .read_to_end(&mut mjai)
+        .ok()?;
+    Some(mjai)
 }
 
 /// The pool's accounts once the collectors have had theirs: everything in
@@ -1239,8 +1680,12 @@ mod tests {
         assert_eq!(deduplicated.len(), 1);
     }
 
-    /// A configuration written by an older build has no `proxy_mode`, and one
-    /// written by hand may leave it out entirely.
+    /// A configuration written by an older build has no `proxy_mode` and no
+    /// `work`, and one written by hand may leave either out.
+    ///
+    /// The second of those is the one that matters. A deployment running the
+    /// repair walk against a bounded backlog must not come back from an upgrade
+    /// sweeping half a billion catalogued games with the same accounts.
     #[test]
     fn reads_a_configuration_that_predates_the_proxy_mode() {
         let document = serde_json::json!({
@@ -1255,6 +1700,44 @@ mod tests {
         });
         let config: RefetchServiceConfig = serde_json::from_value(document).unwrap();
         assert_eq!(config.proxy_mode, WatchProxyMode::Mihomo);
+        assert_eq!(config.work, RefetchWork::MissingPb);
         config.validate().unwrap();
+
+        // And the console's spelling of the other one round-trips.
+        let chosen: RefetchServiceConfig = serde_json::from_value(serde_json::json!({
+            "revision": 4,
+            "enabled": true,
+            "work": "paipuya_gap",
+            "server": "cn",
+            "custom_proxy_url": null,
+            "account_secret_ref": "env:POOL",
+            "concurrency": 3,
+            "request_delay_ms": 2000,
+            "client_version": null,
+        }))
+        .unwrap();
+        assert_eq!(chosen.work, RefetchWork::PaipuyaGap);
+    }
+
+    /// The decision that spends an account's rate limit.
+    ///
+    /// A game whose claim is already in PostgreSQL is one this corpus has
+    /// stored, and asking Mahjong Soul for it again costs a request and returns
+    /// a record that `ingest_one` will only answer `duplicate` to. Inverting
+    /// this filter would look, from the console, exactly like a corpus missing
+    /// everything 牌谱屋 lists.
+    #[test]
+    fn only_the_games_with_no_claim_are_worth_a_request() {
+        let uuids: Vec<String> = ["260716-a", "260716-b", "260716-c"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let held: HashSet<Vec<u8>> = [game_claim_hash("260716-b")].into_iter().collect();
+
+        assert_eq!(unclaimed(uuids.clone(), &held), ["260716-a", "260716-c"]);
+        // Nothing held is everything wanted, and everything held is nothing.
+        assert_eq!(unclaimed(uuids.clone(), &HashSet::new()), uuids);
+        let all: HashSet<Vec<u8>> = uuids.iter().map(|uuid| game_claim_hash(uuid)).collect();
+        assert!(unclaimed(uuids, &all).is_empty());
     }
 }
