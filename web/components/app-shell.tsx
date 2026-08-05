@@ -8,6 +8,7 @@ import {
   CircleGauge,
   Database,
   History,
+  KeyRound,
   Layers3,
   LogOut,
   Radio,
@@ -28,6 +29,9 @@ const nav = [
   // corpus, and the page an operator goes looking for right after that one.
   { href: "/refetch", label: "牌谱补抓", icon: History },
   { href: "/exports", label: "批量导出", icon: Archive },
+  // Beside the two pages that spend it: what the account pool holds is the one
+  // resource neither Watch nor 牌谱补抓 can get more of on its own.
+  { href: "/accounts", label: "账号池", icon: KeyRound, admin: true },
   // Last, beside 用户管理: the two entries that change how the deployment runs
   // rather than report on it, and the two the page itself refuses to a member.
   { href: "/settings", label: "设置", icon: Settings, admin: true },

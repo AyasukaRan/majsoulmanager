@@ -66,6 +66,7 @@ pub struct ManagedWatchDependencies {
     pub catalog: Arc<Catalog>,
     pub kafka: Arc<Kafka>,
     pub registry: Arc<WatchRegistry>,
+    pub accounts: Arc<crate::accounts::AccountPool>,
     pub mihomo: Arc<MihomoManager>,
     pub logs: Arc<WatchLogBuffer>,
 }
@@ -142,10 +143,15 @@ pub(crate) async fn run(
     // how the console tells concurrent collectors apart.
     let source = format!("collector:{}", instance.id);
     let modes = room_modes(&instance.room, &instance.modes, instance.players)?;
-    let (username, password) = load_first_account(&instance.account_secret_ref)?;
+    let (username, password) =
+        load_first_account(&instance.account_secret_ref, &dependencies.accounts)?;
     let proxy = match config.proxy_mode {
         WatchProxyMode::Direct => None,
-        WatchProxyMode::Mihomo => Some(dependencies.mihomo.proxy_url().to_owned()),
+        WatchProxyMode::Mihomo => Some(
+            dependencies
+                .mihomo
+                .proxy_url_for(crate::mihomo::MihomoLane::Watch),
+        ),
         WatchProxyMode::Custom => config.custom_proxy_url.clone(),
     };
     // The password and the proxy credentials are registered by `connect`, which
@@ -1162,7 +1168,10 @@ fn event(
 /// same format from one place is what lets an operator point both at a single
 /// file and have the collector claim line one while the pool works through what
 /// is left — the pool drops any account a collector already holds.
-pub(crate) fn load_accounts(secret_ref: &str) -> Result<Vec<(String, String)>> {
+pub fn load_accounts(
+    secret_ref: &str,
+    pool: &crate::accounts::AccountPool,
+) -> Result<Vec<(String, String)>> {
     let (scheme, target) = secret_ref
         .split_once(':')
         .context("account secret reference has no scheme")?;
@@ -1171,6 +1180,20 @@ pub(crate) fn load_accounts(secret_ref: &str) -> Result<Vec<(String, String)>> {
             .with_context(|| format!("failed to read account secret file {target}"))?,
         "env" => std::env::var(target)
             .with_context(|| format!("account secret environment variable {target} is missing"))?,
+        // Answered from the store rather than rendered into the text format and
+        // parsed back. There is one representation of a console-managed account
+        // and it is the document; a second one written to disk beside it is a
+        // thing that can disagree, and what it would disagree about is which
+        // account a session logs in with.
+        "pool" => {
+            let reference = crate::accounts::PoolRef::parse(target)
+                .with_context(|| format!("账号池引用 pool:{target} 写法不对"))?;
+            let accounts = pool.resolve(&reference);
+            if accounts.is_empty() {
+                anyhow::bail!("账号池里没有 pool:{target} 指向的可用账号（可能被停用或已删除）");
+            }
+            return Ok(accounts);
+        }
         _ => anyhow::bail!("unsupported account secret scheme"),
     };
     let mut accounts = Vec::new();
@@ -1206,7 +1229,7 @@ pub(crate) fn load_accounts(secret_ref: &str) -> Result<Vec<(String, String)>> {
 /// A Mahjong Soul username is half a credential, and `/api/v1/watch/logs` is
 /// open to every member. Enough is kept to tell two accounts apart, which is all
 /// a log line needs it for.
-pub(crate) fn masked_account(username: &str) -> String {
+pub fn masked_account(username: &str) -> String {
     let (local, domain) = match username.split_once('@') {
         Some((local, domain)) => (local, format!("@{domain}")),
         None => (username, String::new()),
@@ -1215,8 +1238,11 @@ pub(crate) fn masked_account(username: &str) -> String {
     format!("{kept}***{domain}")
 }
 
-fn load_first_account(secret_ref: &str) -> Result<(String, String)> {
-    Ok(load_accounts(secret_ref)?.swap_remove(0))
+fn load_first_account(
+    secret_ref: &str,
+    pool: &crate::accounts::AccountPool,
+) -> Result<(String, String)> {
+    Ok(load_accounts(secret_ref, pool)?.swap_remove(0))
 }
 
 /// Append-only record of every game uuid this collector has ever seen live.
@@ -1300,6 +1326,16 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store with nothing in it, for the `file:`/`env:` cases below. Those
+    /// never consult it — which is the property being relied on, so the tests
+    /// that read a file are also the tests that prove the store is not
+    /// consulted when the reference does not name it.
+    fn empty_pool() -> crate::accounts::AccountPool {
+        let directory =
+            std::env::temp_dir().join(format!("mjai-empty-pool-{}", uuid::Uuid::new_v4()));
+        crate::accounts::AccountPool::open(&directory).expect("an empty store")
+    }
 
     /// The rule every fetch loop shares: the live collector's pending queue, the
     /// collector's spare-time re-fetch serving, and the re-fetch pool's own
@@ -1423,7 +1459,7 @@ mod tests {
         let variable = format!("MJAI_TEST_ACCOUNT_{}", Uuid::new_v4());
         // SAFETY: this uniquely named variable is only read in this test.
         unsafe { std::env::set_var(&variable, "bot@example.com,password") };
-        let account = load_first_account(&format!("env:{variable}")).unwrap();
+        let account = load_first_account(&format!("env:{variable}"), &empty_pool()).unwrap();
         assert_eq!(account.0, "bot@example.com");
         unsafe { std::env::remove_var(variable) };
     }
@@ -1445,14 +1481,14 @@ mod tests {
         };
         let reference = format!("env:{variable}");
         assert_eq!(
-            load_accounts(&reference).unwrap(),
+            load_accounts(&reference, &empty_pool()).unwrap(),
             vec![
                 ("live@example.com".to_owned(), "one".to_owned()),
                 ("pool@example.com".to_owned(), "two".to_owned()),
             ]
         );
         assert_eq!(
-            load_first_account(&reference).unwrap().0,
+            load_first_account(&reference, &empty_pool()).unwrap().0,
             "live@example.com"
         );
         unsafe { std::env::remove_var(variable) };
@@ -1486,7 +1522,7 @@ mod tests {
             )
         };
         let reference = format!("env:{variable}");
-        let accounts = load_accounts(&reference).unwrap();
+        let accounts = load_accounts(&reference, &empty_pool()).unwrap();
         assert_eq!(
             accounts,
             vec![
@@ -1497,7 +1533,7 @@ mod tests {
             "comments and blank lines are skipped, tabs and commas both split"
         );
         assert_eq!(
-            load_first_account(&reference).unwrap().0,
+            load_first_account(&reference, &empty_pool()).unwrap().0,
             "live@example.com"
         );
         unsafe { std::env::remove_var(variable) };

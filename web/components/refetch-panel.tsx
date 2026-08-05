@@ -312,9 +312,7 @@ function RefetchConfigCard({
               }
             />
             <span className="block font-normal text-muted-foreground">
-              只在没有走查位置时用一次，之后以库里存的位置为准。
-              牌谱屋从 2019 年起收录，本地语料从 2026-07 才开始——不填就是从 2019
-              走起，那一段本地一局都没有、也没人量过雀魂还给不给这么早的牌谱，额度会先花在那里。
+              {"只在没有走查位置时用一次，之后以库里存的位置为准。牌谱屋从 2019 年起收录，本地语料从 2026-07 才开始——不填就是从 2019 走起，那一段本地一局都没有、也没人量过雀魂还给不给这么早的牌谱，额度会先花在那里。"}
             </span>
           </label>
         ) : null}
@@ -351,10 +349,12 @@ function RefetchConfigCard({
         {/* Plain text, not the bordered note box used elsewhere: sitting
             directly under an input, a bordered box reads as a second field. */}
         <p className="text-xs leading-relaxed text-muted-foreground">
+          <code className="font-mono">pool:refetch</code>{" "}
+          用控制台「账号池」页里填的那批；也可以继续写{" "}
           <code className="font-mono">file:</code> 或{" "}
           <code className="font-mono">env:</code> 引用，一行一个{" "}
-          <code className="font-mono">账号,密码</code>。密码只留在这个文件里，不进配置文档也不进接口。
-          采集实例已经占用的账号会被自动剔除——雀魂一个账号只能开一个会话，抢账号会把实时采集踢下线。
+          <code className="font-mono">账号,密码</code>。
+          {"密码不进配置文档也不进接口。采集实例已经占用的账号会被自动剔除——雀魂一个账号只能开一个会话，抢账号会把实时采集踢下线。"}
         </p>
 
         <div className="grid gap-3 sm:grid-cols-[180px_1fr]">

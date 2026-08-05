@@ -1,3 +1,4 @@
+pub mod accounts;
 pub mod api;
 pub mod auth;
 pub mod backfill;
@@ -42,6 +43,7 @@ use watch_service::WatchSupervisor;
 pub struct AppState {
     pub config: Arc<Config>,
     pub auth: Arc<AuthStore>,
+    pub accounts: Arc<accounts::AccountPool>,
     pub catalog: Arc<Catalog>,
     pub kafka: Arc<Kafka>,
     pub mihomo: Arc<MihomoManager>,
@@ -107,12 +109,20 @@ impl AppState {
         )?);
         let watch_logs = Arc::new(WatchLogBuffer::default());
         let refetch = Arc::new(refetch::RefetchBroker::default());
+        // Opened before anything that reads an account, and shared by both
+        // halves: the split between them is the only thing keeping a collector
+        // and the re-fetch pool from logging in with one account.
+        let accounts = Arc::new(accounts::AccountPool::open(&data_dir)?);
+        for password in accounts.secrets() {
+            watch_logs.register_secret(password);
+        }
         let dependencies = Arc::new(ManagedWatchDependencies {
             data_dir: data_dir.clone(),
             refetch: Arc::clone(&refetch),
             catalog: Arc::clone(&catalog),
             kafka: Arc::clone(&kafka),
             registry: Arc::clone(&watch),
+            accounts: Arc::clone(&accounts),
             mihomo: Arc::clone(&mihomo),
             logs: Arc::clone(&watch_logs),
         });
@@ -131,6 +141,7 @@ impl AppState {
             packs: Arc::clone(&packs),
             kafka: Arc::clone(&kafka),
             broker: Arc::clone(&refetch),
+            accounts: Arc::clone(&accounts),
             mihomo: Arc::clone(&mihomo),
             logs: Arc::clone(&watch_logs),
             watch: Arc::clone(&watch_service),
@@ -143,6 +154,7 @@ impl AppState {
             logs: watch_logs,
         })?);
         Ok(Self {
+            accounts,
             auth,
             packs,
             catalog,

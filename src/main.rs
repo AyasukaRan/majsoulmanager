@@ -56,6 +56,12 @@ async fn main() -> anyhow::Result<()> {
     // no-op once its marker is written, and on the one boot where several have
     // work they are reading the same pages of the same index a moment apart,
     // which the object store serves from the same place either way.
+    // Behind the listener like the backfills, and for the same reason: mihomo
+    // may not be up yet, and an API that waits on it looks like an outage.
+    {
+        let mihomo = Arc::clone(&state.mihomo);
+        tokio::spawn(async move { mihomo.apply_runtime_config().await });
+    }
     tokio::spawn(upload_legacy_packs(state.clone()));
     tokio::spawn(backfill::rewrite_record_metadata(state.clone()));
     tokio::spawn(backfill::write_game_scoped_claims(state.clone()));

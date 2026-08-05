@@ -130,10 +130,12 @@ export function WatchInstanceList({
                   account_secret_ref: event.target.value,
                 })
               }
-              placeholder="file:/run/secrets/majsoul_accounts"
+              placeholder="pool:watch/账号 或 file:/run/secrets/majsoul_accounts"
             />
             <span className="block font-normal text-muted-foreground">
-              仅允许 file: 或 env: 引用，网页不保存明文账号密码
+              {
+                "pool:watch/账号 用控制台「账号池」页里填的那个；也可以继续写 file: 或 env: 引用。一个实例只能占一个账号——几个实例指向同一个引用会互相把对方踢下线。"
+              }
             </span>
           </label>
 
