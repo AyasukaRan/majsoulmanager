@@ -463,6 +463,28 @@ pub(crate) fn restored_proxy(submitted: Option<String>, stored: Option<&str>) ->
     Some(submitted)
 }
 
+/// A secret as it may be read by anyone holding a console login: present, or
+/// not, and nothing more.
+///
+/// Most secrets in this codebase are named by a `file:`/`env:` reference and
+/// never travel. An API key an operator pastes into the console has to be
+/// stored, so this is the other half of that: it leaves as asterisks.
+pub(crate) fn redacted_secret(value: Option<&str>) -> Option<String> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(|_| REDACTED_USERINFO.to_owned())
+}
+
+/// Puts the stored secret back when a caller hands back what
+/// [`redacted_secret`] gave it. Without this the first save after any read
+/// would overwrite the secret with three asterisks.
+pub(crate) fn restored_secret(submitted: Option<String>, stored: Option<&str>) -> Option<String> {
+    match submitted {
+        Some(value) if value == REDACTED_USERINFO => stored.map(str::to_owned),
+        other => other,
+    }
+}
+
 pub(crate) fn validate_secret_ref(value: &str) -> Result<(), WatchServiceError> {
     let Some((scheme, target)) = value.split_once(':') else {
         return Err(WatchServiceError::InvalidConfig(

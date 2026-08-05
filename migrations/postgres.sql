@@ -88,3 +88,18 @@ CREATE TABLE IF NOT EXISTS api_keys (
     last_used_at timestamptz
 );
 
+
+-- Where the 牌谱屋 sync has got to, one row per mode. The catalogue itself is
+-- in ClickHouse; this is only the bookmark, and it belongs here for the same
+-- reason `kafka_offsets` does — it is a single small row that has to be updated
+-- transactionally after the page it describes has actually landed.
+--
+-- `next_from` is exclusive of nothing: the page is re-requested from the start
+-- time of its own last game, so a game sharing that second with the boundary is
+-- read twice rather than skipped. The catalogue collapses the duplicate.
+CREATE TABLE IF NOT EXISTS paipuya_cursor (
+    mode_id integer PRIMARY KEY,
+    next_from timestamptz NOT NULL,
+    synced_games bigint NOT NULL DEFAULT 0,
+    updated_at timestamptz NOT NULL DEFAULT now()
+);

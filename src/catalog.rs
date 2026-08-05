@@ -2201,6 +2201,42 @@ impl Catalog {
         })
     }
 
+    /// How far the 牌谱屋 sync has got for one mode.
+    pub async fn paipuya_cursor(
+        &self,
+        mode_id: i32,
+    ) -> Result<Option<DateTime<Utc>>, CatalogError> {
+        let row: Option<(DateTime<Utc>,)> =
+            sqlx::query_as("SELECT next_from FROM paipuya_cursor WHERE mode_id = $1")
+                .bind(mode_id)
+                .fetch_optional(&self.postgres)
+                .await?;
+        Ok(row.map(|row| row.0))
+    }
+
+    /// Moves that bookmark, after the page it describes has landed. `added` is
+    /// accumulated rather than replaced, so the row also says how much of the
+    /// catalogue this deployment has ever pulled.
+    pub async fn set_paipuya_cursor(
+        &self,
+        mode_id: i32,
+        next_from: DateTime<Utc>,
+        added: u64,
+    ) -> Result<(), CatalogError> {
+        sqlx::query(
+            "INSERT INTO paipuya_cursor (mode_id, next_from, synced_games) VALUES ($1, $2, $3) \
+             ON CONFLICT (mode_id) DO UPDATE SET next_from = EXCLUDED.next_from, \
+             synced_games = paipuya_cursor.synced_games + EXCLUDED.synced_games, \
+             updated_at = now()",
+        )
+        .bind(mode_id)
+        .bind(next_from)
+        .bind(added as i64)
+        .execute(&self.postgres)
+        .await?;
+        Ok(())
+    }
+
     /// The whole catalogue's size and span, for the console to show without
     /// asking for a window first.
     pub async fn paipuya_totals(&self) -> Result<PaipuyaTotals, CatalogError> {

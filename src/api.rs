@@ -44,6 +44,7 @@ use crate::{
     indexer::{self, Claimed, IngestError},
     kafka::MAX_PRODUCE_BATCH_BYTES,
     mihomo::{MihomoAction, MihomoError, MihomoStatus, ProxySelection, SubscriptionUpdate},
+    paipuya::{PaipuyaConfig, PaipuyaStatus},
     refetch_service::{RefetchRuntimeStatus, RefetchServiceConfig},
     watch_log::WatchLogEntry,
     watch_service::{
@@ -79,6 +80,8 @@ pub fn router(state: AppState) -> Router {
         // Loading the catalogue changes what the pool will go and fetch, so it
         // sits with the rest of what an administrator decides.
         .route("/api/v1/paipuya/games", post(post_paipuya_games))
+        .route("/api/v1/paipuya/config", put(put_paipuya_config))
+        .route("/api/v1/paipuya/actions", post(post_paipuya_action))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_admin_session,
@@ -108,6 +111,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/refetch/config", get(get_refetch_config))
         .route("/api/v1/refetch/status", get(get_refetch_status))
         .route("/api/v1/paipuya/gap", get(get_paipuya_gap))
+        .route("/api/v1/paipuya/config", get(get_paipuya_config))
+        .route("/api/v1/paipuya/status", get(get_paipuya_status))
         .merge(admin)
         .route("/api/v1/users", get(get_users).post(create_user))
         .route("/api/v1/users/{id}", put(update_user))
@@ -1365,6 +1370,31 @@ async fn get_paipuya_gap(
         state.catalog.paipuya_gap(window),
     )?;
     Ok(Json(PaipuyaReport { totals, gap }))
+}
+
+/// Open to every member like the other configuration reads. The API key is the
+/// one field that could not be, so `published_config` replaces it with three
+/// asterisks — handing those back on save keeps the stored one.
+async fn get_paipuya_config(State(state): State<AppState>) -> Json<PaipuyaConfig> {
+    Json(state.paipuya.published_config())
+}
+
+async fn put_paipuya_config(
+    State(state): State<AppState>,
+    Json(config): Json<PaipuyaConfig>,
+) -> Result<Json<PaipuyaConfig>, ApiError> {
+    Ok(Json(state.paipuya.update_config(config).await?))
+}
+
+async fn get_paipuya_status(State(state): State<AppState>) -> Json<PaipuyaStatus> {
+    Json(state.paipuya.status())
+}
+
+async fn post_paipuya_action(
+    State(state): State<AppState>,
+    Json(request): Json<WatchActionRequest>,
+) -> Result<Json<PaipuyaStatus>, ApiError> {
+    Ok(Json(state.paipuya.apply_action(request.action).await?))
 }
 
 #[derive(Deserialize)]
