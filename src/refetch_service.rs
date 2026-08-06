@@ -623,7 +623,7 @@ impl RefetchSupervisor {
         for (index, (username, password)) in accounts.into_iter().take(workers).enumerate() {
             let supervisor = Arc::clone(self);
             let config = config.clone();
-            let proxy = proxy.clone();
+            let proxy = self.account_proxy(&config, &username, proxy.as_deref());
             sessions.push(tokio::spawn(async move {
                 supervisor
                     .run_worker(generation, config, index, username, password, proxy)
@@ -683,6 +683,30 @@ impl RefetchSupervisor {
             let _ = task.await;
         }
         self.sessions.store(0, Ordering::Relaxed);
+    }
+
+    /// Where one account's session dials.
+    ///
+    /// The pool's own proxy unless the account names a node and mihomo has a
+    /// listener for it — which is what spreads a pool of eighty sessions over
+    /// several exits instead of pushing all of them through one. Only in
+    /// `mihomo` mode: a deployment that set a custom proxy or turned the proxy
+    /// off said where its traffic goes, and a per-account node cannot overrule
+    /// that without silently ignoring the setting above it.
+    fn account_proxy(
+        &self,
+        config: &RefetchServiceConfig,
+        username: &str,
+        lane: Option<&str>,
+    ) -> Option<String> {
+        if config.proxy_mode != WatchProxyMode::Mihomo {
+            return lane.map(str::to_owned);
+        }
+        let node = self.dependencies.accounts.node_for(username)?;
+        self.dependencies
+            .mihomo
+            .proxy_url_for_node(&node)
+            .or_else(|| lane.map(str::to_owned))
     }
 
     fn proxy_url(&self, config: &RefetchServiceConfig) -> Option<String> {

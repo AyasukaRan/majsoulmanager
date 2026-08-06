@@ -232,6 +232,12 @@ export type StoredAccount = {
   purpose: "watch" | "refetch";
   note: string;
   enabled: boolean;
+  /**
+   * Which mihomo node this account's session goes out of, by name. Empty means
+   * "whatever 批量补抓 is on", which is what every account did before the pool
+   * could be spread over several exits.
+   */
+  node: string;
 };
 
 export type AccountDocument = {
@@ -386,6 +392,19 @@ export type MihomoLaneStatus = {
   available: boolean;
 };
 
+/**
+ * One node the re-fetch pool goes out of on its own listener, because at least
+ * one account named it. `available` false means mihomo has not picked the group
+ * up, and the accounts on it are going out of the 批量补抓 lane meanwhile.
+ */
+export type MihomoOutboundStatus = {
+  node: string;
+  group: string;
+  proxy_url: string;
+  selected_node: string | null;
+  available: boolean;
+};
+
 export type MihomoNode = {
   name: string;
   node_type: string;
@@ -402,6 +421,8 @@ export type MihomoStatus = {
   /** What the shared `MAJSOUL` group is on; both lanes follow it by default. */
   selected_node: string | null;
   lanes: MihomoLaneStatus[];
+  /** One per node an account was bound to; empty when none is. */
+  outbounds: MihomoOutboundStatus[];
   proxy_url: string;
   nodes: MihomoNode[];
   updated_at: string;

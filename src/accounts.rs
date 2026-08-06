@@ -80,6 +80,18 @@ pub struct StoredAccount {
     /// account stays reserved either way: an operator may switch it back on at
     /// any moment, and the re-fetch pool must not have taken it meanwhile.
     pub enabled: bool,
+    /// Which mihomo node this account's session goes out of, by the node's own
+    /// name. Empty means "whatever this half is on", which is what every
+    /// account was before this field existed.
+    ///
+    /// It is a name and not an index because the operator picks it from the
+    /// list mihomo reports, and because a subscription that reorders its nodes
+    /// must not silently move an account onto a different one. A name that has
+    /// since disappeared from the subscription resolves to nothing and the
+    /// account falls back to the lane — a pool session on the wrong node beats
+    /// a pool session that cannot dial at all.
+    #[serde(default)]
+    pub node: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -286,6 +298,44 @@ impl AccountPool {
             .collect()
     }
 
+    /// The node an account is bound to, or `None` for "follow this half".
+    ///
+    /// Looked up by username rather than carried alongside the password,
+    /// because the password reaches the pool through `load_accounts`, which
+    /// also serves `file:` and `env:` references — and an account that came
+    /// from a file has no row here to carry a node on. Those resolve to `None`,
+    /// which is the same answer they gave before this existed.
+    pub fn node_for(&self, username: &str) -> Option<String> {
+        self.document
+            .read()
+            .accounts
+            .iter()
+            .find(|account| account.username.eq_ignore_ascii_case(username))
+            .map(|account| account.node.trim().to_owned())
+            .filter(|node| !node.is_empty())
+    }
+
+    /// Every distinct node the enabled re-fetch accounts name, in a stable
+    /// order. What mihomo has to grow an outbound for.
+    ///
+    /// Only the re-fetch half: live collection is one session on one node and
+    /// already has a lane of its own, and a collector that started before a
+    /// node was added goes on using the exit it logged in through anyway.
+    pub fn refetch_nodes(&self) -> Vec<String> {
+        let mut nodes: Vec<String> = self
+            .document
+            .read()
+            .accounts
+            .iter()
+            .filter(|account| account.enabled && account.purpose == AccountPurpose::Refetch)
+            .map(|account| account.node.trim().to_owned())
+            .filter(|node| !node.is_empty())
+            .collect();
+        nodes.sort();
+        nodes.dedup();
+        nodes
+    }
+
     /// Every password held, for the log buffer to redact. Registered at start
     /// rather than at use, because a password can reach a log through a module's
     /// stderr or an error chain that never passed through this file.
@@ -330,6 +380,7 @@ mod tests {
             purpose,
             note: String::new(),
             enabled: true,
+            node: String::new(),
         }
     }
 

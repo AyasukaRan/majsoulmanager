@@ -398,6 +398,36 @@ test("the account pool edits a selection, and a delete drops it", async () => {
   assert.doesNotMatch(source, /accounts\.filter\(\(_, at\) => at !== index\)/);
 });
 
+/**
+ * An account can be sent out of its own mihomo node, which is what spreads a
+ * pool of eighty sessions over several exits. Two things about the picker are
+ * worth pinning, both of them ways to silently re-file somebody's accounts:
+ * a node an account already names has to stay in the list even when the
+ * subscription no longer offers it — a `<select>` whose value is not among its
+ * options renders blank, and the next save would write that blank back — and
+ * the batch picker's "follow" option cannot carry the empty string, because
+ * that is the placeholder's value and picking it would fire no event at all.
+ */
+test("the account pool binds accounts to nodes without dropping unknown ones", async () => {
+  const [source, api, service] = await Promise.all([
+    readFile(new URL("../components/account-pool.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../lib/mjai-api.ts", import.meta.url), "utf8"),
+    readFile(new URL("../../src/mihomo.rs", import.meta.url), "utf8"),
+  ]);
+  assert.match(api, /node: string;/);
+  assert.match(source, /nodeOptions/);
+  // Both halves of the option list: what mihomo offers, and what the accounts
+  // already name.
+  assert.match(source, /proxy\?\.nodes \?\? \[\]\)\.map\(\(node\) => node\.name\)/);
+  assert.match(source, /accounts\.map\(\(account\) => account\.node\)\.filter\(Boolean\)/);
+  assert.match(source, /const FOLLOW = "__follow__"/);
+  assert.match(source, /picked === FOLLOW \? "" : picked/);
+  // The console's ports have to be the ports the backend generates listeners
+  // for, so neither side may drift: the group name is what the status keys on.
+  assert.match(service, /MAJSOUL-OUT-\{slot\}/);
+  assert.match(service, /OUTBOUND_PORT_BASE: u16 = 7900/);
+});
+
 test("contains shadcn configuration and no disposable starter", async () => {
   const [components, packageJson] = await Promise.all([
     readFile(new URL("../components.json", import.meta.url), "utf8"),

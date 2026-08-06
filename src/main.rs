@@ -60,7 +60,18 @@ async fn main() -> anyhow::Result<()> {
     // may not be up yet, and an API that waits on it looks like an outage.
     {
         let mihomo = Arc::clone(&state.mihomo);
-        tokio::spawn(async move { mihomo.apply_runtime_config().await });
+        // Re-derived from the pool rather than trusted from the file mihomo's
+        // slots were last written to. The two agree whenever the console did
+        // the editing, which is every normal case; they disagree when the
+        // document was edited some other way, and then the file is the stale
+        // one — it would leave an account bound to a node that has no listener.
+        let nodes = state.accounts.refetch_nodes();
+        tokio::spawn(async move {
+            if let Err(error) = mihomo.set_outbound_nodes(&nodes) {
+                tracing::error!(%error, "写不出账号池的独立出站配置，补抓池会共用一条出站");
+            }
+            mihomo.apply_runtime_config().await;
+        });
     }
     tokio::spawn(upload_legacy_packs(state.clone()));
     tokio::spawn(backfill::rewrite_record_metadata(state.clone()));

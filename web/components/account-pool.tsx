@@ -8,6 +8,7 @@ import {
   ApiRequestError,
   jsonRequest,
   type AccountDocument,
+  type MihomoStatus,
   type StoredAccount,
 } from "@/lib/mjai-api";
 import { Badge } from "@/components/ui/badge";
@@ -21,13 +22,24 @@ import {
 } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
-import { selectClass } from "@/lib/utils";
+import { cn, selectClass } from "@/lib/utils";
 import { useBusyAction } from "@/components/watch/busy-action";
 
 const PURPOSES: Array<{ value: StoredAccount["purpose"]; label: string }> = [
   { value: "watch", label: "实时采集" },
   { value: "refetch", label: "批量补抓" },
 ];
+
+/**
+ * What "no node" is called in the batch picker only.
+ *
+ * A node is stored as the empty string when the account follows its half, and
+ * the batch picker's placeholder already owns that value — an option carrying
+ * it would be unpickable, because choosing it changes nothing and fires no
+ * event. The per-row picker has no placeholder and uses the empty string
+ * directly.
+ */
+const FOLLOW = "__follow__";
 
 /**
  * The accounts this deployment logs in with.
@@ -57,6 +69,14 @@ export function AccountPoolCard() {
    * Adding and importing only append, so what is ticked stays ticked.
    */
   const [selected, setSelected] = useState<ReadonlySet<number>>(new Set());
+  /**
+   * The nodes mihomo knows about, for the 出站 column to offer.
+   *
+   * Read straight from the proxy status rather than stored anywhere: a
+   * subscription can add or drop a node between two page loads, and a picker
+   * built from a remembered list would offer one that no longer exists.
+   */
+  const [proxy, setProxy] = useState<MihomoStatus | null>(null);
   const { busy, message, run } = useBusyAction();
 
   const load = useCallback(async () => {
@@ -66,6 +86,14 @@ export function AccountPoolCard() {
       setError(null);
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : "读取账号池失败");
+    }
+    // Separately, and never fatally: without it the 出站 column falls back to
+    // whatever each account already names, which is worse than the list but a
+    // great deal better than an empty page.
+    try {
+      setProxy(await jsonRequest<MihomoStatus>("/api/watch/proxy"));
+    } catch {
+      setProxy(null);
     }
   }, []);
 
@@ -163,6 +191,9 @@ export function AccountPoolCard() {
                     ...account,
                     purpose: "refetch" as const,
                     enabled: true,
+                    // Follows the pool's own exit until somebody spreads them
+                    // out, which is a batch edit away once they are in the list.
+                    node: "",
                   })),
                 ],
               }
@@ -194,6 +225,22 @@ export function AccountPoolCard() {
     });
   }
 
+  /**
+   * What the 出站 picker offers: every node mihomo reports, plus any node an
+   * account already names that mihomo does not.
+   *
+   * The second half is not defensiveness. A subscription that dropped a node
+   * leaves accounts pointing at a name that is no longer in the list, and a
+   * `<select>` whose value is not among its options renders blank — so the next
+   * save would quietly re-file those accounts onto the shared exit. Keeping the
+   * stale name visible is what lets an operator see it and decide.
+   */
+  const nodeOptions = [
+    ...new Set([
+      ...(proxy?.nodes ?? []).map((node) => node.name),
+      ...accounts.map((account) => account.node).filter(Boolean),
+    ]),
+  ];
   const counts = PURPOSES.map(({ value, label }) => ({
     label,
     value: accounts.filter(
@@ -272,6 +319,35 @@ export function AccountPoolCard() {
                   >
                     停用
                   </Button>
+                  <select
+                    // The shared class is full width, which is right in a grid
+                    // cell and wrong in a row of buttons — it took the whole
+                    // line and pushed 删除 onto the next one.
+                    className={cn(selectClass, "h-8 w-auto py-0")}
+                    aria-label="给选中的账号设出站"
+                    value=""
+                    onChange={(event) => {
+                      // The "follow" option cannot itself carry the empty
+                      // string: that is the placeholder's value and the one the
+                      // box is already showing, so picking it would change
+                      // nothing and fire no event.
+                      const picked = event.target.value;
+                      editSelected({ node: picked === FOLLOW ? "" : picked });
+                      // Back to the placeholder, so setting the same node on a
+                      // second batch is another change rather than nothing.
+                      event.target.value = "";
+                    }}
+                  >
+                    <option value="" disabled>
+                      设出站…
+                    </option>
+                    <option value={FOLLOW}>跟随补抓出站</option>
+                    {nodeOptions.map((node) => (
+                      <option key={node} value={node}>
+                        {node}
+                      </option>
+                    ))}
+                  </select>
                   <Button
                     variant="outline"
                     size="sm"
@@ -290,7 +366,7 @@ export function AccountPoolCard() {
             {accounts.map((account, index) => (
               <div
                 key={index}
-                className="grid gap-2 rounded-lg border bg-muted/25 p-3 md:grid-cols-[auto_1.4fr_1.1fr_140px_1fr_auto] md:items-center"
+                className="grid gap-2 rounded-lg border bg-muted/25 p-3 md:grid-cols-[auto_1.3fr_1fr_130px_150px_1fr_auto] md:items-center"
               >
                 <Checkbox
                   aria-label={`选中 ${account.username || "这一行"}`}
@@ -336,6 +412,25 @@ export function AccountPoolCard() {
                   {PURPOSES.map(({ value, label }) => (
                     <option key={value} value={value}>
                       {label}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  className={selectClass}
+                  aria-label={`${account.username || "这个账号"}走哪个出站`}
+                  value={account.node}
+                  disabled={account.purpose !== "refetch"}
+                  onChange={(event) => edit(index, { node: event.target.value })}
+                >
+                  {/* Live collection has one session and its own lane, and it
+                      picks a node on the settings page. Offering a second place
+                      to set it here would be two answers to one question. */}
+                  <option value="">
+                    {account.purpose === "refetch" ? "跟随补抓出站" : "跟随采集出站"}
+                  </option>
+                  {nodeOptions.map((node) => (
+                    <option key={node} value={node}>
+                      {node}
                     </option>
                   ))}
                 </select>
@@ -395,6 +490,7 @@ export function AccountPoolCard() {
                     purpose: "refetch",
                     note: "",
                     enabled: true,
+                    node: "",
                   },
                 ],
               })

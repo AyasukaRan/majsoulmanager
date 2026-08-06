@@ -385,6 +385,21 @@ async fn put_accounts(
     for password in state.accounts.secrets() {
         state.watch_service.log_buffer().register_secret(password);
     }
+    // The nodes the pool is now spread over, handed to mihomo so it grows or
+    // drops the listeners behind them. Deliberately not fatal to the save: the
+    // accounts are already written, and an outbound that did not come up costs
+    // the accounts on it their node — they fall back to the re-fetch lane —
+    // rather than costing the operator the edit they just made. The proxy card
+    // reads the outbounds back from mihomo and says which of the two happened.
+    if let Err(error) = state
+        .mihomo
+        .set_outbound_nodes(&state.accounts.refetch_nodes())
+    {
+        tracing::warn!(%error, "账号池的节点绑定没能写进 mihomo 配置");
+    } else {
+        let mihomo = std::sync::Arc::clone(&state.mihomo);
+        tokio::spawn(async move { mihomo.apply_runtime_config().await });
+    }
     Ok(Json(saved))
 }
 
