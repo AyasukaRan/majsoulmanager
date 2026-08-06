@@ -342,7 +342,7 @@ function RefetchConfigCard({
               onChange={(event) =>
                 onChange({ ...config, account_secret_ref: event.target.value })
               }
-              placeholder="file:/run/secrets/majsoul_refetch_accounts"
+              placeholder="pool:refetch"
             />
           </label>
         </div>

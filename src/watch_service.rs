@@ -145,7 +145,18 @@ impl Default for WatchInstance {
             room: "all".into(),
             players: 4,
             modes: vec!["east".into(), "south".into()],
-            account_secret_ref: "file:/run/secrets/majsoul_accounts".into(),
+            // A placeholder, and deliberately one that resolves to nothing
+            // rather than to a file. What was here named a path under
+            // `/run/secrets` that no Compose file in this repository mounts, so
+            // a deployment that never touched this page carried an instance
+            // nothing could read — and since the re-fetch pool has to know
+            // which accounts the collectors hold before it may start, that
+            // unreadable instance blocked the pool as well.
+            //
+            // `pool:` is the way out of both: the pool skips these, and an
+            // operator gets 账号池里没有这个账号 instead of a path that was
+            // never going to be there.
+            account_secret_ref: "pool:watch/待配置".into(),
             client_version: None,
         }
     }
@@ -1546,6 +1557,17 @@ mod tests {
         config.validate().unwrap();
         assert!(!config.enabled);
         assert_eq!(config.login_module, ModuleRef::builtin());
+
+        // And the instance it ships points at the account pool rather than at a
+        // file. It used to name a `/run/secrets` path nothing mounts, which
+        // `RefetchSupervisor::collector_accounts` cannot read — and since that
+        // refuses to start the re-fetch pool over any collector whose accounts
+        // it cannot see, one placeholder instance kept the other half of the
+        // deployment switched off too.
+        assert!(
+            config.instances[0].account_secret_ref.starts_with("pool:"),
+            "the shipped instance must not name a path nothing mounts"
+        );
     }
 
     /// The default reaches every instance created without a room being chosen,

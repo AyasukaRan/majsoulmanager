@@ -138,12 +138,14 @@ GitHub Actions 分为 `CI` 与 `Release` 两个工作流，共用 `Checks`（Rus
 
 前端工程说明见 [web/README.md](web/README.md)。
 
-Watch 默认关闭。进入管理台填写 `file:/run/secrets/...` 或 `env:...`
-形式的账号密钥引用后启用；密钥文件内容为 `username,password`。订阅链接由
-后端以 `0600` 权限保存在数据目录中，状态 API 只返回订阅域名。协议模块的打包和
-进程接口见 [docs/watch-modules.md](docs/watch-modules.md)。
-本地 Compose 可在 `.env` 设置 `MAJSOUL_ACCOUNTS=username,password`，然后
-在网页选择 `env:MAJSOUL_ACCOUNTS`；生产环境建议改用只读文件 secret。
+Watch 默认关闭。账号在管理台「账号池」页里填，采集实例的账号引用写
+`pool:watch/账号`、补抓池写 `pool:refetch`（补抓的默认值就是它）；密码以 `0600`
+存在数据目录里，接口只回 `***`。也可以继续用 `file:...` 或 `env:...` 引用，内容
+是一行一个 `username,password`——但 Compose 不挂任何 `/run/secrets` 路径，用
+`file:` 得自己加绑定挂载。本地也可以在 `.env` 里设 `MAJSOUL_ACCOUNTS=username,password`
+然后在网页选 `env:MAJSOUL_ACCOUNTS`。订阅链接由后端以 `0600` 权限保存在数据目录中，
+状态 API 只返回订阅域名。协议模块的打包和进程接口见
+[docs/watch-modules.md](docs/watch-modules.md)。
 
 生产路径不会把每个约 10KB 的 mjson 分别存成 RustFS 对象。打包器把每条记录压成独立 Zstandard frame，再合并为约 256MB 的 `.mjpack`；单条读取根据 ClickHouse 中的 offset/length 发起 Range GET，只下载对应的几 KB。
 
