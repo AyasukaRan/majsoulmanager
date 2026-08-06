@@ -124,11 +124,15 @@ GitHub Actions 分为 `CI` 与 `Release` 两个工作流，共用 `Checks`（Rus
 的格式化、Lint、测试）作为门禁：
 
 - `CI`：只在 PR 上运行，执行检查并试构建镜像，不发布任何产物。
-- `Release`：只在 push `main`、推送 `v*` 标签或手动触发时运行，检查通过后
-  发布镜像到 GHCR：
-  - `main`：`ghcr.io/ayasukaran/majsoulmanager-api:latest` 与 `ghcr.io/ayasukaran/majsoulmanager-web:latest`
-  - `v*` 标签：发布去掉 `v` 前缀后的版本标签
-  - 其他分支仅可手动触发（workflow_dispatch），发布 `dev` 标签
+- `Release`：只在推送 `v*` 标签或手动触发时运行，检查通过后发布镜像到 GHCR：
+  - `v*` 标签：同时发布去掉 `v` 前缀的版本标签和 `latest`
+  - 手动触发（workflow_dispatch）：只发布版本标签，**不动 `latest`** ——
+    重建一个旧版本不应该把 `latest` 拽回去
+  - 其他 ref 手动触发时发布 `dev` 标签
+
+  合并到 `main` 本身不再触发构建。每个合并都会跟一个 tag，所以 tag 是
+  「这是一次发布」的唯一事件；两个触发都留着的话，同一个 commit 会被完整
+  构建两次，产出两套一模一样的镜像。
   - 配置 `DOCKERHUB_USERNAME` 与 `DOCKERHUB_TOKEN` 两个 secrets 后，
     同一批标签会同步推送到 Docker Hub（`docker.io/<用户名>/majsoulmanager-*`）
 
