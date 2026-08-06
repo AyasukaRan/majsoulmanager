@@ -116,17 +116,34 @@ impl MajsoulConverter {
             .iter()
             .map(|account| account.account_id)
             .collect();
+        // The ladder that was actually being climbed. A three-player game is
+        // ranked on the three-player scale, and writing the four-player one —
+        // which is what happened until this read field 8 — described the same
+        // people at a table they were not sitting at.
+        //
+        // Decided by the number of seats rather than by which field is present,
+        // because both are always sent. An account that has never played this
+        // table size carries a zero score there, and its id is still the entry
+        // rank for the room it is in.
+        let three_player = num_players == 3;
+        let level_of = |account: &crate::majsoul::proto::PlayerAccountMeta| {
+            if three_player {
+                (account.level3_id, account.level3_score)
+            } else {
+                (account.level_id, account.level_score)
+            }
+        };
         let level_ids: Vec<u32> = player_accounts
             .iter()
-            .map(|account| account.level_id)
+            .map(|account| level_of(account).0)
             .collect();
         let level_scores: Vec<i32> = player_accounts
             .iter()
-            .map(|account| account.level_score)
+            .map(|account| level_of(account).1)
             .collect();
         let ranks: Vec<String> = player_accounts
             .iter()
-            .map(|account| get_dan_name(account.level_id))
+            .map(|account| get_dan_name(level_of(account).0))
             .collect();
         let mut majsoul = json!({
             "uuid": uuid,
@@ -153,6 +170,17 @@ impl MajsoulConverter {
         let mut pending_reach: Option<u32> = None;
         // Track last discarder for ron target calculation
         let mut last_discarder: Option<u32> = None;
+        // Who just declared a kan, for the one ron that is not on a discard.
+        //
+        // A 搶槓 wins on the tile somebody added to their own pon, so the seat
+        // that dealt in is the one that called the kan — not whoever discarded
+        // last, which is who this used to blame. It is rare (one occurrence in
+        // 309 real games) and it was wrong in both directions at once: an
+        // innocent seat took a 放銃 in `player_games`, and in that one game the
+        // blamed seat was the winner, so the record claimed somebody dealt into
+        // themselves. Cleared on the next discard, because by then the tile is
+        // no longer claimable.
+        let mut kan_pending_chankan: Option<u32> = None;
         // Indicators already announced this hand. Mahjong Soul reports the
         // whole face-up set on every event that can change it rather than the
         // one it just turned, so a `dora` event is emitted for the tail this
@@ -224,6 +252,7 @@ impl MajsoulConverter {
                 GameEvent::DiscardTile(dt) => {
                     // Track last discarder for ron target calculation
                     last_discarder = Some(dt.seat);
+                    kan_pending_chankan = None;
 
                     // Check for riichi declaration
                     if dt.is_liqi || dt.is_wliqi {
@@ -285,6 +314,12 @@ impl MajsoulConverter {
                 }
 
                 GameEvent::AnGangAddGang(ag) => {
+                    // Claimable until somebody discards: a 搶槓 ron lands on
+                    // this seat, and only an added kan can be robbed.
+                    kan_pending_chankan = match ag.gang_type {
+                        AnGangAddGangType::Kakan => Some(ag.seat),
+                        AnGangAddGangType::Ankan => None,
+                    };
                     match ag.gang_type {
                         AnGangAddGangType::Ankan => {
                             let consumed = generate_ankan_tiles(&ag.tiles);
@@ -322,7 +357,13 @@ impl MajsoulConverter {
                         let target = if hule.zimo {
                             hule.seat
                         } else {
-                            last_discarder.unwrap_or(0)
+                            // The kan first: a ron that lands while an added
+                            // kan is still claimable is a 搶槓, and the seat
+                            // that dealt in is the one holding the kan.
+                            kan_pending_chankan
+                                .filter(|seat| *seat != hule.seat)
+                                .or(last_discarder)
+                                .unwrap_or(0)
                         };
                         // Per-hand when the game says so, and the round's
                         // face-up set otherwise: a double ron reports the same
@@ -409,12 +450,21 @@ impl MajsoulConverter {
                         }));
                     }
 
-                    // Abortive draw with reason
+                    // Abortive draw with reason. 2 and 4 were the wrong way
+                    // round, so every 四風連打 in the corpus reads as 四家立直
+                    // and the analysis of either one gets the other's hands.
+                    //
+                    // Measured: all three type 2 draws across 309 real games
+                    // came directly after four identical wind discards by the
+                    // four seats in turn, with nobody having declared riichi.
+                    // Types 3, 4 and 5 never occurred in that sample — they are
+                    // left as the schema orders them, which is the same order
+                    // this correction puts 2 and 4 in.
                     let reason = match lj.liuju_type {
                         1 => "yao9",   // 9 terminals
-                        2 => "reach4", // 4 riichi
+                        2 => "kaze4",  // 4 same wind
                         3 => "kan4",   // 4 kan
-                        4 => "kaze4",  // 4 same wind
+                        4 => "reach4", // 4 riichi
                         5 => "ron3",   // Triple ron
                         _ => "unknown",
                     };
@@ -895,6 +945,7 @@ pub fn convert_downloaded_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::majsoul::events::{AnGangAddGang, DiscardTile, Hule, HuleInfo, NewRound};
 
     #[test]
     fn start_game_contains_discovery_metadata() {
@@ -922,6 +973,78 @@ mod tests {
         assert_eq!(events[0]["majsoul"]["game_length"], "south");
         assert_eq!(events[0]["majsoul"]["players"], 4);
         assert_eq!(events[0]["majsoul"]["year"], 2020);
+    }
+
+    /// A ron on a kan is a ron on the seat that called the kan.
+    ///
+    /// The target used to be whoever discarded last, which is right for every
+    /// ordinary ron and wrong for a 搶槓 — the tile was added to a pon, not
+    /// discarded. One game in 309 hit it, and it was wrong twice over: an
+    /// innocent seat took the 放銃 in `player_games`, and the seat it blamed
+    /// was the winner, so the record said somebody dealt into themselves.
+    #[test]
+    fn a_ron_on_an_added_kan_blames_the_seat_that_called_it() {
+        let hand = |kan: AnGangAddGangType, winner: u32| {
+            let events = vec![
+                GameEvent::NewRound(NewRound {
+                    chang: 0,
+                    ju: 0,
+                    ben: 0,
+                    liqibang: 0,
+                    dora_marker: "1z".into(),
+                    doras: vec!["1z".into()],
+                    scores: vec![25_000; 4],
+                    tiles: vec![Vec::new(); 4],
+                }),
+                GameEvent::DiscardTile(DiscardTile {
+                    seat: 3,
+                    tile: "1m".into(),
+                    is_liqi: false,
+                    is_wliqi: false,
+                    moqie: false,
+                }),
+                GameEvent::AnGangAddGang(AnGangAddGang {
+                    seat: 1,
+                    gang_type: kan,
+                    tiles: "5m".into(),
+                    doras: Vec::new(),
+                }),
+                GameEvent::Hule(Hule {
+                    hules: vec![HuleInfo {
+                        seat: winner,
+                        zimo: false,
+                        hand: vec!["5m".into()],
+                        hu_tile: "5m".into(),
+                        ..HuleInfo::default()
+                    }],
+                    delta_scores: vec![0; 4],
+                    scores: vec![25_000; 4],
+                    doras: Vec::new(),
+                }),
+            ];
+            let record = GameRecord {
+                uuid: "uuid".to_string(),
+                start_time: 123,
+                mode_id: 16,
+                player_names: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+                player_accounts: Vec::new(),
+                result: Vec::new(),
+                records: Vec::new(),
+            };
+            let events = MajsoulConverter
+                .events_to_mjai(&record, &events, None)
+                .unwrap();
+            events
+                .into_iter()
+                .find(|event| event["type"] == "hora")
+                .expect("a win")
+        };
+
+        // Robbed: the kan is the deal-in, not the discard two events earlier.
+        assert_eq!(hand(AnGangAddGangType::Kakan, 0)["target"], 1);
+        // A concealed kan cannot be robbed, so an ordinary ron on the discard
+        // still names the discarder.
+        assert_eq!(hand(AnGangAddGangType::Ankan, 0)["target"], 3);
     }
 
     /// A record fetched by uuid alone has no header to be handed, so the

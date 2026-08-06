@@ -233,8 +233,28 @@ pub struct PlayerAccountMeta {
     pub account_id: u64,
     pub seat: u32,
     pub nickname: String,
+    /// The four-player ladder, in the 1xxxx scale.
     pub level_id: u32,
     pub level_score: i32,
+    /// The three-player ladder, in the 2xxxx scale. Carried for every account
+    /// whatever the table size, so its presence says nothing about which game
+    /// this is — [`GameRecord::level_ids`] picks by the number of seats.
+    pub level3_id: u32,
+    pub level3_score: i32,
+}
+
+/// `AccountLevel { id = 1, score = 2 }`, the same shape under both ladders.
+fn decode_account_level(data: &[u8]) -> Result<(u32, i32)> {
+    let (mut id, mut score) = (0u32, 0i32);
+    for level_field in FieldIterator::new(data) {
+        let level_field = level_field?;
+        match (level_field.number, level_field.wire_type) {
+            (1, 0) => id = extract_varint(level_field.data)? as u32,
+            (2, 0) => score = extract_varint(level_field.data)? as u32 as i32,
+            _ => {}
+        }
+    }
+    Ok((id, score))
 }
 
 fn decode_player_account(data: &[u8]) -> Result<PlayerAccountMeta> {
@@ -245,17 +265,26 @@ fn decode_player_account(data: &[u8]) -> Result<PlayerAccountMeta> {
             (1, 0) => account.account_id = extract_varint(field.data)?,
             (2, 0) => account.seat = extract_varint(field.data)? as u32,
             (3, 2) => account.nickname = extract_string(field.data),
+            // Two ladders, one per table size, and both are always sent. Field
+            // 7 is the four-player rank and field 8 the three-player one:
+            // across 309 real games every field 7 id was in the 1xxxx range and
+            // every field 8 id in 2xxxx, and each room's lowest id sat exactly
+            // on that room's entry requirement in the matching scale.
+            //
+            // Reading only field 7 meant every three-player game in the corpus
+            // recorded its players' *four*-player ranks. Nothing looked wrong:
+            // the numbers were present and well formed, they just described a
+            // different ladder, so a three-player set filtered by rank was
+            // filtered on the wrong people.
             (7, 2) => {
-                for level_field in FieldIterator::new(field.data) {
-                    let level_field = level_field?;
-                    match (level_field.number, level_field.wire_type) {
-                        (1, 0) => account.level_id = extract_varint(level_field.data)? as u32,
-                        (2, 0) => {
-                            account.level_score = extract_varint(level_field.data)? as u32 as i32
-                        }
-                        _ => {}
-                    }
-                }
+                let (id, score) = decode_account_level(field.data)?;
+                account.level_id = id;
+                account.level_score = score;
+            }
+            (8, 2) => {
+                let (id, score) = decode_account_level(field.data)?;
+                account.level3_id = id;
+                account.level3_score = score;
             }
             _ => {}
         }
@@ -472,5 +501,49 @@ mod tests {
         let (name, data) = decode_wrapper(&buf).unwrap();
         assert_eq!(name, "test");
         assert_eq!(data, vec![1, 2, 3]);
+    }
+
+    /// Both ladders come off the wire, and they are not interchangeable.
+    ///
+    /// Field 7 is the four-player rank and field 8 the three-player one. Only
+    /// field 7 was read, so every three-player game in the corpus recorded its
+    /// players' four-player ranks — and nothing about the result looked wrong,
+    /// because the ids are well formed in either scale. Across 309 real games
+    /// every field 7 id was 1xxxx and every field 8 id 2xxxx, with each room's
+    /// lowest id sitting exactly on that room's entry requirement.
+    #[test]
+    fn an_account_carries_a_rank_for_each_table_size() {
+        // AccountLevel { id, score } under both fields, plus a seat and a name.
+        let level = |id: u64, score: u64| {
+            let mut body = vec![0x08];
+            body.extend(encode_varint(id));
+            body.push(0x10);
+            body.extend(encode_varint(score));
+            body
+        };
+        let mut record = vec![0x08, 0x2a, 0x10, 0x01];
+        for (field, body) in [(7u8, level(10_401, 1_200)), (8, level(20_701, 400))] {
+            record.push((field << 3) | 2);
+            record.push(body.len() as u8);
+            record.extend(body);
+        }
+
+        let account = decode_player_account(&record).unwrap();
+
+        assert_eq!((account.level_id, account.level_score), (10_401, 1_200));
+        assert_eq!((account.level3_id, account.level3_score), (20_701, 400));
+    }
+
+    fn encode_varint(mut value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                out.push(byte);
+                return out;
+            }
+            out.push(byte | 0x80);
+        }
     }
 }
