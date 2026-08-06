@@ -203,6 +203,36 @@ export function WatchProxyCard({
           </label>
         ))}
 
+        {/* Read-only on purpose: which node an account goes out of is decided
+            on the 账号池 page, one row at a time, and a second place to change
+            it would be a second answer to the same question. What belongs here
+            is whether mihomo actually grew the listener that binding needs. */}
+        {(proxy?.outbounds ?? []).length > 0 ? (
+          <div className="space-y-1.5 rounded-lg border bg-muted/25 p-3">
+            <p className="text-xs font-medium">
+              {"补抓池的独立出站（账号池里绑到某个节点的账号走这些）"}
+            </p>
+            {(proxy?.outbounds ?? []).map((outbound) => (
+              <p
+                key={outbound.group}
+                className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground"
+              >
+                <span className="font-mono">{outbound.node}</span>
+                <span className="font-mono">{outbound.proxy_url}</span>
+                <span>
+                  {outbound.available &&
+                  outbound.selected_node === outbound.node
+                    ? "已生效"
+                    : `还没生效，绑在它上面的账号先走 ${
+                        proxy?.lanes.find((lane) => lane.lane === "refetch")
+                          ?.proxy_url ?? "共用出站"
+                      }`}
+                </span>
+              </p>
+            ))}
+          </div>
+        ) : null}
+
         <div className="flex flex-wrap gap-2">
           <Button
             variant="outline"

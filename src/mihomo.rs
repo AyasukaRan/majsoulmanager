@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -65,6 +66,69 @@ impl MihomoLane {
     pub const ALL: [Self; 2] = [Self::Watch, Self::Refetch];
 }
 
+/// How many nodes the pool may go out of at once.
+///
+/// One listener and one select group per node, so this is a bound on generated
+/// configuration rather than on anything Mahjong Soul cares about. Sized to be
+/// larger than any subscription an operator would actually spread a pool over,
+/// and small enough that the ports stay in one legible block.
+const MAX_OUTBOUNDS: u16 = 32;
+/// The first port an outbound gets. Above the two lanes, and above the shared
+/// 7890, so nothing here can collide with a port a deployment already dials.
+const OUTBOUND_PORT_BASE: u16 = 7900;
+
+fn outbound_group(slot: u16) -> String {
+    format!("MAJSOUL-OUT-{slot}")
+}
+
+fn outbound_port(slot: u16) -> u16 {
+    OUTBOUND_PORT_BASE + slot
+}
+
+/// Which node each outbound slot carries, remembered across restarts.
+///
+/// The assignment is persisted rather than derived from the sorted node names
+/// for one reason: a session dials a port for the life of its login, and
+/// deriving the slot would move every later node's port whenever a name was
+/// added or removed. A pool session would then keep dialling a port that now
+/// means a different country. Slots are freed when nothing references the node
+/// any more and handed out lowest-first, so the numbering stays dense without
+/// ever moving a node that is still in use.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct OutboundSlots {
+    /// Node name → slot. A `BTreeMap` so the generated configuration is byte
+    /// for byte the same for the same set of nodes, which is what keeps a
+    /// rewrite from looking like a change to mihomo.
+    #[serde(default)]
+    assignments: std::collections::BTreeMap<String, u16>,
+}
+
+impl OutboundSlots {
+    /// Re-files the slots so exactly `nodes` are assigned, keeping every node
+    /// that is still named where it already was. Returns whether anything moved.
+    fn refile(&mut self, nodes: &[String]) -> bool {
+        let wanted: HashSet<&str> = nodes.iter().map(String::as_str).collect();
+        let before = self.assignments.clone();
+        self.assignments
+            .retain(|node, _| wanted.contains(node.as_str()));
+        for node in nodes {
+            if self.assignments.contains_key(node) {
+                continue;
+            }
+            let taken: HashSet<u16> = self.assignments.values().copied().collect();
+            let Some(slot) = (1..=MAX_OUTBOUNDS).find(|slot| !taken.contains(slot)) else {
+                tracing::warn!(
+                    node,
+                    "mihomo 出站已经用满 {MAX_OUTBOUNDS} 个，这个节点上的账号会走补抓那条共用出站"
+                );
+                break;
+            };
+            self.assignments.insert(node.clone(), slot);
+        }
+        self.assignments != before
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct StoredSubscription {
     url: String,
@@ -127,6 +191,24 @@ pub struct MihomoLaneStatus {
     pub available: bool,
 }
 
+/// One node the re-fetch pool goes out of, and whether it is usable.
+///
+/// `available` is read back from mihomo for the same reason the lanes' is: the
+/// group and its listener are written into a configuration this process
+/// generates, and a mihomo that has not reloaded is a port nothing answers on.
+/// An account bound to an unavailable node falls back to the re-fetch lane.
+#[derive(Clone, Debug, Serialize)]
+pub struct MihomoOutboundStatus {
+    pub node: String,
+    pub group: String,
+    pub proxy_url: String,
+    /// What the group is actually on. Equal to `node` once the selection has
+    /// been applied; `MAJSOUL` before that, which is the group's default and
+    /// means the accounts on it are still going out the shared way.
+    pub selected_node: Option<String>,
+    pub available: bool,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct MihomoNode {
     pub name: String,
@@ -148,6 +230,9 @@ pub struct MihomoStatus {
     pub selected_node: Option<String>,
     /// One entry per lane, keyed by its `snake_case` name.
     pub lanes: Vec<MihomoLaneStatus>,
+    /// One entry per node the re-fetch pool has been spread over, empty when
+    /// no account names one.
+    pub outbounds: Vec<MihomoOutboundStatus>,
     pub proxy_url: String,
     pub nodes: Vec<MihomoNode>,
     pub updated_at: DateTime<Utc>,
@@ -187,6 +272,12 @@ pub struct MihomoManager {
     /// get the shared port, which is exactly what they used before this
     /// existed.
     lanes_ready: std::sync::atomic::AtomicBool,
+    /// The same question as `lanes_ready`, asked about the per-node outbounds,
+    /// and kept apart from it on purpose: a slot group that mihomo has not
+    /// picked up must cost the accounts bound to that node their node, not cost
+    /// live collection its lane.
+    slots_ready: std::sync::atomic::AtomicBool,
+    slots: RwLock<OutboundSlots>,
     subscription: RwLock<Option<StoredSubscription>>,
     client: Client,
 }
@@ -211,12 +302,22 @@ impl MihomoManager {
             .connect_timeout(Duration::from_secs(3))
             .timeout(Duration::from_secs(15))
             .build()?;
+        // Read before the first configuration is written, so a restart
+        // regenerates the same slots for the same nodes and every session that
+        // reconnects dials the port it dialled before.
+        let slots = match std::fs::read(root.join("outbounds.json")) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => OutboundSlots::default(),
+            Err(error) => return Err(error.into()),
+        };
         let manager = Self {
             root,
             controller_url,
             controller_secret,
             proxy_url,
             lanes_ready: std::sync::atomic::AtomicBool::new(false),
+            slots_ready: std::sync::atomic::AtomicBool::new(false),
+            slots: RwLock::new(slots),
             subscription: RwLock::new(subscription),
             client,
         };
@@ -245,12 +346,16 @@ impl MihomoManager {
         if !self.lanes_ready.load(std::sync::atomic::Ordering::Relaxed) {
             return self.proxy_url.clone();
         }
-        let with_port = || {
-            let mut url = Url::parse(&self.proxy_url).ok()?;
-            url.set_port(Some(lane.port())).ok()?;
-            Some(url.to_string())
-        };
-        with_port().unwrap_or_else(|| self.proxy_url.clone())
+        self.port_url(lane.port())
+            .unwrap_or_else(|| self.proxy_url.clone())
+    }
+
+    /// The shared proxy URL with another port on it, so a deployment that moved
+    /// mihomo somewhere else only has to say so once.
+    fn port_url(&self, port: u16) -> Option<String> {
+        let mut url = Url::parse(&self.proxy_url).ok()?;
+        url.set_port(Some(port)).ok()?;
+        Some(url.to_string())
     }
 
     /// Whether the lanes are live, for anything that has to explain itself.
@@ -258,12 +363,67 @@ impl MihomoManager {
         self.lanes_ready.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Where a session bound to `node` dials, or `None` if it should use its
+    /// lane instead.
+    ///
+    /// `None` covers all three ways this can be answered honestly: the node has
+    /// no slot (nothing asked for it, or the slots are full), mihomo has not
+    /// picked the slot groups up yet, or the URL will not take a port. Every
+    /// one of them means "there is no listener for this node right now", and a
+    /// session sent to a closed port fetches nothing at all — where a session
+    /// on the shared exit fetches everything, just not from where it was asked
+    /// to.
+    pub fn proxy_url_for_node(&self, node: &str) -> Option<String> {
+        if !self.slots_ready.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let slot = *self.slots.read().assignments.get(node.trim())?;
+        self.port_url(outbound_port(slot))
+    }
+
+    /// Grows or shrinks the per-node outbounds to exactly `nodes`.
+    ///
+    /// Writes the configuration but does not reload it: the caller follows with
+    /// [`Self::apply_runtime_config`], which is the one path that reloads,
+    /// checks mihomo actually took the groups, and only then reports the
+    /// outbounds as usable.
+    pub fn set_outbound_nodes(&self, nodes: &[String]) -> Result<bool, MihomoError> {
+        let changed = {
+            let mut slots = self.slots.write();
+            let changed = slots.refile(nodes);
+            if changed {
+                atomic_write(
+                    &self.root.join("outbounds.json"),
+                    &serde_json::to_vec_pretty(&*slots)?,
+                )?;
+            }
+            changed
+        };
+        if changed {
+            // The slots that were just written are not the slots mihomo is
+            // running until it says so, and until then an account bound to one
+            // of them belongs on the lane rather than on a port that may not
+            // exist yet.
+            self.slots_ready
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            self.write_runtime_config()?;
+        }
+        Ok(changed)
+    }
+
     pub async fn status(&self) -> MihomoStatus {
         match self.read_nodes().await {
-            Ok((selected, lanes, nodes)) => self.status_value(true, selected, lanes, nodes, None),
-            Err(error) => {
-                self.status_value(false, None, Vec::new(), Vec::new(), Some(error.to_string()))
+            Ok((selected, lanes, outbounds, nodes)) => {
+                self.status_value(true, selected, lanes, outbounds, nodes, None)
             }
+            Err(error) => self.status_value(
+                false,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Some(error.to_string()),
+            ),
         }
     }
 
@@ -272,6 +432,7 @@ impl MihomoManager {
         available: bool,
         selected_node: Option<String>,
         lanes: Vec<MihomoLaneStatus>,
+        outbounds: Vec<MihomoOutboundStatus>,
         nodes: Vec<MihomoNode>,
         error: Option<String>,
     ) -> MihomoStatus {
@@ -287,6 +448,7 @@ impl MihomoManager {
                 .unwrap_or(default_update_interval()),
             selected_node,
             lanes,
+            outbounds,
             proxy_url: self.proxy_url.clone(),
             nodes,
             updated_at: Utc::now(),
@@ -321,6 +483,10 @@ impl MihomoManager {
                     self.proxy_url_for(MihomoLane::Watch),
                     self.proxy_url_for(MihomoLane::Refetch)
                 );
+                // After the lanes, and never in place of them: a subscription
+                // that dropped a node leaves its slot group selecting nothing,
+                // and that must not cost live collection its lane.
+                self.apply_outbound_selections().await;
                 return;
             } else {
                 tracing::warn!(attempt, "mihomo 重载了但还没有分流出站的策略组");
@@ -335,6 +501,55 @@ impl MihomoManager {
              控制台「mihomo 代理」卡片会显示分组未生效",
             self.proxy_url
         );
+    }
+
+    /// Points every outbound group at the node it was created for, and only
+    /// then lets sessions dial those ports.
+    ///
+    /// The selection has to be made through the controller rather than written
+    /// into the group, because the nodes come from a subscription provider and
+    /// a group can only `use:` the provider, not name one of its members. Which
+    /// is also the fail-safe: a group whose selection never lands stays on
+    /// `MAJSOUL`, so the traffic goes out the shared way rather than nowhere.
+    async fn apply_outbound_selections(&self) {
+        let assignments = self.slots.read().assignments.clone();
+        if assignments.is_empty() {
+            self.slots_ready
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        let mut applied = 0usize;
+        for (node, slot) in &assignments {
+            match self
+                .controller_json(
+                    Method::PUT,
+                    &format!("/proxies/{}", outbound_group(*slot)),
+                    Some(serde_json::json!({ "name": node })),
+                )
+                .await
+            {
+                Ok(_) => applied += 1,
+                Err(error) => {
+                    tracing::warn!(
+                        node,
+                        slot,
+                        %error,
+                        "mihomo 没接受这个出站的节点选择，绑在它上面的账号先走补抓那条出站"
+                    );
+                }
+            }
+        }
+        let ready = applied == assignments.len();
+        self.slots_ready
+            .store(ready, std::sync::atomic::Ordering::Relaxed);
+        if ready {
+            tracing::info!(
+                outbounds = assignments.len(),
+                "补抓池的独立出站已就绪，端口 {}..{}",
+                outbound_port(1),
+                outbound_port(assignments.len() as u16)
+            );
+        }
     }
 
     /// Whether mihomo currently has every lane's group. Read from the
@@ -437,7 +652,15 @@ impl MihomoManager {
     #[allow(clippy::type_complexity)]
     async fn read_nodes(
         &self,
-    ) -> Result<(Option<String>, Vec<MihomoLaneStatus>, Vec<MihomoNode>), MihomoError> {
+    ) -> Result<
+        (
+            Option<String>,
+            Vec<MihomoLaneStatus>,
+            Vec<MihomoOutboundStatus>,
+            Vec<MihomoNode>,
+        ),
+        MihomoError,
+    > {
         let value = self.controller_json(Method::GET, "/proxies", None).await?;
         let proxies = value
             .get("proxies")
@@ -484,6 +707,43 @@ impl MihomoManager {
             lanes.iter().all(|lane| lane.available),
             std::sync::atomic::Ordering::Relaxed,
         );
+        // The same re-answer for the per-node outbounds. A slot whose group
+        // mihomo does not have is a port nothing answers on, and the accounts
+        // bound to it have to go back to the lane before the next session tries
+        // to dial it — which is what dropping `slots_ready` does.
+        // The assignments are copied out first rather than read through the
+        // guard: building each URL reads the same lock, and a second read taken
+        // while a writer is queued between them is a deadlock, not a slow path.
+        let assignments = self.slots.read().assignments.clone();
+        let outbounds: Vec<MihomoOutboundStatus> = assignments
+            .into_iter()
+            .map(|(node, slot)| {
+                let group = outbound_group(slot);
+                let present = proxies.get(&group);
+                MihomoOutboundStatus {
+                    selected_node: present
+                        .and_then(|group| group.get("now"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    available: present.is_some(),
+                    proxy_url: self
+                        .port_url(outbound_port(slot))
+                        .unwrap_or_else(|| self.proxy_url.clone()),
+                    node,
+                    group,
+                }
+            })
+            .collect();
+        // Ready means every slot is both present and pointed at the node it was
+        // created for. A group that is present but still on `MAJSOUL` — the
+        // selection has not been applied, or mihomo refused it — is a session
+        // that would go out the shared way while the console said otherwise.
+        self.slots_ready.store(
+            outbounds.iter().all(|outbound| {
+                outbound.available && outbound.selected_node.as_deref() == Some(&outbound.node)
+            }),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let selected = shared;
         let provider_names = self.provider_node_names().await.unwrap_or_default();
         let mut nodes = Vec::new();
@@ -521,7 +781,7 @@ impl MihomoManager {
                     &right.name,
                 ))
         });
-        Ok((selected, lanes, nodes))
+        Ok((selected, lanes, outbounds, nodes))
     }
 
     async fn provider_node_names(&self) -> Result<Vec<String>, MihomoError> {
@@ -638,6 +898,46 @@ proxy-providers:
                 )
             })
             .collect();
+        // One more group and one more listener per node the pool was spread
+        // over. They are built exactly like a lane — same shape, same default —
+        // because they are the same mechanism: a listener bound to a group
+        // bypasses `rules`, and that is what lets one process reach several
+        // nodes at once. What makes an outbound different from a lane is only
+        // that its selection is made through the controller afterwards, since a
+        // group can `use:` a provider but cannot name one of its members here.
+        //
+        // `MAJSOUL` first again, and for the same reason as the lanes: a group
+        // that has never been picked resolves to its first entry, and a slot
+        // that resolved to `DIRECT` would send a pool session out of the host's
+        // own address the moment the group appeared — before the selection that
+        // was the entire point of creating it.
+        // Ordered by slot rather than by node name, so the block reads down the
+        // ports it creates. The set is what matters to mihomo; the order is for
+        // whoever opens the file to see why a port is listening.
+        let slots = {
+            let mut slots: Vec<u16> = self.slots.read().assignments.values().copied().collect();
+            slots.sort_unstable();
+            slots
+        };
+        let outbound_groups: String = slots
+            .iter()
+            .map(|slot| {
+                format!(
+                    "  - name: {}\n    type: select\n    proxies:\n      - {GROUP_NAME}\n      - DIRECT\n{provider_use}",
+                    outbound_group(*slot)
+                )
+            })
+            .collect();
+        let outbound_listeners: String = slots
+            .iter()
+            .map(|slot| {
+                format!(
+                    "  - name: majsoul-out-{slot}-in\n    type: mixed\n    port: {}\n    listen: 0.0.0.0\n    proxy: {}\n",
+                    outbound_port(*slot),
+                    outbound_group(*slot)
+                )
+            })
+            .collect();
         let listeners: String = MihomoLane::ALL
             .into_iter()
             .map(|lane| {
@@ -648,6 +948,7 @@ proxy-providers:
                     lane.group()
                 )
             })
+            .chain(std::iter::once(outbound_listeners))
             .collect();
         let config = format!(
             r#"mixed-port: 7890
@@ -671,7 +972,7 @@ proxy-groups:
     type: select
     proxies:
       - DIRECT
-{}{lane_groups}listeners:
+{}{lane_groups}{outbound_groups}listeners:
 {listeners}rules:
   - MATCH,{GROUP_NAME}
 "#,
@@ -850,6 +1151,105 @@ mod lane_tests {
                 format!("http://mihomo:{}/", lane.port())
             );
         }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// One outbound per node the pool was spread over, and the same node on the
+    /// same port for as long as anything asks for it.
+    ///
+    /// The stability is the part worth a test. A session dials its proxy for
+    /// the life of a login, so deriving the port from the sorted node names
+    /// would move every later node whenever one was added — and a session that
+    /// kept dialling 7902 would find another country there. The generated file
+    /// was fed to `metacubex/mihomo` v1.19.27 (`mihomo -t`), the version the
+    /// deployment runs, and accepted.
+    #[test]
+    fn each_bound_node_gets_its_own_outbound_and_keeps_its_port() {
+        let root = std::env::temp_dir().join(format!("mjai-mihomo-out-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("subscription.json"),
+            br#"{"url":"https://provider.example/sub?token=x","update_interval_secs":3600}"#,
+        )
+        .unwrap();
+        let manager = MihomoManager::new(
+            root.clone(),
+            "http://127.0.0.1:9090",
+            "secret".into(),
+            "http://mihomo:7890".into(),
+        )
+        .expect("a manager");
+
+        // Node names carry spaces and non-ASCII, because subscriptions name
+        // nodes for people. They never reach the YAML — the group is numbered
+        // and the node is selected through the controller — which is half the
+        // reason for the numbering.
+        let first = ["日本 07".to_owned(), "香港 13".to_owned()];
+        assert!(manager.set_outbound_nodes(&first).expect("written"));
+        let config = std::fs::read_to_string(root.join("config.yaml")).expect("a config");
+        for slot in 1..=2u16 {
+            assert!(
+                config.contains(&format!(
+                    "  - name: MAJSOUL-OUT-{slot}\n    type: select\n    proxies:\n      - {GROUP_NAME}\n"
+                )),
+                "outbound {slot} does not default to the shared group: {config}"
+            );
+            assert!(
+                config.contains(&format!("    port: {}\n", 7900 + slot)),
+                "outbound {slot} has no listener: {config}"
+            );
+            assert!(
+                config.contains(&format!("    proxy: MAJSOUL-OUT-{slot}\n")),
+                "outbound {slot}'s listener is not bound to its group: {config}"
+            );
+        }
+        // The lanes are untouched by any of it.
+        assert!(config.contains("    port: 7891\n"), "{config}");
+        assert!(config.contains("  - MATCH,MAJSOUL\n"), "{config}");
+
+        let ports: Vec<u16> = ["日本 07", "香港 13"]
+            .into_iter()
+            .map(|node| {
+                manager
+                    .slots
+                    .read()
+                    .assignments
+                    .get(node)
+                    .copied()
+                    .expect("a slot")
+            })
+            .collect();
+
+        // Nothing is dialled until mihomo is confirmed to have the groups —
+        // the same fail-safe the lanes have, and for the same reason: a port
+        // nothing listens on fetches nothing, where the shared exit fetches
+        // everything.
+        assert_eq!(manager.proxy_url_for_node("日本 07"), None);
+        manager
+            .slots_ready
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            manager.proxy_url_for_node("日本 07").as_deref(),
+            Some(format!("http://mihomo:{}/", outbound_port(ports[0])).as_str())
+        );
+        // A node nobody bound an account to has no listener, so it has no URL
+        // either; the caller falls back to the lane rather than to a guess.
+        assert_eq!(manager.proxy_url_for_node("新加坡 02"), None);
+
+        // One node dropped, one added. The one that stayed keeps its port, and
+        // the newcomer takes the freed slot rather than pushing the numbering
+        // along.
+        let second = ["日本 07".to_owned(), "新加坡 02".to_owned()];
+        assert!(manager.set_outbound_nodes(&second).expect("written"));
+        let slots = manager.slots.read().assignments.clone();
+        assert_eq!(slots.get("日本 07").copied(), Some(ports[0]));
+        assert_eq!(slots.get("新加坡 02").copied(), Some(ports[1]));
+        assert_eq!(slots.get("香港 13"), None);
+
+        // And asking for the same set again changes nothing, so a console poll
+        // or a save that touched a note does not rewrite the configuration and
+        // make mihomo reload for no reason.
+        assert!(!manager.set_outbound_nodes(&second).expect("unchanged"));
         std::fs::remove_dir_all(root).ok();
     }
 }
