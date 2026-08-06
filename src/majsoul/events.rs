@@ -58,11 +58,15 @@ pub struct ChiPengGang {
     pub froms: Vec<u32>,
 }
 
-/// Ankan/Kakan type
+/// Ankan/Kakan type, numbered as the game numbers them.
+///
+/// The discriminants had these the wrong way round, alongside the decoder that
+/// read them, so they are pinned by a test now: 2 is the added kan and 3 the
+/// concealed one.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AnGangAddGangType {
-    Ankan = 2,
-    Kakan = 3,
+    Kakan = 2,
+    Ankan = 3,
 }
 
 /// Decoded RecordAnGangAddGang event
@@ -89,7 +93,7 @@ pub struct FanInfo {
 }
 
 /// A single winning hand in RecordHule
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct HuleInfo {
     pub seat: u32,
     pub zimo: bool,
@@ -308,11 +312,20 @@ pub fn parse_an_gang_add_gang(data: &[u8]) -> Result<AnGangAddGang> {
         let field = field?;
         match (field.number, field.wire_type) {
             (1, 0) => seat = extract_varint(field.data)? as u32,
+            // 2 is the added kan, 3 is the concealed one. They were the other
+            // way round here, which made every kan in the corpus the wrong mjai
+            // event — an `ankan` where the game had a `kakan` and back again.
+            //
+            // Measured rather than read off a schema, because getting it wrong
+            // costs the same either way: across 309 real games, all 140 kans of
+            // type 2 were on a tile that seat had already ponned in that hand,
+            // and none of the 166 of type 3 were. Adding to your own pon is the
+            // definition of 加杠; a concealed kan cannot follow a pon at all.
             (2, 0) => {
                 let t = extract_varint(field.data)? as u32;
                 gang_type = match t {
-                    3 => AnGangAddGangType::Kakan,
-                    2 => AnGangAddGangType::Ankan,
+                    2 => AnGangAddGangType::Kakan,
+                    3 => AnGangAddGangType::Ankan,
                     n => {
                         tracing::warn!("Unknown AnGangAddGang type: {}, defaulting to Ankan", n);
                         AnGangAddGangType::Ankan
@@ -454,12 +467,18 @@ pub fn parse_no_tile(data: &[u8]) -> Result<NoTile> {
     for field in FieldIterator::new(data) {
         let field = field?;
         match (field.number, field.wire_type) {
-            // players: NoTilePlayerInfo { tingpai = 1, hand = 2, ... }
+            // players: NoTilePlayerInfo { tingpai = 3, hand = 4, tings = 5 }
+            //
+            // Field 1 was read here, and there is no field 1: across 309 real
+            // games the sub-message only ever carried 3, 4 and 5. So every
+            // exhaustive draw reported nobody tenpai, and `draws_tenpai` in
+            // `player_games` counted nothing at all — silently, because "no one
+            // was ready" is a perfectly ordinary thing for a draw to say.
             (2, 2) => {
                 let mut seat_tenpai = false;
                 for inner in FieldIterator::new(field.data) {
                     let inner = inner?;
-                    if (inner.number, inner.wire_type) == (1, 0) {
+                    if (inner.number, inner.wire_type) == (3, 0) {
                         seat_tenpai = extract_varint(inner.data)? != 0;
                     }
                 }
@@ -619,7 +638,12 @@ mod tests {
     fn an_exhaustive_draw_pays_every_seat_and_says_who_was_tenpai() {
         let mut players = Vec::new();
         for tenpai in [true, false, true, false] {
-            players.extend(message(2, &scalar(1, i64::from(tenpai))));
+            // Field 3. This said field 1, and `NoTilePlayerInfo` has no field
+            // 1 — across 309 real games the sub-message only ever carried 3, 4
+            // and 5 — so every draw in the corpus reported nobody tenpai and
+            // `draws_tenpai` counted nothing. Re-converting those 309 games
+            // took the flags from 0 true / 882 false to 445 / 437.
+            players.extend(message(2, &scalar(3, i64::from(tenpai))));
         }
         let mut payment = repeated(2, &[25_000, 25_000, 25_000, 25_000]);
         payment.extend(repeated(3, &[1_500, -1_500, 1_500, -1_500]));
@@ -631,6 +655,26 @@ mod tests {
         assert_eq!(draw.tenpai, vec![true, false, true, false]);
         assert_eq!(draw.delta_scores, vec![1_500, -1_500, 1_500, -1_500]);
         assert_eq!(draw.scores, vec![26_500, 23_500, 26_500, 23_500]);
+    }
+
+    /// Which number means which kan.
+    ///
+    /// These were swapped, so every kan in the corpus was the other kind of
+    /// mjai event: 306 of them across 309 real games, 166 concealed kans
+    /// written as `kakan` and 140 added ones written as `ankan`. The evidence
+    /// is in the games rather than in a schema — all 140 kans of type 2 were on
+    /// a tile that seat had already ponned in that hand, and none of the 166 of
+    /// type 3 were, which is what 加杠 is and what 暗杠 cannot be.
+    #[test]
+    fn an_added_kan_is_type_two_and_a_concealed_one_is_type_three() {
+        let kan = |kind: i64| {
+            let mut record = scalar(1, 2);
+            record.extend(scalar(2, kind));
+            record.extend(text(3, "5m"));
+            parse_an_gang_add_gang(&record).unwrap()
+        };
+        assert_eq!(kan(2).gang_type, AnGangAddGangType::Kakan);
+        assert_eq!(kan(3).gang_type, AnGangAddGangType::Ankan);
     }
 
     /// 流局満貫 is a second payment on the same draw. Summing rather than
