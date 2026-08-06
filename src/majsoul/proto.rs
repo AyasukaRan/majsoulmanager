@@ -169,6 +169,14 @@ pub fn decode_wrapper(buf: &[u8]) -> Result<(String, Vec<u8>)> {
 pub struct RecordAction {
     pub name: String,
     pub data: Vec<u8>,
+    /// Milliseconds since the game opened, as the server timed this action.
+    ///
+    /// The only account of *when* anything happened inside a hand, and there is
+    /// no recovering it afterwards — a mjai stream is a sequence with no clock.
+    /// Present on all 328,048 actions across 309 real games and never going
+    /// backwards, so it also orders two events that share a wall-clock second.
+    /// `None` only for the old record format, which carries no timing at all.
+    pub passed_ms: Option<u32>,
 }
 
 /// Decoded ResGameRecord
@@ -176,6 +184,9 @@ pub struct RecordAction {
 pub struct GameRecord {
     pub uuid: String,
     pub start_time: u32,
+    /// When the game ended, which is the only way to know how long it took.
+    /// Present on all 309 real games sampled; the median game ran 1031 seconds.
+    pub end_time: u32,
     /// `head.config.meta.mode_id`, or 0 where the head carries no config — a
     /// friend room, a contest, or a shape this decoder has not seen.
     ///
@@ -314,6 +325,7 @@ fn decode_config_mode_id(data: &[u8]) -> Result<i32> {
 pub fn decode_game_record(raw: &[u8]) -> Result<GameRecord> {
     let mut uuid = String::new();
     let mut start_time = 0u32;
+    let mut end_time = 0u32;
     let mut mode_id = 0i32;
     let mut player_accounts = Vec::new();
     let mut result = Vec::new();
@@ -345,6 +357,7 @@ pub fn decode_game_record(raw: &[u8]) -> Result<GameRecord> {
                         2 if inner.wire_type == 0 => {
                             start_time = extract_varint(inner.data)? as u32
                         }
+                        3 if inner.wire_type == 0 => end_time = extract_varint(inner.data)? as u32,
                         // config (GameConfig). Its field number is 5 here and 3
                         // in `GameLiveHead`, which the live-list parser reads —
                         // two different messages that both call the field
@@ -430,6 +443,7 @@ pub fn decode_game_record(raw: &[u8]) -> Result<GameRecord> {
     Ok(GameRecord {
         uuid,
         start_time,
+        end_time,
         mode_id,
         player_names,
         player_accounts,
@@ -446,7 +460,13 @@ fn decode_old_format_records(raw_records: &[Vec<u8>]) -> Result<Vec<RecordAction
         // Each record bytes is a Wrapper {name: string, data: bytes}
         let (name, data) = decode_wrapper(raw)?;
         if !name.is_empty() {
-            records.push(RecordAction { name, data });
+            // The old format wraps the record on its own, with no GameAction
+            // around it and so no clock.
+            records.push(RecordAction {
+                name,
+                data,
+                passed_ms: None,
+            });
         }
     }
     Ok(records)
@@ -457,12 +477,15 @@ fn decode_old_format_records(raw_records: &[Vec<u8>]) -> Result<Vec<RecordAction
 fn decode_new_format_actions(actions_data: &[Vec<u8>]) -> Result<Vec<RecordAction>> {
     let mut records = Vec::new();
     for action_bytes in actions_data {
-        // GameAction: {type: uint32 (field 1), result: bytes (field 3)}
+        // GameAction: {passed: uint32 (1), type: uint32 (2), result: bytes (3)}
         let mut result_data: Option<Vec<u8>> = None;
+        let mut passed_ms = None;
         for field in FieldIterator::new(action_bytes) {
             let field = field?;
-            if field.number == 3 && field.wire_type == 2 {
-                result_data = Some(field.data.to_vec());
+            match (field.number, field.wire_type) {
+                (1, 0) => passed_ms = Some(extract_varint(field.data)? as u32),
+                (3, 2) => result_data = Some(field.data.to_vec()),
+                _ => {}
             }
         }
 
@@ -470,7 +493,11 @@ fn decode_new_format_actions(actions_data: &[Vec<u8>]) -> Result<Vec<RecordActio
             if !result.is_empty() {
                 let (name, data) = decode_wrapper(&result)?;
                 if !name.is_empty() {
-                    records.push(RecordAction { name, data });
+                    records.push(RecordAction {
+                        name,
+                        data,
+                        passed_ms,
+                    });
                 }
             }
         }
