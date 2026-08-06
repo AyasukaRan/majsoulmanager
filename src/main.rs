@@ -77,6 +77,13 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(backfill::rewrite_record_metadata(state.clone()));
     tokio::spawn(backfill::write_game_scoped_claims(state.clone()));
     tokio::spawn(backfill::score_indexed_records(state.clone()));
+    // After the scoring pass rather than before it, and both are spawned rather
+    // than chained: the scoring pass repairs a statistic on all 1.9M records
+    // from the mjai already stored, and this one rebuilds the mjai itself for
+    // the 245k that kept their protobuf. A record this pass rewrites is scored
+    // again by the pack worker on the way in, so the order between them costs
+    // nothing but a little repeated work on the overlap.
+    tokio::spawn(backfill::reconvert_stored_records(state.clone()));
     tokio::spawn(collect_orphans(state.clone()));
     // What the ingest path's backlog ceiling reads. Nothing samples it in the
     // test suite, which is why an unsampled reading of zero has to mean "no

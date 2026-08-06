@@ -453,6 +453,81 @@ async fn scores_a_game_into_per_player_counters() {
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 
+/// The re-conversion pass walks exactly the records it can convert.
+///
+/// It rebuilds a record's mjai from the protobuf that was stored beside it,
+/// which only 245k of 1.9M records have — the rest arrived as mjai or predate
+/// the protobuf being kept, and their only repair is a re-fetch. A filter that
+/// let those through would hand the pass 1.6M records with nothing to convert,
+/// and its whole output would be a failure count.
+#[tokio::test]
+async fn the_reconversion_walk_sees_only_records_that_kept_their_protobuf() {
+    let (state, data_dir) = test_state().await;
+    let source = test_source(&data_dir);
+    let mjai = r#"{"type":"start_game","names":["a","b","c","d"],"rule":"tonpu"}
+{"type":"start_kyoku","bakaze":"E","kyoku":1}"#;
+
+    let mut with_pb = None;
+    for uuid in ["kept-its-pb", "never-had-one"] {
+        let accepted = mjai_management::indexer::ingest_one(
+            &state.catalog,
+            &state.kafka,
+            &source,
+            uuid,
+            None,
+            mjai.as_bytes(),
+            None,
+        )
+        .await
+        .unwrap();
+        index_pending(&state).await;
+        if uuid == "kept-its-pb" {
+            let stored = state.catalog.get(accepted.id).await.unwrap().unwrap();
+            mjai_management::indexer::reindex_one(
+                &state.kafka,
+                &stored,
+                mjai.as_bytes().to_vec(),
+                Some(b"a protobuf".to_vec()),
+            )
+            .await
+            .unwrap();
+            index_pending(&state).await;
+            with_pb = Some(accepted.id);
+        }
+    }
+
+    let walk = |stored_pb: bool| mjai_management::catalog::RecordFilter {
+        source: Some(source.clone()),
+        stored_pb,
+        ..Default::default()
+    };
+    let (page, _) = state.catalog.scan(&walk(true), None, 100).await.unwrap();
+    assert_eq!(
+        page.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![with_pb.expect("the record that kept its protobuf")],
+        "the walk picked up a record it has nothing to convert"
+    );
+    assert!(page[0].majsoul_pb.is_some());
+
+    // And the two halves partition the corpus: what this pass cannot repair is
+    // exactly what the re-fetch pool goes and fetches.
+    let (missing, _) = state
+        .catalog
+        .scan(
+            &mjai_management::catalog::RecordFilter {
+                source: Some(source.clone()),
+                missing_pb: true,
+                ..Default::default()
+            },
+            None,
+            100,
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.len(), 1);
+    assert_ne!(missing[0].id, page[0].id);
+}
+
 /// Replacing a record's bytes keeps it one record.
 ///
 /// This is the property the whole re-fetch backfill rests on: a re-fetched game
