@@ -18,15 +18,19 @@ concurrency:
 permissions:
   contents: read
 
+# No checks job. A tag is only ever pushed onto a commit that just came out of
+# a pull request, where CI ran clippy, the tests and the web build against the
+# same tree — and `needs: checks` put that 3.2 minutes in front of every
+# publish. Rebuilding an old tag by hand is worse: months-old code against
+# today's toolchain, and whatever it says cannot change what gets published.
+#
+# What a tag on an unverified commit costs is the images it publishes. That is
+# the trade: the verification lives on the pull request, and a tag pushed
+# outside that path is a process mistake this workflow would only notice after
+# it had already started building.
 jobs:
-  checks:
-    name: Checks
-    uses: ./.github/workflows/checks.yml
-
   images:
     name: Publish images
-    needs:
-      - checks
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
