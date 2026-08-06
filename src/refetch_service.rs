@@ -96,11 +96,13 @@ const MAX_PASSES: u32 = 12;
 /// lines by matching this prefix.
 const LOG_SOURCE: &str = "refetch";
 
-/// Ceilings on the two knobs. The concurrency ceiling is not a Mahjong Soul
-/// limit — the real limit is how many accounts a deployment has, since a second
-/// login on one account ends the first session — it only stops a typo from
-/// spawning a hundred logins.
-const MAX_CONCURRENCY: usize = 16;
+/// The one ceiling left. Concurrency has none: it never was a Mahjong Soul
+/// limit, and the real limit sits at the point the sessions are opened —
+/// `min(concurrency, accounts)`, because a second login on an account ends the
+/// first session. A pool of eighty accounts asked for eighty sessions and got
+/// sixteen, which is sixty-four accounts idling for a number that was only ever
+/// there to catch a typo. What catches a typo now is the account count sitting
+/// on the page next to the box.
 const MAX_REQUEST_DELAY_MS: u64 = 60_000;
 
 /// The name the 牌谱屋 walk keeps its position under. One row in
@@ -202,10 +204,10 @@ impl RefetchServiceConfig {
                 "server must be cn, en or jp".into(),
             ));
         }
-        if !(1..=MAX_CONCURRENCY).contains(&self.concurrency) {
-            return Err(WatchServiceError::InvalidConfig(format!(
-                "concurrency must be between 1 and {MAX_CONCURRENCY}"
-            )));
+        if self.concurrency < 1 {
+            return Err(WatchServiceError::InvalidConfig(
+                "concurrency must be at least 1".into(),
+            ));
         }
         if self.request_delay_ms > MAX_REQUEST_DELAY_MS {
             return Err(WatchServiceError::InvalidConfig(format!(
@@ -1615,14 +1617,27 @@ mod tests {
         };
         assert!(plaintext.validate().is_err());
 
-        for concurrency in [0, MAX_CONCURRENCY + 1] {
+        assert!(
+            RefetchServiceConfig {
+                concurrency: 0,
+                ..valid()
+            }
+            .validate()
+            .is_err(),
+            "concurrency 0 was accepted"
+        );
+        // And nothing above it is refused any more. The ceiling that used to sit
+        // here was a typo guard, and it cost a pool of eighty accounts sixty-four
+        // idle sessions; what bounds the sessions is `min(concurrency, accounts)`
+        // at the point they are opened.
+        for concurrency in [17, 64, 500] {
             let config = RefetchServiceConfig {
                 concurrency,
                 ..valid()
             };
             assert!(
-                config.validate().is_err(),
-                "concurrency {concurrency} was accepted"
+                config.validate().is_ok(),
+                "concurrency {concurrency} was refused"
             );
         }
         assert!(

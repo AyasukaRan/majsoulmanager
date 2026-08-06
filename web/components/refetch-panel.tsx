@@ -398,10 +398,13 @@ function RefetchConfigCard({
               <Gauge className="size-3.5" />
               并发会话数
             </span>
+            {/* No maximum. The old 16 was a typo guard, not a Mahjong Soul
+                limit, and a pool of eighty accounts spent sixty-four of them
+                idle because of it. What actually bounds the sessions is the
+                account count, which the line below this box reports. */}
             <Input
               type="number"
               min={1}
-              max={16}
               value={config.concurrency}
               onChange={(event) =>
                 onChange({

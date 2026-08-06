@@ -357,6 +357,47 @@ test("reads the registrar's accounts.jsonl and drops what the pool already has",
   assert.match(source, /purpose: "refetch" as const/);
 });
 
+/**
+ * The concurrency box and the API's own rule have to agree. A console that
+ * offers 64 against a backend that refuses anything over 16 is a 400 on save,
+ * and the operator's only clue is a number they typed being called invalid.
+ */
+test("nothing caps the re-fetch concurrency, on either side", async () => {
+  const [panel, service] = await Promise.all([
+    readFile(new URL("../components/refetch-panel.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../../src/refetch_service.rs", import.meta.url), "utf8"),
+  ]);
+  // The box still refuses zero — a pool of no sessions is a pool that does
+  // nothing while reporting that it is running.
+  assert.match(panel, /type="number"\n\s+min=\{1\}\n\s+value=\{config\.concurrency\}/);
+  assert.doesNotMatch(panel, /max=\{\d+\}\n\s+value=\{config\.concurrency\}/);
+  assert.doesNotMatch(service, /MAX_CONCURRENCY/);
+  assert.match(service, /self\.concurrency < 1/);
+});
+
+/**
+ * A batch of fifty imported accounts is a batch of fifty rows to re-file, so
+ * the pool edits by selection. What this pins is the one thing that can go
+ * quietly wrong: the selection is by position, and a delete shifts every later
+ * row up — so a delete that does not clear it re-points every tick at the row
+ * that moved into the slot, and the next batch edit lands on the wrong accounts.
+ */
+test("the account pool edits a selection, and a delete drops it", async () => {
+  const source = await readFile(
+    new URL("../components/account-pool.tsx", import.meta.url),
+    "utf8",
+  );
+  assert.match(source, /const editSelected =/);
+  assert.match(source, /aria-label="全选"/);
+  assert.match(source, /已选 \{selected\.size\} 个/);
+  // Every delete goes through the one helper that clears the selection, so
+  // neither the row button nor the batch button can forget to.
+  assert.match(source, /const removeAt = [\s\S]*?setSelected\(new Set\(\)\);/);
+  assert.match(source, /onClick=\{\(\) => removeAt\(\(at\) => at === index\)\}/);
+  assert.match(source, /removeAt\(\(at\) => selected\.has\(at\)\)/);
+  assert.doesNotMatch(source, /accounts\.filter\(\(_, at\) => at !== index\)/);
+});
+
 test("contains shadcn configuration and no disposable starter", async () => {
   const [components, packageJson] = await Promise.all([
     readFile(new URL("../components.json", import.meta.url), "utf8"),
