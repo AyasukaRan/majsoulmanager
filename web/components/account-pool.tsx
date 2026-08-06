@@ -46,11 +46,23 @@ const PURPOSES: Array<{ value: StoredAccount["purpose"]; label: string }> = [
 export function AccountPoolCard() {
   const [document_, setDocument] = useState<AccountDocument | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * Which rows the batch controls act on, by position.
+   *
+   * By position rather than by id because a row imported or added but not yet
+   * saved has no id — the backend assigns it — and those are exactly the rows a
+   * batch edit is for. The cost is that a delete shifts every later row up, so
+   * a delete clears it rather than leave a tick sitting on whatever moved into
+   * that slot; a reload clears it too, since the list came from elsewhere.
+   * Adding and importing only append, so what is ticked stays ticked.
+   */
+  const [selected, setSelected] = useState<ReadonlySet<number>>(new Set());
   const { busy, message, run } = useBusyAction();
 
   const load = useCallback(async () => {
     try {
       setDocument(await jsonRequest<AccountDocument>("/api/accounts"));
+      setSelected(new Set());
       setError(null);
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : "读取账号池失败");
@@ -99,6 +111,28 @@ export function AccountPoolCard() {
       accounts: accounts.map((account, at) =>
         at === index ? { ...account, ...patch } : account,
       ),
+    });
+  /** The same edit, applied to every ticked row at once. */
+  const editSelected = (patch: Partial<StoredAccount>) =>
+    setDocument({
+      ...document_,
+      accounts: accounts.map((account, at) =>
+        selected.has(at) ? { ...account, ...patch } : account,
+      ),
+    });
+  const removeAt = (drop: (index: number) => boolean) => {
+    setDocument({
+      ...document_,
+      accounts: accounts.filter((_, at) => !drop(at)),
+    });
+    setSelected(new Set());
+  };
+  const toggle = (index: number, on: boolean) =>
+    setSelected((previous) => {
+      const next = new Set(previous);
+      if (on) next.add(index);
+      else next.delete(index);
+      return next;
     });
   /**
    * Stages the registrar's output, it does not save it: what lands is rows in
@@ -198,11 +232,71 @@ export function AccountPoolCard() {
           </p>
         ) : (
           <div className="space-y-2">
+            <div className="flex flex-wrap items-center gap-3 px-1 text-xs text-muted-foreground">
+              <label className="flex items-center gap-1.5">
+                <Checkbox
+                  aria-label="全选"
+                  checked={selected.size === accounts.length}
+                  onCheckedChange={(checked) =>
+                    setSelected(
+                      checked ? new Set(accounts.map((_, at) => at)) : new Set(),
+                    )
+                  }
+                />
+                全选
+              </label>
+              {selected.size > 0 ? (
+                <>
+                  <span className="font-mono">已选 {selected.size} 个</span>
+                  {PURPOSES.map(({ value, label }) => (
+                    <Button
+                      key={value}
+                      variant="outline"
+                      size="sm"
+                      onClick={() => editSelected({ purpose: value })}
+                    >
+                      设为{label}
+                    </Button>
+                  ))}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => editSelected({ enabled: true })}
+                  >
+                    启用
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => editSelected({ enabled: false })}
+                  >
+                    停用
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => removeAt((at) => selected.has(at))}
+                  >
+                    <Trash2 className="size-4" />
+                    删除
+                  </Button>
+                </>
+              ) : (
+                <span>
+                  {"勾上几行就能一次改用途、一次启停、一次删除。改完照样要点保存。"}
+                </span>
+              )}
+            </div>
             {accounts.map((account, index) => (
               <div
                 key={index}
-                className="grid gap-2 rounded-lg border bg-muted/25 p-3 md:grid-cols-[1.4fr_1.1fr_140px_1fr_auto] md:items-center"
+                className="grid gap-2 rounded-lg border bg-muted/25 p-3 md:grid-cols-[auto_1.4fr_1.1fr_140px_1fr_auto] md:items-center"
               >
+                <Checkbox
+                  aria-label={`选中 ${account.username || "这一行"}`}
+                  checked={selected.has(index)}
+                  onCheckedChange={(checked) => toggle(index, checked === true)}
+                />
                 <label className="space-y-1 text-xs font-medium md:space-y-0">
                   <span className="md:hidden">账号</span>
                   <Input
@@ -264,12 +358,7 @@ export function AccountPoolCard() {
                     variant="ghost"
                     size="sm"
                     aria-label="删除这个账号"
-                    onClick={() =>
-                      setDocument({
-                        ...document_,
-                        accounts: accounts.filter((_, at) => at !== index),
-                      })
-                    }
+                    onClick={() => removeAt((at) => at === index)}
                   >
                     <Trash2 className="size-4" />
                   </Button>
