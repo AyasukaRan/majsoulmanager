@@ -117,6 +117,14 @@ const PAIPUYA_WALK: &str = "paipuya";
 /// namespace constant that deliberately does not follow this name.
 const PAIPUYA_SOURCE: &str = "paipuya";
 
+/// What this field defaulted to before the console grew an account pool.
+///
+/// It names a path `docker-compose.yml` has never mounted — it always meant
+/// "add a bind mount yourself" — so a deployment that never edited this box
+/// gets `No such file or directory` on every start, with its accounts sitting
+/// in the pool the whole time.
+const LEGACY_SECRET_REF: &str = "file:/run/secrets/majsoul_refetch_accounts";
+
 /// Where the walk gets its uuids.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -162,10 +170,12 @@ pub struct RefetchServiceConfig {
     #[serde(default)]
     pub proxy_mode: WatchProxyMode,
     pub custom_proxy_url: Option<String>,
-    /// `file:` or `env:`, one `username,password` per line — the same format a
-    /// collector's secret uses, so one file can serve both. A collector reads
-    /// only the first line; the pool reads every line and drops the ones a
-    /// collector holds.
+    /// Where the accounts come from. `pool:refetch` is the console's account
+    /// pool, which is where they live now; `file:` and `env:` still work and
+    /// hold one `username,password` per line — the same format a collector's
+    /// secret uses, so one file can serve both. A collector reads only the
+    /// first line; the pool reads every line and drops the ones a collector
+    /// holds.
     pub account_secret_ref: String,
     /// How many sessions to run at once. Capped by the number of usable
     /// accounts, because one account is one session.
@@ -185,7 +195,7 @@ impl Default for RefetchServiceConfig {
             server: "cn".into(),
             proxy_mode: WatchProxyMode::Mihomo,
             custom_proxy_url: None,
-            account_secret_ref: "file:/run/secrets/majsoul_refetch_accounts".into(),
+            account_secret_ref: "pool:refetch".into(),
             concurrency: 2,
             // Three times the collector's, and deliberately. A collector sends
             // a handful of requests per poll and then sleeps; this sends one
@@ -195,6 +205,27 @@ impl Default for RefetchServiceConfig {
             client_version: None,
         }
     }
+}
+
+/// Points a configuration that still carries the pre-pool default at the pool,
+/// and says whether it changed anything.
+///
+/// Only that exact string, and only when the path it names is genuinely absent:
+/// a deployment that did add the bind mount has a working configuration, and
+/// moving it onto the pool would log the sessions in with different accounts
+/// than the ones it chose. Anything typed by hand is left alone whatever it
+/// says — an operator who wrote `env:` meant `env:`.
+fn migrate_legacy_secret_ref(config: &mut RefetchServiceConfig, legacy_file_exists: bool) -> bool {
+    if config.account_secret_ref != LEGACY_SECRET_REF || legacy_file_exists {
+        return false;
+    }
+    config.account_secret_ref = "pool:refetch".into();
+    // Bumped, because the document on disk is no longer the one the console is
+    // holding. Without it a page opened before the restart saves its stale copy
+    // over this — the revision check would see no conflict — and puts the
+    // deployment back on the path that does not exist.
+    config.revision = config.revision.saturating_add(1);
+    true
 }
 
 impl RefetchServiceConfig {
@@ -354,8 +385,17 @@ impl RefetchSupervisor {
         let config_path = directory.join("config.json");
         let config = match std::fs::read(&config_path) {
             Ok(bytes) => {
-                let config: RefetchServiceConfig = serde_json::from_slice(&bytes)?;
+                let mut config: RefetchServiceConfig = serde_json::from_slice(&bytes)?;
                 config.validate()?;
+                // Written back, not just held in memory: the console shows this
+                // field, and an operator reading `file:` there while the pool
+                // logs in from `pool:refetch` is worse than the bug.
+                if migrate_legacy_secret_ref(
+                    &mut config,
+                    Path::new(LEGACY_SECRET_REF.trim_start_matches("file:")).exists(),
+                ) {
+                    persist_json(&config_path, &config)?;
+                }
                 config
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -516,9 +556,13 @@ impl RefetchSupervisor {
     /// costs is games that were being played while the collector was locked out,
     /// which Mahjong Soul does not serve twice.
     ///
-    /// A collector whose secret cannot be read contributes nothing, which is the
-    /// right answer — it cannot log in either — but it is said out loud, because
-    /// the alternative reading is that the pool is about to take its account.
+    /// A `file:` or `env:` reference that cannot be read stops the pool. What it
+    /// named a minute ago is not knowable from here, and a collector reads its
+    /// credentials once and keeps logging in with them, so "unreadable" says
+    /// nothing about which account is in use.
+    ///
+    /// A `pool:` reference is not read at all — the store it names is this
+    /// process's own and `reserved` below already holds everything in it.
     fn collector_accounts(&self) -> Result<HashSet<String>, WatchServiceError> {
         // Every account the console filed under live collection, whether an
         // instance points at it today or not and whether it is switched on or
@@ -530,6 +574,20 @@ impl RefetchSupervisor {
             .accounts
             .reserved(crate::accounts::AccountPurpose::Watch);
         for instance in &self.dependencies.watch.config().instances {
+            // A `pool:` instance is already counted. `reserved` above took every
+            // account filed under live collection, enabled or not, and that is a
+            // superset of anything `pool:watch/…` can resolve to — reading it
+            // would add nothing, and failing on it would refuse to start over an
+            // instance pointing at an account nobody has added yet. That
+            // instance holds no session: it cannot log in either.
+            //
+            // Which is exactly a deployment nobody has configured live
+            // collection on. Its one instance names an account that is not in
+            // the pool, and without this the pool it is not competing with could
+            // never start.
+            if instance.account_secret_ref.starts_with("pool:") {
+                continue;
+            }
             match load_accounts(&instance.account_secret_ref, &self.dependencies.accounts) {
                 // The first line, byte for byte what `load_first_account` gives
                 // the collector itself.
@@ -547,8 +605,13 @@ impl RefetchSupervisor {
                 // to start instead, and says which instance it could not read.
                 Err(error) => {
                     return Err(WatchServiceError::InvalidConfig(format!(
+                        // Not "或者停用它": the loop above reads every instance,
+                        // switched off or not, and deliberately so — an
+                        // operator turns one back on with a click. Advising a
+                        // remedy that changes nothing sends them to a checkbox
+                        // and back.
                         "读不到采集实例 {} 的账号（{error:#}），无法确认补抓池会不会和它抢；\
-                         先把这个实例的账号引用修好，或者停用它",
+                         把它的账号引用改成控制台账号池里的 pool:watch/账号，或者删掉这个实例",
                         instance.id
                     )));
                 }
@@ -1631,6 +1694,51 @@ mod tests {
         // And the delay is above the collector's 500ms, because this one sends
         // requests back to back for as long as the backlog lasts.
         assert!(config.request_delay_ms >= 1_000);
+    }
+
+    /// The default has to name the place the accounts are actually kept.
+    ///
+    /// It named a `file:` path nothing mounts, which meant every deployment
+    /// that filled in the console's account pool and pressed 启动 got
+    /// `No such file or directory` — with the accounts one field away the whole
+    /// time.
+    #[test]
+    fn the_default_reads_the_console_account_pool() {
+        assert_eq!(
+            RefetchServiceConfig::default().account_secret_ref,
+            "pool:refetch"
+        );
+
+        // A deployment still carrying the old default moves with it...
+        let mut stored = RefetchServiceConfig {
+            account_secret_ref: LEGACY_SECRET_REF.into(),
+            ..RefetchServiceConfig::default()
+        };
+        stored.revision = 7;
+        assert!(migrate_legacy_secret_ref(&mut stored, false));
+        assert_eq!(stored.account_secret_ref, "pool:refetch");
+        // The revision moves with it, so a console page opened before the
+        // restart cannot save its stale copy back over the migration without
+        // being told the document changed.
+        assert_eq!(stored.revision, 8);
+
+        // ...unless it did mount that file, in which case the file is the
+        // configuration and the accounts in it need not be the pool's.
+        let mut mounted = RefetchServiceConfig {
+            account_secret_ref: LEGACY_SECRET_REF.into(),
+            ..RefetchServiceConfig::default()
+        };
+        assert!(!migrate_legacy_secret_ref(&mut mounted, true));
+        assert_eq!(mounted.account_secret_ref, LEGACY_SECRET_REF);
+
+        // Anything typed by hand is left alone, missing file or not: an
+        // operator who wrote a path meant that path.
+        let mut typed = RefetchServiceConfig {
+            account_secret_ref: "file:/srv/mjai/accounts.txt".into(),
+            ..RefetchServiceConfig::default()
+        };
+        assert!(!migrate_legacy_secret_ref(&mut typed, false));
+        assert_eq!(typed.account_secret_ref, "file:/srv/mjai/accounts.txt");
     }
 
     #[test]

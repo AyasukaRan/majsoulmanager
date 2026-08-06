@@ -1176,8 +1176,16 @@ pub fn load_accounts(
         .split_once(':')
         .context("account secret reference has no scheme")?;
     let content = match scheme {
-        "file" => std::fs::read_to_string(target)
-            .with_context(|| format!("failed to read account secret file {target}"))?,
+        // Named in Chinese and with the way out in it, because the way this is
+        // reached is almost always a configuration written before the console
+        // had an account pool: the path is one nothing mounts, and the accounts
+        // are already in the pool a few characters away.
+        "file" => std::fs::read_to_string(target).with_context(|| {
+            format!(
+                "读不到账号文件 {target}（容器里没挂这个路径？账号在控制台「账号池」页里的话，\
+                 把引用改成 pool:refetch 或 pool:watch/账号）"
+            )
+        })?,
         "env" => std::env::var(target)
             .with_context(|| format!("account secret environment variable {target} is missing"))?,
         // Answered from the store rather than rendered into the text format and
