@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { KeyRound, Plus, Save, Trash2 } from "lucide-react";
 
+import { parseAccountsJsonl } from "@/lib/accounts-jsonl.mjs";
 import {
   ApiRequestError,
   jsonRequest,
@@ -99,6 +100,66 @@ export function AccountPoolCard() {
         at === index ? { ...account, ...patch } : account,
       ),
     });
+  /**
+   * Stages the registrar's output, it does not save it: what lands is rows in
+   * the list above, for an operator to look at before pressing 保存. Fifty
+   * accounts arriving in one PUT that then fails validation would otherwise be
+   * fifty rows to find the bad one in.
+   */
+  async function importJsonl(file: File) {
+    if (!document_) return;
+    await run("导入失败", async () => {
+      const { accounts: added, duplicates, unusable } = parseAccountsJsonl(
+        await file.text(),
+        accounts.map((account) => account.username),
+      );
+      if (added.length > 0) {
+        // Appended to whatever is on screen when the file finishes reading, not
+        // to the snapshot this handler started with: a row deleted or a note
+        // typed while the file was being read would otherwise come back.
+        setDocument((previous) =>
+          previous
+            ? {
+                ...previous,
+                accounts: [
+                  ...previous.accounts,
+                  ...added.map((account) => ({
+                    // Empty: the backend assigns one on save and hands it back.
+                    id: "",
+                    ...account,
+                    purpose: "refetch" as const,
+                    enabled: true,
+                  })),
+                ],
+              }
+            : previous,
+        );
+      }
+      // Named for what was actually skipped. A repeat inside the file is not
+      // "already in the pool", and an operator told that goes looking through
+      // the list for a row that was never there.
+      const skipped = [
+        duplicates > 0 ? `${duplicates} 个重复的（池里已有，或文件里重了）` : null,
+        unusable > 0
+          ? `${unusable} 行用不了（读不出、没密码，或账号里带空格和 /）`
+          : null,
+      ]
+        .filter(Boolean)
+        .join("，");
+      if (added.length === 0 && !skipped) {
+        throw new Error("这个文件里一个账号都没有");
+      }
+      return [
+        `${added.length} 个账号已加进列表，用途是批量补抓`,
+        skipped ? `；跳过 ${skipped}` : "",
+        // Only when something is waiting to be saved: after an import that
+        // added nothing, "点保存才写进去" reads as an instruction to save the
+        // rows that were just thrown away.
+        added.length > 0 ? "。还没保存，点保存才写进去。" : "。",
+      ].join("");
+    });
+  }
+
   const counts = PURPOSES.map(({ value, label }) => ({
     label,
     value: accounts.filter(
@@ -225,7 +286,11 @@ export function AccountPoolCard() {
           {"把它让给另一边——「实时采集」下的账号始终算采集占着的，补抓池永远不碰。雀魂一个账号只能开一个会话，两边抢会把实时采集踢下线，而那段时间正在打的对局没有第二次机会。"}
         </p>
 
-        <div className="flex flex-wrap gap-2">
+        <p className="text-xs leading-relaxed text-muted-foreground">
+          {"注册脚本产出的 accounts.jsonl（每行一个 email / password / nickname）可以直接选进来，一次加一批「批量补抓」的账号；重复的和用不了的会跳过，加完还得自己点保存。"}
+        </p>
+
+        <div className="flex flex-wrap items-center gap-2">
           <Button
             variant="outline"
             onClick={() =>
@@ -249,6 +314,24 @@ export function AccountPoolCard() {
             <Plus className="size-4" />
             加一个
           </Button>
+          <Input
+            type="file"
+            accept=".jsonl,.json,application/json,text/plain"
+            aria-label="导入注册脚本产出的 accounts.jsonl"
+            // A file input is as wide as its own button and filename together,
+            // which is most of a phone screen: it takes a row of its own there
+            // rather than squeezing 加一个 and 保存 out of shape.
+            className="w-full min-w-0 sm:w-auto"
+            disabled={busy}
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              // Cleared first, so picking the same file again is another change
+              // event — an import that was rejected has to be retryable after
+              // the file is fixed.
+              event.target.value = "";
+              if (file) void importJsonl(file);
+            }}
+          />
           <Button onClick={() => void save()} disabled={busy}>
             <Save className="size-4" />
             保存

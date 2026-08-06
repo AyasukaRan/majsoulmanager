@@ -309,6 +309,54 @@ test("the monitoring page holds no configuration and points at the settings page
   assert.match(shell, /href: "\/settings".+admin: true/);
 });
 
+/**
+ * The account pool is filled from the registrar's `accounts.jsonl`, fifty rows
+ * at a time, so the reading of that file is the one piece of the console worth
+ * asserting on behaviour rather than on source text. What it has to get right
+ * is the duplicate rule: the backend rejects the whole document when one
+ * account appears twice, case-insensitively, so an import that lets a
+ * re-registered address through loses the other forty-nine rows with it.
+ */
+test("reads the registrar's accounts.jsonl and drops what the pool already has", async () => {
+  const { parseAccountsJsonl } = await import("../lib/accounts-jsonl.mjs");
+  const report = parseAccountsJsonl(
+    [
+      String.raw`{"email":"a@example.com","password":"pw-a","nickname":"甲","account_id":null,"ts":1}`,
+      "",
+      String.raw`{"email":"A@Example.COM","password":"pw-again","nickname":"甲二"}`,
+      String.raw`{"email":"b@example.com","password":"pw-b","nickname":null}`,
+      String.raw`{"email":"c@example.com","password":"pw-c"}`,
+      String.raw`{"email":"d@example.com"}`,
+      String.raw`{"email":"e f@example.com","password":"pw-e"}`,
+      "这一行不是 JSON",
+    ].join("\n"),
+    // As the pool holds it — a different spelling of the same login.
+    ["C@example.com"],
+  );
+
+  assert.deepEqual(report.accounts, [
+    { username: "a@example.com", password: "pw-a", note: "甲" },
+    // A null nickname is a blank note, not the string "null".
+    { username: "b@example.com", password: "pw-b", note: "" },
+  ]);
+  // The repeat of a@ within the file, and c@ against the pool.
+  assert.equal(report.duplicates, 2);
+  // No password; a space in the login, which validate() refuses by name; and no
+  // JSON at all. The middle one is the point of checking it here: staged, it
+  // would take the other forty-nine rows down with it on save.
+  assert.equal(report.unusable, 3);
+
+  // Wired into the card, and onto the pool the re-fetch half draws from: an
+  // import filed as 实时采集 is an account the collector would fight over.
+  const source = await readFile(
+    new URL("../components/account-pool.tsx", import.meta.url),
+    "utf8",
+  );
+  assert.match(source, /parseAccountsJsonl/);
+  assert.match(source, /type="file"/);
+  assert.match(source, /purpose: "refetch" as const/);
+});
+
 test("contains shadcn configuration and no disposable starter", async () => {
   const [components, packageJson] = await Promise.all([
     readFile(new URL("../components.json", import.meta.url), "utf8"),
