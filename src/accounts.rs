@@ -336,6 +336,34 @@ impl AccountPool {
         nodes
     }
 
+    /// The account a submitted document would take away from a collector, if
+    /// there is one. `in_use` is lowercased, as `referenced_accounts` returns
+    /// it.
+    ///
+    /// Only an account this store actually holds can be taken away here. A
+    /// collector reached through `file:` or `env:` names one that was never in
+    /// the pool, and measuring the submission against those reads as "you just
+    /// deleted it" every single time — which is not a refusal to delete, it is
+    /// the page refusing to save at all.
+    pub fn taken_from_a_collector(
+        &self,
+        next: &AccountDocument,
+        in_use: &HashSet<String>,
+    ) -> Option<String> {
+        self.document
+            .read()
+            .accounts
+            .iter()
+            .find(|account| {
+                in_use.contains(&account.username.to_lowercase())
+                    && !next
+                        .accounts
+                        .iter()
+                        .any(|kept| kept.username.eq_ignore_ascii_case(&account.username))
+            })
+            .map(|account| account.username.clone())
+    }
+
     /// Every password held, for the log buffer to redact. Registered at start
     /// rather than at use, because a password can reach a log through a module's
     /// stderr or an error chain that never passed through this file.
@@ -505,6 +533,39 @@ mod tests {
                 .reserved(AccountPurpose::Watch)
                 .contains("resting@example.com"),
             "a disabled account is still spoken for"
+        );
+    }
+
+    /// A collector pointed at a `file:` or `env:` reference names an account
+    /// that is not in the pool and never was. Counting it as one this save
+    /// deleted made every save fail: nothing could be added, edited or
+    /// imported while any instance used a reference the pool does not own.
+    #[test]
+    fn only_an_account_the_pool_holds_can_be_taken_from_a_collector() {
+        let store = pool(vec![account("live@example.com", AccountPurpose::Watch)]);
+        // As `referenced_accounts` answers it: lowercased, and holding one
+        // account this store has never seen.
+        let in_use: HashSet<String> = ["live@example.com", "from-a-file@example.com"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+
+        // Adding a re-fetch account is a save like any other.
+        let mut grown = store.published();
+        grown
+            .accounts
+            .push(account("pool-a@example.com", AccountPurpose::Refetch));
+        assert_eq!(store.taken_from_a_collector(&grown, &in_use), None);
+
+        // Dropping the one the collector actually reads is still refused.
+        let emptied = AccountDocument {
+            revision: grown.revision,
+            accounts: Vec::new(),
+            updated_at: None,
+        };
+        assert_eq!(
+            store.taken_from_a_collector(&emptied, &in_use).as_deref(),
+            Some("live@example.com")
         );
     }
 
