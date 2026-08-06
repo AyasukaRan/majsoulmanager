@@ -362,16 +362,7 @@ async fn put_accounts(
             .into());
         }
     }
-    let removed: Vec<&String> = in_use
-        .iter()
-        .filter(|username| {
-            !document
-                .accounts
-                .iter()
-                .any(|account| account.username.to_lowercase() == ***username)
-        })
-        .collect();
-    if let Some(username) = removed.first() {
+    if let Some(username) = state.accounts.taken_from_a_collector(&document, &in_use) {
         return Err(WatchServiceError::InvalidConfig(format!(
             "有采集实例正指向账号 {username}，不能删除；先改那个实例的账号引用"
         ))
