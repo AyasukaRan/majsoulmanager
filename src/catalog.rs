@@ -154,6 +154,12 @@ pub struct RecordFilter {
     /// skip them a thousand at a time.
     #[serde(default)]
     pub missing_pb: bool,
+    /// The other half: only records that *do* carry one, which is what can be
+    /// re-converted without asking Mahjong Soul for anything. Same reasoning as
+    /// above — the walk would otherwise page through the 1.6M rows that have no
+    /// protobuf to find the 245k that do.
+    #[serde(default)]
+    pub stored_pb: bool,
 }
 
 impl RecordFilter {
@@ -627,6 +633,9 @@ impl Catalog {
         // unmerged part, and without FINAL the walk would keep finding it.
         if filter.missing_pb {
             sql.push_str(" AND pb_size = 0");
+        }
+        if filter.stored_pb {
+            sql.push_str(" AND pb_size > 0");
         }
         // Bounds go over the wire as epoch milliseconds: a bare
         // `{x:DateTime64(3)}` would be read in the server timezone, and the

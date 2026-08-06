@@ -1538,7 +1538,7 @@ fn register_proxy_secrets(logs: &WatchLogBuffer, proxy: &str) {
 }
 
 /// The game uuid and the mode header of a stored record.
-fn majsoul_header(raw: &[u8]) -> Option<(String, GameMetadata)> {
+pub(crate) fn majsoul_header(raw: &[u8]) -> Option<(String, GameMetadata)> {
     let events = mjai::events(raw).ok()?;
     let start = events
         .iter()
@@ -1580,7 +1580,7 @@ fn majsoul_header(raw: &[u8]) -> Option<(String, GameMetadata)> {
 /// a complete game with a truncated one would be a loss dressed up as a repair.
 /// Equal is allowed and expected: the fixed converter adds fields to events, not
 /// events.
-fn reconverted(
+pub(crate) fn reconverted(
     pb: &[u8],
     metadata: &GameMetadata,
     stored: &[u8],

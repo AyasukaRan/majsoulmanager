@@ -973,8 +973,10 @@ async fn search(
         played_to: query.played_to,
         // Built field by field rather than with struct update syntax, so a new
         // filter has to be added to `SearchQuery` before it can be asked for
-        // here. This one is for the re-fetch walk, not for the console.
+        // here. These two are for the re-fetch walk and the re-conversion pass,
+        // not for the console.
         missing_pb: false,
+        stored_pb: false,
     };
     let (items, next_cursor) = state
         .catalog

@@ -442,7 +442,25 @@ async fn scan_game_claims(state: &AppState) -> anyhow::Result<Progress> {
 /// `player_games` is written by the pack worker for everything it packs, which
 /// covers records arriving from now on and nothing else. This is the other
 /// 810,004.
-pub const PLAYER_STATS_NAME: &str = "player_game_stats";
+///
+/// **Versioned, and the version is the point.** The rows in `player_games` were
+/// computed by whatever `replay.rs` said at the time, so a fix to what it counts
+/// leaves 1.9M rows carrying the old answer with nothing to distinguish them.
+/// Bumping the suffix is how that fix reaches them: a name with no completion
+/// marker runs once and marks itself. `_v2` is the ura dora fix — the scan only
+/// looked at the concealed hand, so every ura that landed on the winning tile
+/// went uncounted, about one hit in twenty.
+pub const PLAYER_STATS_NAME: &str = "player_game_stats_v2";
+
+/// Names the pass that re-converts every record whose protobuf was kept.
+///
+/// Versioned for the same reason and by the same rule as the scoring pass, but
+/// answering a different question: those rows' *mjai* was produced by the old
+/// converter, and no amount of re-scoring can repair an event that was written
+/// as the wrong kind of kan. Only a re-conversion can, and only where the
+/// protobuf is still there to convert — 245k of the 1.9M. The rest is what the
+/// `missing_pb` re-fetch pool is for.
+pub const RECONVERT_NAME: &str = "reconvert_stored_pb_v1";
 
 /// Scores every already-indexed record into `player_games`.
 ///
@@ -616,6 +634,162 @@ fn report(state: &AppState, level: WatchLogLevel, message: String) {
         .watch_service
         .log_buffer()
         .append(level, LOG_SOURCE, message);
+}
+
+/// Re-converts every record whose Mahjong Soul protobuf was kept.
+///
+/// The one repair that needs nothing from Mahjong Soul. A decoder fix changes
+/// what the converter writes, and the records already in the corpus were
+/// written by the old one — every kan the wrong kind, every draw reporting
+/// nobody tenpai, every three-player game ranked on the four-player ladder.
+/// Where the protobuf is still there, all of that can be rebuilt from it here,
+/// off-line and free.
+///
+/// Where it is not — 1.6M of the 1.9M, the historical import and everything
+/// collected before the protobuf was kept — the only repair is to fetch the
+/// game again, which is what the `missing_pb` re-fetch work does. This pass
+/// deliberately does not touch those: it would have nothing to convert.
+///
+/// Safe beside live ingest and safe to interrupt. A record is replaced through
+/// the same `reindex_one` the re-fetch pool uses, so a half-finished run leaves
+/// a corpus that is partly repaired and wholly valid, and the next boot picks
+/// the rest up because the completion marker is only written at the end.
+pub async fn reconvert_stored_records(state: AppState) {
+    match already_done(&state, RECONVERT_NAME).await {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            report(
+                &state,
+                WatchLogLevel::Error,
+                format!("读不到重转回填的完成标记，本次启动不重转：{error}"),
+            );
+            return;
+        }
+    }
+
+    report(
+        &state,
+        WatchLogLevel::Info,
+        "开始用当前转换器重转所有存下了 PB 的记录".to_owned(),
+    );
+    match reconvert(&state).await {
+        Ok(progress) => {
+            report(
+                &state,
+                WatchLogLevel::Info,
+                format!(
+                    "重转完成：扫描 {} 条，替换 {} 条，读不到 {} 条，转不出来 {} 条",
+                    progress.scanned, progress.rewritten, progress.unreadable, progress.unparsable
+                ),
+            );
+            if let Err(error) = mark_done(&state, RECONVERT_NAME).await {
+                report(
+                    &state,
+                    WatchLogLevel::Error,
+                    format!("重转完成但写不下标记，下次启动会重跑：{error}"),
+                );
+            }
+        }
+        Err(error) => {
+            report(
+                &state,
+                WatchLogLevel::Error,
+                format!("重转失败，已替换的部分仍然有效，下次启动会重跑：{error}"),
+            );
+        }
+    }
+}
+
+async fn reconvert(state: &AppState) -> anyhow::Result<Progress> {
+    use futures_util::StreamExt;
+
+    let filter = RecordFilter {
+        stored_pb: true,
+        ..RecordFilter::default()
+    };
+    let mut progress = Progress::default();
+    let mut cursor = None;
+    let mut reported = 0usize;
+    loop {
+        let (page, next) = state.catalog.scan(&filter, cursor, PAGE_SIZE).await?;
+        let reads = futures_util::stream::iter(page.iter().cloned().enumerate())
+            .map(|(index, row)| async move {
+                // Both frames of the same pack: the protobuf to convert, and
+                // the mjai it produced last time. The second is not redundant —
+                // it carries the header the record was indexed with, and it is
+                // what the length guard compares against.
+                let mjai = state.packs.read(&row.storage).await;
+                let pb = match row.majsoul_pb.as_ref() {
+                    Some(location) => {
+                        state
+                            .packs
+                            .read(&location.in_pack(&row.storage.pack_key))
+                            .await
+                    }
+                    None => return (index, None),
+                };
+                (index, Some((mjai, pb)))
+            })
+            .buffer_unordered(READ_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+
+        for (index, read) in reads {
+            let row = &page[index];
+            // The filter said this row has a protobuf, so no entry means the
+            // row changed under the walk — a re-fetch replaced it — and the
+            // replacement is already current.
+            let Some((mjai, pb)) = read else { continue };
+            let (Ok(stored), Ok(pb)) = (mjai, pb) else {
+                tracing::warn!(record = %row.id, "跳过一条读不到字节的记录");
+                progress.unreadable += 1;
+                continue;
+            };
+            let Some((uuid, metadata)) = crate::refetch_service::majsoul_header(&stored) else {
+                progress.unparsable += 1;
+                continue;
+            };
+            // Off the runtime for the same reason the re-fetch pool does it: a
+            // conversion decodes a protobuf, walks every event, gzips the
+            // result and parses it back twice.
+            let (pb, converted) = tokio::task::spawn_blocking(move || {
+                let converted = crate::refetch_service::reconverted(&pb, &metadata, &stored, &uuid);
+                (pb, converted)
+            })
+            .await?;
+            let Some(fresh) = converted else {
+                progress.unparsable += 1;
+                continue;
+            };
+            // Behind the same ceiling live ingest answers 503 on. This pass has
+            // 245k records to rewrite and the collectors' records are the ones
+            // nobody can fetch twice, so it waits rather than competing.
+            while state.kafka.lag() >= state.kafka.max_lag() / 2 {
+                tracing::info!("打包队列积压，重转让出写入位置");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            crate::indexer::reindex_one(&state.kafka, row, fresh, Some(pb)).await?;
+            progress.rewritten += 1;
+        }
+        progress.scanned += page.len();
+        if progress.scanned - reported >= PROGRESS_EVERY {
+            reported = progress.scanned;
+            report(
+                state,
+                WatchLogLevel::Info,
+                format!(
+                    "重转中：已扫描 {} 条，替换 {} 条，读不到 {} 条，转不出来 {} 条",
+                    progress.scanned, progress.rewritten, progress.unreadable, progress.unparsable
+                ),
+            );
+        }
+        match next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    Ok(progress)
 }
 
 #[cfg(test)]
