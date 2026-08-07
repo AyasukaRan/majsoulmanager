@@ -1881,8 +1881,8 @@ pub(crate) fn reconverted(
             format!("解压失败：{error}"),
         ));
     }
-    let fresh = match mjai::events(&mjai) {
-        Ok(events) => events.len(),
+    let fresh_events = match mjai::events(&mjai) {
+        Ok(events) => events,
         Err(error) => {
             tracing::info!(%expected_uuid, %error, "补抓：重转结果解析不出事件");
             return Err(Rejected::new(
@@ -1891,8 +1891,8 @@ pub(crate) fn reconverted(
             ));
         }
     };
-    let before = match mjai::events(stored) {
-        Ok(events) => events.len(),
+    let before_events = match mjai::events(stored) {
+        Ok(events) => events,
         Err(error) => {
             tracing::info!(%expected_uuid, %error, "补抓：库里那条本身就解析不出事件");
             return Err(Rejected::new(
@@ -1901,14 +1901,48 @@ pub(crate) fn reconverted(
             ));
         }
     };
+    let (fresh, before) = (fresh_events.len(), before_events.len());
     if fresh < before {
         // Not a failure — the guard doing its job. Replacing here would lose
         // events the stored record still has.
         tracing::info!(%expected_uuid, fresh, before, "补抓：重转的事件数比库里那条还少，保留原样");
-        return Err(Rejected::new(
-            Unconvertible::NotBetter,
-            format!("重转 {fresh} 个事件，库里那条有 {before} 个"),
-        ));
+        // Where they first disagree, not just how many there are. A count says a
+        // record got shorter; this says which event went missing, which is the
+        // difference between the converter dropping something and the stored
+        // record having carried something it should not have.
+        let kind = |event: &serde_json::Value| {
+            event
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_owned()
+        };
+        let at = fresh_events
+            .iter()
+            .zip(&before_events)
+            .position(|(a, b)| a != b);
+        let detail = match at {
+            // Diverged mid-stream: the stored event at that index is the one the
+            // re-conversion did not produce there.
+            Some(i) => format!(
+                "重转 {fresh} 个事件，库里那条有 {before} 个；第 {i} 个起就不一样了，库里是 {}，重转是 {}",
+                kind(&before_events[i]),
+                fresh_events
+                    .get(i)
+                    .map(kind)
+                    .unwrap_or_else(|| "（没有）".into()),
+            ),
+            // Identical prefix, so the whole difference is at the tail.
+            None => format!(
+                "重转 {fresh} 个事件，库里那条有 {before} 个；前 {fresh} 个完全一致，库里末尾多出 {}",
+                before_events[fresh..]
+                    .iter()
+                    .map(kind)
+                    .collect::<Vec<_>>()
+                    .join("、"),
+            ),
+        };
+        return Err(Rejected::new(Unconvertible::NotBetter, detail));
     }
     Ok(mjai)
 }
