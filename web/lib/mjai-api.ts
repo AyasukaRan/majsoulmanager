@@ -293,6 +293,28 @@ export type RefetchProgress = {
   refused: number;
   unreadable: number;
   unconvertible: number;
+  /** `unconvertible` split by cause — one number cannot tell the guard working from the converter breaking. */
+  unconvertible_by: {
+    no_uuid: number;
+    convert_failed: number;
+    wrong_game: number;
+    not_better: number;
+  };
+};
+
+export type UnconvertibleReason =
+  | "no_uuid"
+  | "convert_failed"
+  | "wrong_game"
+  | "not_better";
+
+export type RefetchFailure = {
+  at: string;
+  /** Game uuid when known, record id when not. */
+  subject: string;
+  why: UnconvertibleReason;
+  label: string;
+  detail: string;
 };
 
 export type RefetchStatus = {
@@ -310,6 +332,10 @@ export type RefetchStatus = {
   /** Records with no protobuf when the run started; null before the first run. */
   backlog: number | null;
   progress: RefetchProgress;
+  /** Records per second over the last 30s. The counters say how much is done; this says whether anything is happening now. */
+  qps: number;
+  /** Most recent rejections, newest first. Bounded display buffer. */
+  failures: RefetchFailure[];
 };
 
 /**

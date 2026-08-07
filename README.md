@@ -122,8 +122,11 @@ make image-build
 
 GitHub Actions 分为 `CI` 与 `Release` 两个工作流：
 
-- `CI`：只在 PR 上运行，跑 `Checks`（Rust 与 Web 的格式化、Lint、测试）并
-  试构建镜像，不发布任何产物。这是唯一的门禁。
+- `CI`：只在 PR 上运行，跑 `Checks`（Rust 与 Web 的格式化、Lint、测试），
+  不发布任何产物。这是唯一的门禁。镜像只在 `Dockerfile`、`web/Dockerfile`、
+  `Cargo.lock` 或 `web/package-lock.json` 动过时才试构建——`Checks` 已经
+  编译过全部 Rust 代码、也跑过 `next build`，镜像构建独有的验证只剩
+  Dockerfile 本身。
 - `Release`：只在推送 `v*` 标签或手动触发时运行，直接发布镜像到 GHCR。
   它不再重跑 `Checks`——tag 只打在刚合并的 commit 上，那棵树在 PR 上刚被
   同一套检查验证过，重跑一遍是给每次发布白加三分多钟；手动重建旧 tag 时

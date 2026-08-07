@@ -300,6 +300,11 @@ pub struct RefetchProgress {
     /// record with no Majsoul header to name the game, or a re-conversion that
     /// came out shorter than what is already in the corpus.
     pub unconvertible: u64,
+    /// `unconvertible` split by cause. One number cannot distinguish "the guard
+    /// kept a better record" from "the converter is broken", and those call for
+    /// opposite reactions. Fixed fields rather than a map because this struct is
+    /// `Copy` — it is read as `*self.progress.read()`.
+    pub unconvertible_by: UnconvertibleCounts,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -326,6 +331,12 @@ pub struct RefetchRuntimeStatus {
     /// run, or when the count could not be read.
     pub backlog: Option<u64>,
     pub progress: RefetchProgress,
+    /// Records per second over the last 30 seconds. The counters say how much
+    /// has been done; this says whether anything is happening right now.
+    pub qps: f64,
+    /// The most recent rejections, newest first. Bounded — a display buffer,
+    /// not a record of what happened; the service log has that.
+    pub failures: Vec<RefetchFailure>,
 }
 
 impl Default for RefetchRuntimeStatus {
@@ -343,6 +354,8 @@ impl Default for RefetchRuntimeStatus {
             waiting: 0,
             backlog: None,
             progress: RefetchProgress::default(),
+            qps: 0.0,
+            failures: Vec::new(),
         }
     }
 }
@@ -368,6 +381,10 @@ pub struct RefetchSupervisor {
     config: RwLock<RefetchServiceConfig>,
     runtime: RwLock<RefetchRuntimeStatus>,
     progress: RwLock<RefetchProgress>,
+    /// Kept beside `progress` rather than in it: `RefetchProgress` is `Copy` and
+    /// these two are not.
+    rate: RwLock<RateWindow>,
+    failures: RwLock<std::collections::VecDeque<RefetchFailure>>,
     sessions: AtomicUsize,
     dependencies: RefetchDependencies,
     generation: AtomicU64,
@@ -410,6 +427,8 @@ impl RefetchSupervisor {
             config: RwLock::new(config),
             runtime: RwLock::new(RefetchRuntimeStatus::default()),
             progress: RwLock::new(RefetchProgress::default()),
+            rate: RwLock::new(RateWindow::default()),
+            failures: RwLock::new(std::collections::VecDeque::new()),
             sessions: AtomicUsize::new(0),
             dependencies,
             generation: AtomicU64::new(0),
@@ -438,6 +457,8 @@ impl RefetchSupervisor {
         status.sessions = self.sessions.load(Ordering::Relaxed);
         status.waiting = self.dependencies.broker.waiting();
         status.progress = *self.progress.read();
+        status.qps = self.rate.read().qps();
+        status.failures = self.failures.read().iter().rev().cloned().collect();
         status
     }
 
@@ -782,6 +803,22 @@ impl RefetchSupervisor {
             ),
             WatchProxyMode::Custom => config.custom_proxy_url.clone(),
         }
+    }
+
+    /// Bounded push onto the console's rejection list.
+    fn note_failure(&self, subject: impl Into<String>, rejected: &Rejected) {
+        const KEEP: usize = 200;
+        let mut failures = self.failures.write();
+        if failures.len() >= KEEP {
+            failures.pop_front();
+        }
+        failures.push_back(RefetchFailure {
+            at: Utc::now(),
+            subject: subject.into(),
+            why: rejected.why,
+            label: rejected.why.label(),
+            detail: rejected.detail.clone(),
+        });
     }
 
     fn report(&self, level: WatchLogLevel, message: String) {
@@ -1181,17 +1218,21 @@ impl RefetchSupervisor {
             // that goes up to a minute, is how a pool that is merely slow starts
             // reporting that nobody is serving it.
             let in_flight = self.runtime.read().workers.max(1);
-            let outcomes = futures_util::stream::iter(page)
+            // Counted as each record lands, not once the page has. Collecting the
+            // page first meant `PAGE_SIZE` fetches — minutes at a rate-limited
+            // pace — during which the console polled a progress card that still
+            // read zero, which is indistinguishable from a stalled walk.
+            let mut outcomes = futures_util::stream::iter(page)
                 .map(|row| self.one_record(row))
-                .buffer_unordered(in_flight)
-                .collect::<Vec<_>>()
-                .await;
-            {
-                let mut progress = self.progress.write();
-                for outcome in outcomes {
-                    scanned += 1;
+                .buffer_unordered(in_flight);
+            while let Some(outcome) = outcomes.next().await {
+                let outcome = outcome?;
+                scanned += 1;
+                self.rate.write().hit();
+                {
+                    let mut progress = self.progress.write();
                     progress.scanned += 1;
-                    match outcome? {
+                    match outcome {
                         Outcome::Replaced => {
                             replaced += 1;
                             progress.replaced += 1;
@@ -1201,27 +1242,34 @@ impl RefetchSupervisor {
                         // pass finds it again without anything being remembered.
                         Outcome::Refused | Outcome::Unserved => progress.refused += 1,
                         Outcome::Unreadable => progress.unreadable += 1,
-                        Outcome::Unconvertible => progress.unconvertible += 1,
+                        Outcome::Unconvertible(why) => {
+                            progress.unconvertible += 1;
+                            progress.unconvertible_by.bump(why);
+                        }
                         // The repair walk replaces a row it already found, so
                         // it never claims and never meets this.
                         Outcome::Duplicate => progress.duplicates += 1,
                     }
                 }
-            }
-            if scanned - reported >= PROGRESS_EVERY {
-                reported = scanned;
-                let progress = *self.progress.read();
-                self.report(
-                    WatchLogLevel::Info,
-                    format!(
-                        "补抓中：扫描 {} 条，替换 {} 条，雀魂拒绝 {} 条，读不到字节 {} 条，无法替换 {} 条",
-                        progress.scanned,
-                        progress.replaced,
-                        progress.refused,
-                        progress.unreadable,
-                        progress.unconvertible
-                    ),
-                );
+                if scanned - reported >= PROGRESS_EVERY {
+                    reported = scanned;
+                    let progress = *self.progress.read();
+                    self.report(
+                        WatchLogLevel::Info,
+                        format!(
+                            "补抓中：扫描 {} 条，替换 {} 条，雀魂拒绝 {} 条，读不到字节 {} 条，无法替换 {} 条{}",
+                            progress.scanned,
+                            progress.replaced,
+                            progress.refused,
+                            progress.unreadable,
+                            progress.unconvertible,
+                            match progress.unconvertible_by.summary() {
+                                s if s.is_empty() => String::new(),
+                                s => format!("（{s}）"),
+                            }
+                        ),
+                    );
+                }
             }
             match next {
                 Some(next) => cursor = Some(next),
@@ -1316,7 +1364,10 @@ impl RefetchSupervisor {
                             unserved += 1;
                             progress.refused += 1;
                         }
-                        Outcome::Unconvertible => progress.unconvertible += 1,
+                        Outcome::Unconvertible(why) => {
+                            progress.unconvertible += 1;
+                            progress.unconvertible_by.bump(why);
+                        }
                         // No stored bytes are read on this path.
                         Outcome::Unreadable => progress.unreadable += 1,
                     }
@@ -1397,7 +1448,12 @@ impl RefetchSupervisor {
         })
         .await?;
         let Some(mjai) = converted else {
-            return Ok(Outcome::Unconvertible);
+            // No stored record to compare against on this path, so the only way
+            // here is the converter refusing what Mahjong Soul returned.
+            let rejected =
+                Rejected::new(Unconvertible::ConvertFailed, "转换器读不了雀魂返回的这局");
+            self.note_failure(uuid.clone(), &rejected);
+            return Ok(Outcome::Unconvertible(rejected.why));
         };
 
         loop {
@@ -1455,7 +1511,12 @@ impl RefetchSupervisor {
         // the converter writes back into `start_game`. Both come from the record
         // being replaced, so the replacement carries the header the original did.
         let Some((uuid, metadata)) = majsoul_header(&raw) else {
-            return Ok(Outcome::Unconvertible);
+            // Also counted as 「无法替换」, but it never even reached Mahjong Soul:
+            // the stored bytes carry no `start_game.majsoul.uuid` to ask for.
+            tracing::info!(record = %row.id, "补抓：库里这条读不出 majsoul uuid，没法去抓");
+            let rejected = Rejected::new(Unconvertible::NoUuid, "start_game 里没有 majsoul.uuid");
+            self.note_failure(row.id.to_string(), &rejected);
+            return Ok(Outcome::Unconvertible(rejected.why));
         };
         let pb = match self.dependencies.broker.fetch(&uuid).await {
             Ok(pb) => pb,
@@ -1492,8 +1553,12 @@ impl RefetchSupervisor {
             (pb, converted)
         })
         .await?;
-        let Some(mjai) = converted else {
-            return Ok(Outcome::Unconvertible);
+        let mjai = match converted {
+            Ok(mjai) => mjai,
+            Err(rejected) => {
+                self.note_failure(uuid.clone(), &rejected);
+                return Ok(Outcome::Unconvertible(rejected.why));
+            }
         };
         // Behind the same backlog ceiling live ingest answers `503` on, because
         // this path does not go through `indexer::claim` and would otherwise be
@@ -1510,11 +1575,147 @@ impl RefetchSupervisor {
     }
 }
 
+/// Why a fetch that arrived intact still could not replace the stored row.
+/// They all add up to the console's 「无法替换」, but they mean different things:
+/// `NotBetter` is the guard working as intended, the other three are faults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Unconvertible {
+    /// The stored record carries no `start_game.majsoul.uuid`, so there was
+    /// nothing to ask Mahjong Soul for. Never even left the process.
+    NoUuid,
+    /// The converter could not read the protobuf Mahjong Soul returned.
+    ConvertFailed,
+    /// What came back was a different game than the uuid asked for.
+    WrongGame,
+    /// The re-conversion held fewer events than the record already in the
+    /// corpus. Not a failure — replacing here would lose data.
+    NotBetter,
+}
+
+/// A rejection with the detail that made it one, so the console can show the
+/// actual reason rather than only its category.
+pub struct Rejected {
+    pub why: Unconvertible,
+    pub detail: String,
+}
+
+impl Rejected {
+    fn new(why: Unconvertible, detail: impl Into<String>) -> Self {
+        Self {
+            why,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// One rejected record, kept for the console's list. Bounded — this is a
+/// display buffer, not a record of what happened; the log has that.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RefetchFailure {
+    pub at: DateTime<Utc>,
+    /// The game uuid when it is known, the record id when it is not.
+    pub subject: String,
+    pub why: Unconvertible,
+    pub label: &'static str,
+    pub detail: String,
+}
+
+/// Completion instants over a short window, for the console's live rate. A
+/// window rather than "since last poll", so two browsers watching do not each
+/// see a rate the other consumed.
+#[derive(Default)]
+struct RateWindow {
+    hits: std::collections::VecDeque<std::time::Instant>,
+}
+
+impl RateWindow {
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+    const CAP: usize = 4_096;
+
+    fn hit(&mut self) {
+        let now = std::time::Instant::now();
+        self.hits.push_back(now);
+        while self.hits.len() > Self::CAP
+            || self
+                .hits
+                .front()
+                .is_some_and(|at| now.duration_since(*at) > Self::WINDOW)
+        {
+            self.hits.pop_front();
+        }
+    }
+
+    /// Records per second over the window. Zero once the walk stops, because
+    /// everything in the deque ages out of it.
+    fn qps(&self) -> f64 {
+        let now = std::time::Instant::now();
+        let live = self
+            .hits
+            .iter()
+            .filter(|at| now.duration_since(**at) <= Self::WINDOW)
+            .count();
+        if live < 2 {
+            return 0.0;
+        }
+        // Against the window, not against first-to-last: the latter reads as a
+        // full rate when only two records landed in thirty seconds.
+        live as f64 / Self::WINDOW.as_secs_f64()
+    }
+}
+
+impl Unconvertible {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NoUuid => "库里读不出 uuid",
+            Self::ConvertFailed => "转换器读不了",
+            Self::WrongGame => "抓回来是另一局",
+            Self::NotBetter => "重转的还不如原来的",
+        }
+    }
+}
+
+/// The 「无法替换」 counter split by cause, in the order they can happen.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UnconvertibleCounts {
+    pub no_uuid: u64,
+    pub convert_failed: u64,
+    pub wrong_game: u64,
+    pub not_better: u64,
+}
+
+impl UnconvertibleCounts {
+    fn bump(&mut self, why: Unconvertible) {
+        let slot = match why {
+            Unconvertible::NoUuid => &mut self.no_uuid,
+            Unconvertible::ConvertFailed => &mut self.convert_failed,
+            Unconvertible::WrongGame => &mut self.wrong_game,
+            Unconvertible::NotBetter => &mut self.not_better,
+        };
+        *slot += 1;
+    }
+
+    /// Only the causes that actually happened, for the progress line.
+    fn summary(self) -> String {
+        [
+            (Unconvertible::NoUuid, self.no_uuid),
+            (Unconvertible::ConvertFailed, self.convert_failed),
+            (Unconvertible::WrongGame, self.wrong_game),
+            (Unconvertible::NotBetter, self.not_better),
+        ]
+        .into_iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(why, n)| format!("{} {n} 条", why.label()))
+        .collect::<Vec<_>>()
+        .join("，")
+    }
+}
+
 enum Outcome {
     Replaced,
     Refused,
     Unreadable,
-    Unconvertible,
+    Unconvertible(Unconvertible),
     /// A game fetched and then found already claimed. Only the 牌谱屋 walk can
     /// produce it, and only when a claim appeared after its page was compared.
     Duplicate,
@@ -1648,22 +1849,68 @@ pub(crate) fn reconverted(
     metadata: &GameMetadata,
     stored: &[u8],
     expected_uuid: &str,
-) -> Option<Vec<u8>> {
+) -> Result<Vec<u8>, Rejected> {
     use std::io::Read;
 
-    let (uuid, compressed) =
-        crate::majsoul::convert::convert_record_bytes(pb, Some(metadata)).ok()?;
+    // Every rejection carries its cause out: they all land in the console as one
+    // 「无法替换」 counter, and without the split there is no way to tell a
+    // converter that choked from a replacement that was simply not an improvement.
+    let (uuid, compressed) = match crate::majsoul::convert::convert_record_bytes(pb, Some(metadata))
+    {
+        Ok(converted) => converted,
+        Err(error) => {
+            tracing::info!(%expected_uuid, %error, "补抓：转换器读不了雀魂返回的这局");
+            return Err(Rejected::new(
+                Unconvertible::ConvertFailed,
+                error.to_string(),
+            ));
+        }
+    };
     if uuid != expected_uuid {
         tracing::error!(%uuid, %expected_uuid, "补抓拿回来的是另一局，拒绝替换");
-        return None;
+        return Err(Rejected::new(
+            Unconvertible::WrongGame,
+            format!("要的是 {expected_uuid}，回来的是 {uuid}"),
+        ));
     }
     let mut mjai = Vec::new();
-    flate2::read::GzDecoder::new(compressed.as_slice())
-        .read_to_end(&mut mjai)
-        .ok()?;
-    let fresh = mjai::events(&mjai).ok()?.len();
-    let before = mjai::events(stored).ok()?.len();
-    (fresh >= before).then_some(mjai)
+    if let Err(error) = flate2::read::GzDecoder::new(compressed.as_slice()).read_to_end(&mut mjai) {
+        tracing::info!(%expected_uuid, %error, "补抓：重转结果解压失败");
+        return Err(Rejected::new(
+            Unconvertible::ConvertFailed,
+            format!("解压失败：{error}"),
+        ));
+    }
+    let fresh = match mjai::events(&mjai) {
+        Ok(events) => events.len(),
+        Err(error) => {
+            tracing::info!(%expected_uuid, %error, "补抓：重转结果解析不出事件");
+            return Err(Rejected::new(
+                Unconvertible::ConvertFailed,
+                format!("重转结果解析不出事件：{error}"),
+            ));
+        }
+    };
+    let before = match mjai::events(stored) {
+        Ok(events) => events.len(),
+        Err(error) => {
+            tracing::info!(%expected_uuid, %error, "补抓：库里那条本身就解析不出事件");
+            return Err(Rejected::new(
+                Unconvertible::ConvertFailed,
+                format!("库里那条解析不出事件：{error}"),
+            ));
+        }
+    };
+    if fresh < before {
+        // Not a failure — the guard doing its job. Replacing here would lose
+        // events the stored record still has.
+        tracing::info!(%expected_uuid, fresh, before, "补抓：重转的事件数比库里那条还少，保留原样");
+        return Err(Rejected::new(
+            Unconvertible::NotBetter,
+            format!("重转 {fresh} 个事件，库里那条有 {before} 个"),
+        ));
+    }
+    Ok(mjai)
 }
 
 /// Where this service keeps its configuration, exposed for the test below and
