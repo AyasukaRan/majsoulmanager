@@ -298,7 +298,7 @@ export type RefetchProgress = {
     no_uuid: number;
     convert_failed: number;
     wrong_game: number;
-    not_better: number;
+    truncated: number;
   };
 };
 
@@ -306,7 +306,7 @@ export type UnconvertibleReason =
   | "no_uuid"
   | "convert_failed"
   | "wrong_game"
-  | "not_better";
+  | "truncated";
 
 export type RefetchFailure = {
   at: string;

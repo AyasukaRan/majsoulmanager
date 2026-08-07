@@ -28,7 +28,7 @@ import {
 } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
-import { cn, selectClass } from "@/lib/utils";
+import { selectClass } from "@/lib/utils";
 import { useBusyAction } from "@/components/watch/busy-action";
 
 const PHASE_LABELS: Record<RefetchStatus["phase"], string> = {
@@ -137,7 +137,7 @@ function RefetchStatusCard({
           ["库里读不出 uuid", by.no_uuid],
           ["转换器读不了", by.convert_failed],
           ["抓回来是另一局", by.wrong_game],
-          ["重转的还不如原来的", by.not_better],
+          ["重转的不完整", by.truncated],
         ] as const
       ).filter(([, n]) => n > 0);
 
@@ -245,14 +245,7 @@ function RefetchStatusCard({
                   <span className="shrink-0 text-muted-foreground">
                     {new Date(f.at).toLocaleTimeString("zh-CN", { hour12: false })}
                   </span>
-                  <span
-                    className={cn(
-                      "shrink-0",
-                      f.why === "not_better"
-                        ? "text-amber-700 dark:text-amber-300"
-                        : "text-red-700 dark:text-red-300",
-                    )}
-                  >
+                  <span className="shrink-0 text-red-700 dark:text-red-300">
                     {f.label}
                   </span>
                   <span className="shrink-0 text-muted-foreground">{f.subject}</span>

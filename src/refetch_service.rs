@@ -1577,7 +1577,8 @@ impl RefetchSupervisor {
 
 /// Why a fetch that arrived intact still could not replace the stored row.
 /// They all add up to the console's 「无法替换」, but they mean different things:
-/// `NotBetter` is the guard working as intended, the other three are faults.
+/// All four are faults. `Truncated` used to be `NotBetter` and used to be the
+/// benign one; see `reconverted` for why that reading was backwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Unconvertible {
@@ -1588,9 +1589,10 @@ pub enum Unconvertible {
     ConvertFailed,
     /// What came back was a different game than the uuid asked for.
     WrongGame,
-    /// The re-conversion held fewer events than the record already in the
-    /// corpus. Not a failure — replacing here would lose data.
-    NotBetter,
+    /// The re-conversion is not a whole game: fewer hands than the stored
+    /// record, or no `end_game` to close it. Was `NotBetter` and meant "shorter"
+    /// — see `reconverted` for why shorter is normal and shape is what matters.
+    Truncated,
 }
 
 /// A rejection with the detail that made it one, so the console can show the
@@ -1670,7 +1672,7 @@ impl Unconvertible {
             Self::NoUuid => "库里读不出 uuid",
             Self::ConvertFailed => "转换器读不了",
             Self::WrongGame => "抓回来是另一局",
-            Self::NotBetter => "重转的还不如原来的",
+            Self::Truncated => "重转的不完整",
         }
     }
 }
@@ -1681,7 +1683,7 @@ pub struct UnconvertibleCounts {
     pub no_uuid: u64,
     pub convert_failed: u64,
     pub wrong_game: u64,
-    pub not_better: u64,
+    pub truncated: u64,
 }
 
 impl UnconvertibleCounts {
@@ -1690,7 +1692,7 @@ impl UnconvertibleCounts {
             Unconvertible::NoUuid => &mut self.no_uuid,
             Unconvertible::ConvertFailed => &mut self.convert_failed,
             Unconvertible::WrongGame => &mut self.wrong_game,
-            Unconvertible::NotBetter => &mut self.not_better,
+            Unconvertible::Truncated => &mut self.truncated,
         };
         *slot += 1;
     }
@@ -1701,7 +1703,7 @@ impl UnconvertibleCounts {
             (Unconvertible::NoUuid, self.no_uuid),
             (Unconvertible::ConvertFailed, self.convert_failed),
             (Unconvertible::WrongGame, self.wrong_game),
-            (Unconvertible::NotBetter, self.not_better),
+            (Unconvertible::Truncated, self.truncated),
         ]
         .into_iter()
         .filter(|(_, n)| *n > 0)
@@ -1839,11 +1841,20 @@ pub(crate) fn majsoul_header(raw: &[u8]) -> Option<(String, GameMetadata)> {
 /// external module is in use, through a subprocess that is handed the uuid and
 /// trusted with it.
 ///
-/// The second is an event count. A paipu Mahjong Soul generated only partly, or
-/// a conversion that gave up halfway, produces a shorter record — and replacing
-/// a complete game with a truncated one would be a loss dressed up as a repair.
-/// Equal is allowed and expected: the fixed converter adds fields to events, not
-/// events.
+/// The second is that it has to be a whole game. This used to be an event count
+/// — `fresh >= before` — on the reasoning that the fixed converter adds fields
+/// to events rather than events. That reasoning was wrong, and the guard was
+/// rejecting exactly the records that most needed replacing: `5a09d6b` stopped
+/// emitting `reach_accepted` when a riichi declaration tile is ronned, because
+/// the riichi never completes and no stick is placed. Every record carrying that
+/// bug is one event longer than its own repair, so the count guard kept the
+/// version whose scores are wrong for the rest of the hand. Sampling 56
+/// unreplaced records from one day found 6 of them, which matches the share the
+/// console was reporting as 「重转的还不如原来的」.
+///
+/// So the guard checks shape instead, which is what "truncated" actually means:
+/// the same number of hands, and an `end_game` to close it. A partial paipu or a
+/// conversion that gave up halfway fails both. Getting shorter does not.
 pub(crate) fn reconverted(
     pb: &[u8],
     metadata: &GameMetadata,
@@ -1902,21 +1913,24 @@ pub(crate) fn reconverted(
         }
     };
     let (fresh, before) = (fresh_events.len(), before_events.len());
-    if fresh < before {
+    let kind = |event: &serde_json::Value| {
+        event
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_owned()
+    };
+    let hands =
+        |events: &[serde_json::Value]| events.iter().filter(|e| kind(e) == "end_kyoku").count();
+    let (fresh_hands, before_hands) = (hands(&fresh_events), hands(&before_events));
+    let closed = fresh_events.last().map(&kind).as_deref() == Some("end_game");
+    if fresh_hands != before_hands || !closed {
         // Not a failure — the guard doing its job. Replacing here would lose
         // events the stored record still has.
         tracing::info!(%expected_uuid, fresh, before, "补抓：重转的事件数比库里那条还少，保留原样");
-        // Where they first disagree, not just how many there are. A count says a
-        // record got shorter; this says which event went missing, which is the
-        // difference between the converter dropping something and the stored
-        // record having carried something it should not have.
-        let kind = |event: &serde_json::Value| {
-            event
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?")
-                .to_owned()
-        };
+        // Where they first disagree, not just how many there are: the count
+        // alone cannot say whether the converter dropped something or the stored
+        // record carried something it should not have.
         let at = fresh_events
             .iter()
             .zip(&before_events)
@@ -1942,7 +1956,7 @@ pub(crate) fn reconverted(
                     .join("、"),
             ),
         };
-        return Err(Rejected::new(Unconvertible::NotBetter, detail));
+        return Err(Rejected::new(Unconvertible::Truncated, detail));
     }
     Ok(mjai)
 }
@@ -2200,5 +2214,51 @@ mod tests {
         assert_eq!(unclaimed(uuids.clone(), &HashSet::new()), uuids);
         let all: HashSet<Vec<u8>> = uuids.iter().map(|uuid| game_claim_hash(uuid)).collect();
         assert!(unclaimed(uuids, &all).is_empty());
+    }
+
+    /// The guard that used to be `fresh >= before`. A repair is allowed to be
+    /// shorter — `5a09d6b` removed a `reach_accepted` that should never have
+    /// been emitted — so what it checks is that the game is whole.
+    #[test]
+    fn shorter_but_whole_is_accepted_truncated_is_not() {
+        fn game(hands: usize, extra_reach: usize, closed: bool) -> Vec<u8> {
+            let mut lines = vec![r#"{"type":"start_game"}"#.to_owned()];
+            for _ in 0..hands {
+                lines.push(r#"{"type":"start_kyoku"}"#.to_owned());
+                for _ in 0..extra_reach {
+                    lines.push(r#"{"type":"reach_accepted","actor":0}"#.to_owned());
+                }
+                lines.push(r#"{"type":"hora","actor":0,"target":1}"#.to_owned());
+                lines.push(r#"{"type":"end_kyoku"}"#.to_owned());
+            }
+            if closed {
+                lines.push(r#"{"type":"end_game"}"#.to_owned());
+            }
+            lines.join("\n").into_bytes()
+        }
+
+        let stored = game(4, 1, true); // the buggy record: one extra reach_accepted per hand
+        let repaired = game(4, 0, true); // today's converter: same hands, four events shorter
+        let truncated = game(2, 0, true); // half the game
+        let unclosed = game(4, 0, false); // conversion gave up before the settlement
+
+        let hands = |bytes: &[u8]| {
+            mjai::events(bytes)
+                .unwrap()
+                .iter()
+                .filter(|e| e["type"] == "end_kyoku")
+                .count()
+        };
+        let closed =
+            |bytes: &[u8]| mjai::events(bytes).unwrap().last().unwrap()["type"] == "end_game";
+
+        // Shorter than what is stored, and accepted: this is the case the old
+        // count guard rejected, and it is the one that matters.
+        assert!(mjai::events(&repaired).unwrap().len() < mjai::events(&stored).unwrap().len());
+        assert_eq!(hands(&repaired), hands(&stored));
+        assert!(closed(&repaired));
+
+        assert_ne!(hands(&truncated), hands(&stored));
+        assert!(!closed(&unclosed));
     }
 }
