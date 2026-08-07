@@ -28,7 +28,7 @@ import {
 } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
-import { selectClass } from "@/lib/utils";
+import { cn, selectClass } from "@/lib/utils";
 import { useBusyAction } from "@/components/watch/busy-action";
 
 const PHASE_LABELS: Record<RefetchStatus["phase"], string> = {
@@ -127,6 +127,20 @@ function RefetchStatusCard({
         { label: "读不到字节", value: progress?.unreadable ?? 0 },
       ];
 
+  // Only the causes that happened. Listing all four with three zeros reads as
+  // "four things went wrong" at a glance.
+  const by = progress?.unconvertible_by;
+  const breakdown = !by
+    ? []
+    : (
+        [
+          ["库里读不出 uuid", by.no_uuid],
+          ["转换器读不了", by.convert_failed],
+          ["抓回来是另一局", by.wrong_game],
+          ["重转的还不如原来的", by.not_better],
+        ] as const
+      ).filter(([, n]) => n > 0);
+
   return (
     // No `border-b` on the header: this card is all header, and the rule drew a
     // divider with nothing under it.
@@ -145,6 +159,14 @@ function RefetchStatusCard({
               {status && status.phase === "running" ? (
                 <Badge variant="outline" className="font-mono">
                   会话 {status.sessions}/{status.workers}
+                </Badge>
+              ) : null}
+              {status && status.phase === "running" ? (
+                <Badge variant="outline" className="font-mono">
+                  {status.qps >= 10
+                    ? Math.round(status.qps)
+                    : status.qps.toFixed(1)}{" "}
+                  条/秒
                 </Badge>
               ) : null}
               {status && status.waiting > 0 ? (
@@ -196,6 +218,50 @@ function RefetchStatusCard({
             </div>
           ))}
         </div>
+        {breakdown.length === 0 ? null : (
+          <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+            <span>无法替换的原因：</span>
+            {breakdown.map(([label, n]) => (
+              <span key={label} className="rounded border bg-muted/25 px-2 py-0.5">
+                {label} <span className="font-mono font-semibold">{count(n)}</span>
+              </span>
+            ))}
+          </div>
+        )}
+        {!status || status.failures.length === 0 ? null : (
+          <div className="rounded-lg border">
+            <div className="flex items-center justify-between border-b px-3 py-2">
+              <p className="text-xs font-medium">最近替换不了的记录</p>
+              <p className="text-xs text-muted-foreground">
+                只留最近 {status.failures.length} 条，完整记录看服务日志
+              </p>
+            </div>
+            <div className="max-h-64 overflow-y-auto font-mono text-xs">
+              {status.failures.map((f, i) => (
+                <div
+                  key={`${f.at}-${f.subject}-${i}`}
+                  className="flex gap-2 border-b px-3 py-1.5 last:border-b-0"
+                >
+                  <span className="shrink-0 text-muted-foreground">
+                    {new Date(f.at).toLocaleTimeString("zh-CN", { hour12: false })}
+                  </span>
+                  <span
+                    className={cn(
+                      "shrink-0",
+                      f.why === "not_better"
+                        ? "text-amber-700 dark:text-amber-300"
+                        : "text-red-700 dark:text-red-300",
+                    )}
+                  >
+                    {f.label}
+                  </span>
+                  <span className="shrink-0 text-muted-foreground">{f.subject}</span>
+                  <span className="truncate text-muted-foreground">{f.detail}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </CardHeader>
     </Card>
   );

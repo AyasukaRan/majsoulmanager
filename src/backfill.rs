@@ -758,7 +758,9 @@ async fn reconvert(state: &AppState) -> anyhow::Result<Progress> {
                 (pb, converted)
             })
             .await?;
-            let Some(fresh) = converted else {
+            // This walk keeps one 转不出来 counter; the cause is in the log line
+            // `reconverted` already wrote.
+            let Ok(fresh) = converted else {
                 progress.unparsable += 1;
                 continue;
             };
