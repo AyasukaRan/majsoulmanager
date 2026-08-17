@@ -15,11 +15,11 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
+    accounts::AccountState,
     catalog::Catalog,
     indexer,
     kafka::Kafka,
     majsoul::{
-        BROWSER_USER_AGENT,
         convert::{GameMetadata, convert_record_bytes},
         gateway::{discover_gateway, discover_package_version},
         modes::{mode_metadata, room_modes, uuid_year},
@@ -28,6 +28,7 @@ use crate::{
             FETCH_GAME_LIVE_LIST_METHOD, FETCH_GAME_RECORD_METHOD, MajsoulRpc, ServerError,
             build_fetch_game_live_list_request, build_fetch_game_record_request,
             ensure_success_response,
+            requests::{browser_headers, persona, user_agent},
         },
     },
     mihomo::MihomoManager,
@@ -209,6 +210,9 @@ pub(crate) async fn run(
         .await
         {
             Ok((mut transport, client_version)) => {
+                dependencies
+                    .accounts
+                    .record_login(&username, AccountState::Ok, "");
                 info!(
                     account = %username,
                     ?modes,
@@ -241,12 +245,33 @@ pub(crate) async fn run(
             }
             Err(error) => {
                 let detail = format!("{error:#}");
+                let state = login_verdict(&error);
+                dependencies
+                    .accounts
+                    .record_login(&username, state, detail.clone());
                 warn!(error = %detail, "watch login failed");
                 dependencies.logs.append(
                     WatchLogLevel::Error,
                     &source,
                     format!("登录失败: {detail}"),
                 );
+                // Unlike the re-fetch pool, a banned collector account is not a
+                // reason to stop: a collector is bound to one account by
+                // configuration and giving up would silently end live collection,
+                // which is the one thing here that cannot be done again. It keeps
+                // retrying and says why on the account list instead, where an
+                // operator can see it and re-point the instance.
+                if state.is_terminal() {
+                    dependencies.logs.append(
+                        WatchLogLevel::Error,
+                        &source,
+                        format!(
+                            "账号 {} 已被雀魂封禁，这个采集实例不会再登录成功；\
+                             给它换一个账号，在此之前它一直在空转",
+                            masked_account(&username)
+                        ),
+                    );
+                }
                 if let Some(refreshed) = refreshed_client_version(
                     &config.server,
                     &username,
@@ -306,6 +331,35 @@ pub(crate) fn ends_the_session(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<ServerError>()
         .is_none_or(|server| server.is_session_stale())
+}
+
+/// What Mahjong Soul answers a login with when the account is banned. Its text
+/// name is `account is banned`, and unlike every other refusal it never clears.
+const BANNED_CODE: u64 = 503;
+
+/// What a failed login says about the account.
+///
+/// Stated once here, beside [`ends_the_session`], because both halves log in and
+/// a second copy of this rule would be a second answer to the same question.
+///
+/// The distinction that matters is between an answer and a silence. A
+/// `ServerError` means Mahjong Soul heard the login and refused it; anything
+/// else means the gateway, the network or the proxy, and says nothing about the
+/// account at all.
+///
+/// Among the answers only `503` is read. It is tempting to decide that some
+/// other code means "wrong password" and retire the account — but the codes that
+/// actually turn up on a login include `1005 ERR_ACC_ALREADY_LOGIN`, which means
+/// the account is *fine* and logged in somewhere else, and `151
+/// ERR_CLIENT_VERSION`, which is this client's own fault. Acting on either would
+/// throw away a working credential over a transient. The code travels in the
+/// health entry's `detail` for a human to read instead.
+pub(crate) fn login_verdict(error: &anyhow::Error) -> AccountState {
+    match error.downcast_ref::<ServerError>() {
+        Some(server) if server.code == BANNED_CODE => AccountState::Banned,
+        Some(_) => AccountState::Refused,
+        None => AccountState::Unreachable,
+    }
 }
 
 /// Renders a proxy URL as `scheme://host[:port]`, never exposing credentials.
@@ -733,13 +787,37 @@ pub(crate) async fn connect(
             client_version,
         ));
     }
-    let mut builder = reqwest::Client::builder().user_agent(BROWSER_USER_AGENT);
+    // The same machine that is about to log in, and the same headers a browser
+    // sends when the game page calls this API.
+    //
+    // Discovery and the login go to the same hosts within a second of each
+    // other, and the login frame carries its own user agent in `device.f12`. A
+    // fleet-wide constant here meant every session announced Chrome/150 over
+    // HTTP and whatever its persona said over the socket — two versions of one
+    // browser, a contradiction no real client can produce.
+    //
+    // Captured: every one of the fifty API requests in five captures carries
+    // `origin`, `referer` and the three client hints. This sent a user agent and
+    // nothing else — a request claiming to be Chrome while missing everything
+    // Chrome attaches, which is a cheaper thing to spot than the user agent is
+    // to fake.
+    let machine = persona(username);
+    let chrome = machine.chrome;
+    let mut builder = reqwest::Client::builder()
+        .user_agent(user_agent(chrome))
+        .default_headers(browser_headers(chrome));
     if let Some(proxy) = proxy {
         builder = builder.proxy(reqwest::Proxy::all(proxy)?);
     }
     let http = builder.build()?;
+    // Discovery asks for the routes the way the client does, and that URL
+    // carries the *package* version — so it has to be known before the gateway
+    // is, not after.
+    let package_version = discover_package_version(&http, server, cache_dir)
+        .await
+        .unwrap_or_else(|_| CN_PACKAGE_VERSION.to_string());
     let (endpoint, _resource_version, route_id) =
-        discover_gateway(&http, server, cache_dir).await?;
+        discover_gateway(&http, server, cache_dir, &package_version).await?;
     logs.append(
         WatchLogLevel::Info,
         source,
@@ -747,30 +825,49 @@ pub(crate) async fn connect(
     );
     // Login sends client_version_string = WebGL_2022-<code_version>; the code
     // version differs from the resource version and is pinned, overridable per
-    // instance — which is also how a discovered floor is applied. The package
-    // (Unity build) is discovered from index.html, falling back to the pinned
-    // default.
+    // instance — which is also how a discovered floor is applied.
     let code_version = client_version.unwrap_or(CN_CODE_VERSION).to_owned();
-    let package_version = discover_package_version(&http, server, cache_dir)
-        .await
-        .unwrap_or_else(|_| CN_PACKAGE_VERSION.to_string());
     logs.append(
         WatchLogLevel::Info,
         source,
         format!("客户端版本 WebGL_2022-{code_version} (package {package_version})"),
     );
-    let rpc = MajsoulRpc::connect_with_proxy(&endpoint, proxy).await?;
+    let rpc = MajsoulRpc::connect_with_proxy(&endpoint, proxy, chrome).await?;
     logs.append(WatchLogLevel::Info, source, "WebSocket 已连接");
-    rpc.login_native_exact(
-        username,
-        password,
-        &code_version,
-        &package_version,
-        server,
-        &route_id,
-    )
-    .await?;
+    let login_started = std::time::Instant::now();
+    let account_id = rpc
+        .login_native_exact(
+            username,
+            password,
+            &code_version,
+            &package_version,
+            server,
+            &route_id,
+        )
+        .await?;
     logs.append(WatchLogLevel::Info, source, "登录成功");
+    // The four log lines a real client uploads after every login. Sending none
+    // of them made "logged in and never reported" a single join for whoever
+    // runs the log store — see `majsoul::telemetry`.
+    //
+    // After the log line above and never in front of it: this is best-effort,
+    // and a session is up whether or not it goes out.
+    if account_id != 0 {
+        crate::majsoul::telemetry::report_login(
+            &http,
+            crate::majsoul::telemetry::LoginReport {
+                persona: machine,
+                device_id: &crate::majsoul::device_id(username),
+                account_id,
+                res_version: &code_version,
+                package_version: &package_version,
+                gateway_host: &endpoint_host(&endpoint),
+                login_seconds: login_started.elapsed().as_secs_f64(),
+                load_millis: login_started.elapsed().as_millis() as u64,
+            },
+        )
+        .await;
+    }
     Ok((
         LoginTransport::Builtin(rpc),
         format!("WebGL_2022-{code_version}"),

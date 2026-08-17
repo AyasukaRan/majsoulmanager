@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     io::{Read, Seek, Write},
     path::Path,
     str::FromStr,
@@ -31,7 +32,7 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
-    accounts::{AccountDocument, AccountPurpose},
+    accounts::{AccountDocument, AccountHealth, AccountPurpose},
     auth::{
         AuthError, AuthSettings, CreateUserRequest, LoginRequest, LoginResponse, RegisterRequest,
         RegistrationStatus, UpdateUserRequest, UserView, VerifyEmailRequest,
@@ -86,6 +87,11 @@ pub fn router(state: AppState) -> Router {
         // console's log panel, which every member can read, never shows one in
         // full. Serving the whole list to the same members would undo that.
         .route("/api/v1/accounts", get(get_accounts).put(put_accounts))
+        // Beside the account list and behind the same door, because it names the
+        // same accounts. It carries no password and no proxy — only what the
+        // last login with each one did — but an account name is itself the thing
+        // the route above is restricted for.
+        .route("/api/v1/accounts/health", get(get_account_health))
         .route("/api/v1/refetch/config", put(put_refetch_config))
         .route("/api/v1/refetch/actions", post(post_refetch_action))
         // Loading the catalogue changes what the pool will go and fetch, so it
@@ -336,6 +342,19 @@ async fn post_watch_action(
 
 async fn get_accounts(State(state): State<AppState>) -> Json<AccountDocument> {
     Json(state.accounts.published())
+}
+
+/// What the last login with each account did.
+///
+/// A separate route rather than a field on the document, because the document is
+/// what the console edits and hands back: folding a runtime verdict into it
+/// would mean the console submitting a claim about a login it did not make, and
+/// the `PUT` would have to learn to ignore it. This is read-only by
+/// construction.
+async fn get_account_health(
+    State(state): State<AppState>,
+) -> Json<BTreeMap<String, AccountHealth>> {
+    Json(state.accounts.health())
 }
 
 async fn put_accounts(
