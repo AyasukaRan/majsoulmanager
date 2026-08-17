@@ -69,6 +69,11 @@ const USER_AGENT: &str =
 
 const LOG_SOURCE: &str = "paipuya";
 
+/// How many catalogued games between two progress lines. One page is at most
+/// 500, so this is a line every twenty pages or so — often enough to see the
+/// sweep moving, rare enough not to drown the log a human reads for warnings.
+const PROGRESS_EVERY: u64 = 10_000;
+
 /// Ceilings on the two knobs an operator sets.
 const MAX_CONCURRENCY: usize = 8;
 const MIN_REQUEST_INTERVAL_MS: u64 = 200;
@@ -614,13 +619,41 @@ impl PaipuyaSupervisor {
                 .catalog
                 .set_paipuya_cursor(mode, from, count)
                 .await?;
-            {
+            let total = {
                 let mut progress = self.progress.write();
                 progress.synced += count;
                 progress.without_uuid += without_uuid;
                 progress.cursors.insert(mode, from);
+                progress.synced
+            };
+            // Said out loud every so often, because the alternative is what this
+            // had before: one line when the sweep starts and then silence until
+            // it finishes or fails. A sweep of the whole catalogue runs for days,
+            // and an operator watching the log had no way to tell a working sync
+            // from a wedged one.
+            //
+            // Counted against the running total rather than per mode, so the
+            // interval is a property of the sweep and not of how many modes
+            // happen to be in flight.
+            if total / PROGRESS_EVERY > (total - count) / PROGRESS_EVERY {
+                self.report(
+                    WatchLogLevel::Info,
+                    format!(
+                        "牌谱屋同步中：已收录 {total} 局（模式 {mode} 走到 {}，本页 {count} 局）",
+                        from.format("%Y-%m-%d %H:%M:%S")
+                    ),
+                );
             }
             if !full {
+                // Caught up. Worth one line: with twelve modes in the queue this
+                // is the only signal that a mode is done rather than stuck.
+                self.report(
+                    WatchLogLevel::Info,
+                    format!(
+                        "模式 {mode} 已追平牌谱屋（走到 {}）",
+                        from.format("%Y-%m-%d %H:%M:%S")
+                    ),
+                );
                 return Ok(());
             }
         }
