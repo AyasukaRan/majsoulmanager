@@ -52,6 +52,24 @@ zstd = "0.13"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 
+# Line tables instead of full DWARF. What a panic here has ever needed is the
+# file and line it came from, and that is exactly what this keeps; what it drops
+# is the variable-level information a debugger would show, which nothing in this
+# repository's workflow reads — there is no lldb step, the loop is a test and a
+# backtrace.
+#
+# Measured, both from `cargo clean` through `cargo test --all-targets --no-run`:
+# 1.7G and 48.7s wall (200.9s CPU) with full debug, 1.2G and 30.6s (126.5s)
+# with this. The time is the bigger half of it — a third off every cold build
+# and off CI, for debug sections nothing here opens.
+#
+# It is not what made `target` reach 14G, and the note is worth leaving: that
+# was accumulation, not one build. Cargo never reclaims an old artifact, so
+# `deps/` held ten hashed copies of this crate across 107,754 files. Only
+# `cargo clean` answers that; this makes each copy smaller.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
