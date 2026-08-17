@@ -1,0 +1,9 @@
+{
+  "protocol_version": 1,
+  "kind": "login",
+  "name": "curl-chrome",
+  "version": "1.0.0",
+  "executable": "module.py",
+  "args": [],
+  "sha256": "3b2b1c41eb05434c01db92d34865631c8b21a7b2d6ee98af8b6bffba5740c797"
+}
