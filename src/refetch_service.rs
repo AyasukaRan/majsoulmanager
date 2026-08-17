@@ -33,12 +33,13 @@ use serde::{Deserialize, Serialize};
 use tokio::{sync::Mutex, task::JoinHandle};
 
 use crate::{
+    accounts::AccountState,
     catalog::{Catalog, Record, RecordFilter},
     indexer::{self, game_claim_hash},
     kafka::Kafka,
     majsoul::convert::GameMetadata,
     managed_watch::{
-        LoginTransport, connect, ends_the_session, fetch_game_record, load_accounts,
+        LoginTransport, connect, ends_the_session, fetch_game_record, load_accounts, login_verdict,
         masked_account, proxy_display, refreshed_client_version,
     },
     mihomo::MihomoManager,
@@ -914,6 +915,9 @@ impl RefetchSupervisor {
             .await
             {
                 Ok((transport, negotiated)) => {
+                    self.dependencies
+                        .accounts
+                        .record_login(&username, AccountState::Ok, "");
                     self.sessions.fetch_add(1, Ordering::Relaxed);
                     let outcome = self
                         .serve(
@@ -936,11 +940,33 @@ impl RefetchSupervisor {
                 }
                 Err(error) => {
                     let detail = format!("{error:#}");
+                    let state = login_verdict(&error);
+                    self.dependencies
+                        .accounts
+                        .record_login(&username, state, detail.clone());
                     self.dependencies.logs.append(
                         WatchLogLevel::Error,
                         &source,
                         format!("登录失败：{detail}"),
                     );
+                    // A banned account is the one failure that reconnecting
+                    // cannot mend. What this did before was sleep and try again,
+                    // for ever — which costs a session slot the pool counted as
+                    // available and never gets a record back. The slot is worth
+                    // more free: `workers` already reports fewer sessions than
+                    // configured, and now the account list says which one and
+                    // why.
+                    if state.is_terminal() {
+                        self.report(
+                            WatchLogLevel::Error,
+                            format!(
+                                "账号 {} 已被雀魂封禁，补抓会话 {index} 退出，不再重连；\
+                                 换一个账号再启动补抓池",
+                                masked_account(&username)
+                            ),
+                        );
+                        return;
+                    }
                     if let Some(refreshed) = refreshed_client_version(
                         &config.server,
                         &username,

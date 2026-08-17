@@ -959,6 +959,25 @@ impl PluginWorker {
         Ok(())
     }
 
+    /// How long a module gets to answer, by what it was asked.
+    ///
+    /// This was five seconds for everything, which is right for a health check
+    /// and impossible for a login: `open_session` has to reach the gateway, do
+    /// the route handshake, authenticate and settle into the lobby the way a
+    /// client does. No external login module could ever have worked — the call
+    /// would have been abandoned before the socket finished opening, and the
+    /// error said "health check timed out" whatever had actually been asked.
+    fn deadline(method: &str) -> Duration {
+        match method {
+            // A whole login, including the lobby the client draws afterwards.
+            "open_session" => Duration::from_secs(120),
+            // One RPC. Game records are large and the far side is rate limited.
+            "rpc" => Duration::from_secs(60),
+            // Health checks and teardown answer immediately or not at all.
+            _ => Duration::from_secs(5),
+        }
+    }
+
     pub(crate) async fn request(
         &self,
         method: &str,
@@ -979,13 +998,17 @@ impl PluginWorker {
 
         let mut line = String::new();
         let read = async { self.output.lock().await.read_line(&mut line).await };
-        let bytes = tokio::time::timeout(Duration::from_secs(5), read)
-            .await
-            .map_err(|_| WatchServiceError::ModuleHealth("health check timed out".into()))??;
+        let deadline = Self::deadline(method);
+        let bytes = tokio::time::timeout(deadline, read).await.map_err(|_| {
+            WatchServiceError::ModuleHealth(format!(
+                "模块的 {method} 在 {} 秒内没有回应",
+                deadline.as_secs()
+            ))
+        })??;
         if bytes == 0 {
-            return Err(WatchServiceError::ModuleHealth(
-                "module exited during health check".into(),
-            ));
+            return Err(WatchServiceError::ModuleHealth(format!(
+                "模块在处理 {method} 时退出了"
+            )));
         }
         let response: serde_json::Value = serde_json::from_str(&line)?;
         if response.get("id").and_then(|value| value.as_u64()) != Some(id) {

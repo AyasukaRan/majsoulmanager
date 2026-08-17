@@ -8,6 +8,8 @@ import {
   ApiRequestError,
   jsonRequest,
   type AccountDocument,
+  type AccountHealth,
+  type AccountHealthMap,
   type MihomoStatus,
   type StoredAccount,
 } from "@/lib/mjai-api";
@@ -40,6 +42,54 @@ const PURPOSES: Array<{ value: StoredAccount["purpose"]; label: string }> = [
  * directly.
  */
 const FOLLOW = "__follow__";
+
+/**
+ * How each verdict reads, and how loudly.
+ *
+ * Only 已封禁 is destructive, and only it is red. A refusal is amber because it
+ * usually is not the account's fault — it is most often 1005 ERR_ACC_ALREADY_LOGIN,
+ * which clears by itself — and painting it red would send an operator to replace
+ * a perfectly good credential. 未登录过 is deliberately not green: a console that
+ * showed a fresh deployment as all-healthy would be reporting a check it never ran.
+ */
+const STATES: Record<
+  AccountHealth["state"],
+  { label: string; className: string }
+> = {
+  unknown: { label: "未登录过", className: "text-muted-foreground" },
+  ok: { label: "正常", className: "text-emerald-600 dark:text-emerald-400" },
+  banned: { label: "已封禁", className: "text-red-600 dark:text-red-400" },
+  refused: { label: "被拒", className: "text-amber-600 dark:text-amber-400" },
+  unreachable: { label: "连不上", className: "text-amber-600 dark:text-amber-400" },
+};
+
+/**
+ * One account's last login, as a word and a tooltip.
+ *
+ * The detail carries the server's own error text, which is the only thing that
+ * separates "logged in elsewhere" from "wrong password" — both arrive as
+ * 被拒 and the console does not guess between them.
+ */
+function AccountStateBadge({ health }: { health?: AccountHealth }) {
+  const state = health?.state ?? "unknown";
+  const { label, className } = STATES[state];
+  const when = health?.at ? new Date(health.at).toLocaleString("zh-CN") : null;
+  const title = [
+    when ? `最后一次登录 ${when}` : "本次启动以来还没有登录过",
+    health?.detail,
+    health && health.failures > 1 ? `已连续失败 ${health.failures} 次` : null,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return (
+    <span
+      className={cn("shrink-0 text-xs tabular-nums", className)}
+      title={title}
+    >
+      {label}
+    </span>
+  );
+}
 
 /**
  * The accounts this deployment logs in with.
@@ -77,7 +127,25 @@ export function AccountPoolCard() {
    * built from a remembered list would offer one that no longer exists.
    */
   const [proxy, setProxy] = useState<MihomoStatus | null>(null);
+  /**
+   * What the last login with each account did, as the backend saw it.
+   *
+   * Runtime, not configuration: it is fetched apart from the document and never
+   * submitted back. An account with no entry is one nothing has tried since the
+   * backend started, which the backend reports as `unknown` rather than by
+   * leaving the row out.
+   */
+  const [health, setHealth] = useState<AccountHealthMap>({});
   const { busy, message, run } = useBusyAction();
+
+  const loadHealth = useCallback(async () => {
+    try {
+      setHealth(await jsonRequest<AccountHealthMap>("/api/accounts/health"));
+    } catch {
+      // Never fatal. The pool is editable without it; all that is lost is the
+      // 状态 column, and an error banner over a working editor is worse.
+    }
+  }, []);
 
   const load = useCallback(async () => {
     try {
@@ -95,12 +163,21 @@ export function AccountPoolCard() {
     } catch {
       setProxy(null);
     }
-  }, []);
+    void loadHealth();
+  }, [loadHealth]);
 
   useEffect(() => {
     const initial = window.setTimeout(() => void load(), 0);
     return () => window.clearTimeout(initial);
   }, [load]);
+
+  // A ban does not arrive when the page is opened — it arrives while a session
+  // is running, minutes or hours later. Polling only the verdicts keeps the
+  // column live without pulling the document out from under an unsaved edit.
+  useEffect(() => {
+    const timer = window.setInterval(() => void loadHealth(), 20_000);
+    return () => window.clearInterval(timer);
+  }, [loadHealth]);
 
   async function save() {
     if (!document_) return;
@@ -440,6 +517,7 @@ export function AccountPoolCard() {
                   onChange={(event) => edit(index, { note: event.target.value })}
                 />
                 <div className="flex items-center gap-3">
+                  <AccountStateBadge health={health[account.username]} />
                   <label className="flex items-center gap-1.5 text-xs">
                     <Checkbox
                       checked={account.enabled}

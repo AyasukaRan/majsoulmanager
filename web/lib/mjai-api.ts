@@ -247,6 +247,40 @@ export type AccountDocument = {
 };
 
 /**
+ * What the last login with an account did.
+ *
+ * Not a boolean, because "failed" covers three things an operator acts on
+ * differently: `banned` is an account Mahjong Soul will never let in again and
+ * has to be replaced; `refused` is an answer that often says nothing bad about
+ * the account at all (`1005 ERR_ACC_ALREADY_LOGIN` means it is logged in
+ * elsewhere, `151 ERR_CLIENT_VERSION` is this client's own fault); and
+ * `unreachable` is the gateway or the proxy. Only the first is worth acting on.
+ *
+ * `unknown` means nothing has tried since the backend started — deliberately its
+ * own state, because a fresh deployment showing every account green would be
+ * claiming something it has not checked.
+ */
+export type AccountState =
+  | "unknown"
+  | "ok"
+  | "banned"
+  | "refused"
+  | "unreachable";
+
+export type AccountHealth = {
+  state: AccountState;
+  /** When that happened, or `null` for an account nothing has tried. */
+  at: string | null;
+  /** The error as the backend reported it. Empty when `ok`. */
+  detail: string;
+  /** Consecutive failures, cleared by a success. */
+  failures: number;
+};
+
+/** Keyed by username, as the account document spells it. */
+export type AccountHealthMap = Record<string, AccountHealth>;
+
+/**
  * The re-fetch pool. It logs in with accounts of its own rather than borrowing a
  * collector's session, so `concurrency` is how many sessions run at once — and
  * it cannot exceed the number of accounts, because Mahjong Soul allows one

@@ -193,17 +193,94 @@ async fn resolve_config_url(
 /// Returns (endpoint, version, route_id) tuple needed for connection.
 /// `cache_dir` backs a content-addressed resource cache used as a fallback
 /// when the live CDN is briefly unavailable.
+/// The route hosts, as the client build carries them.
+///
+/// Not discovered, because the real client does not discover them. Five
+/// captures of a browser playing the 4.0.45 CN client contain 1389 HTTP
+/// requests and not one of them is `version.json`, `resversion*.json` or
+/// `config.json` — the gateway list is compiled in, and the client goes
+/// straight to `/api/clientgate/routes` on each of these.
+///
+/// Kept in the order the client asks them in, which is also the order to prefer.
+const CN_ROUTE_HOSTS: [&str; 5] = [
+    "https://route-2.maj-soul.com",
+    "https://route-3.maj-soul.com:8443",
+    "https://route-4.maj-soul.com",
+    "https://route-5.maj-soul.com",
+    "https://route-6.maj-soul.com",
+];
+
+/// Builds the `routes` URL exactly as the client does.
+///
+/// `version` is the *package* version (`4.0.45`) — the Unity build — not the
+/// resource version (`0.16.257`). This sent the resource version, which is a
+/// value no client ever puts in this parameter, and omitted `lang` entirely.
+fn routes_url(host: &str, package_version: &str) -> String {
+    format!("{host}/api/clientgate/routes?platform=Web&version={package_version}&lang=chs_t")
+}
+
 pub async fn discover_gateway(
     client: &reqwest::Client,
     server: &str,
     cache_dir: &Path,
+    package_version: &str,
+) -> Result<(String, String, String)> {
+    let ms_host = server_base_url(server);
+    info!("Using {} server: {}", server, ms_host);
+
+    // The client's own path: ask a route host for the route list, and nothing
+    // else. Three fewer requests than what this did, and — more to the point —
+    // three fewer requests that identify the caller as not a browser.
+    if server == "cn" {
+        for host in CN_ROUTE_HOSTS {
+            match fetch_json_cached::<RoutesResponse>(
+                client,
+                &routes_url(host, package_version),
+                cache_dir,
+                false,
+            )
+            .await
+            {
+                Ok(response) => {
+                    if let Some(route) = response.data.routes.first() {
+                        let endpoint = format!("wss://{}/gateway", route.domain);
+                        info!(
+                            "Discovered gateway: {} (route_id: {}, via {host})",
+                            endpoint, route.id
+                        );
+                        // The resource version is not learned on this path and
+                        // is not needed: its only caller ignores it, and the
+                        // login carries the pinned code version instead.
+                        return Ok((endpoint, String::new(), route.id.clone()));
+                    }
+                    warn!("{host} answered with no routes");
+                }
+                Err(error) => warn!("{host} did not answer routes ({error:#})"),
+            }
+        }
+        warn!("no compiled-in route host answered; falling back to config.json discovery");
+    }
+
+    discover_gateway_via_config(client, server, cache_dir, package_version).await
+}
+
+/// The long way round: `version.json` → `resversion` → `config.json` → routes.
+///
+/// Kept only as a fallback for when every compiled-in route host is
+/// unreachable, and for the non-CN servers this has never had a captured client
+/// for. It is three requests a browser does not make, so it is not the path to
+/// be on — but a deployment that cannot dial at all is worse than one that is
+/// identifiable, and the hosts above are a static list that Mahjong Soul could
+/// move.
+async fn discover_gateway_via_config(
+    client: &reqwest::Client,
+    server: &str,
+    cache_dir: &Path,
+    package_version: &str,
 ) -> Result<(String, String, String)> {
     let ms_host = server_base_url(server);
     let prefix = server_path_prefix(server);
-    info!("Using {} server: {}", server, ms_host);
 
-    // Step 1: Get version (always cache-busted so a new release is picked up
-    // immediately, matching the reference client).
     let version_url = format!("{ms_host}{prefix}/version.json");
     let version_info: VersionInfo = fetch_json_cached(client, &version_url, cache_dir, true)
         .await
@@ -212,9 +289,6 @@ pub async fn discover_gateway(
     let version = version_info.version.clone();
     info!("Majsoul version: {}", version);
 
-    // Step 2: Resolve config.json through the resversion manifest. Fall back
-    // to the legacy v{version} path if the manifest cannot be read so the
-    // behaviour never regresses relative to the previous implementation.
     let config_url = match resolve_config_url(client, ms_host, prefix, &version, cache_dir).await {
         Ok(url) => url,
         Err(error) => {
@@ -228,9 +302,6 @@ pub async fn discover_gateway(
         .await
         .context("Failed to fetch config.json")?;
 
-    // Gateway URL is like "https://route-2.maj-soul.com". Match the official
-    // client and prefer the "player" gateway list, falling back to the first
-    // entry if the name is absent.
     let gateway = config
         .ip
         .iter()
@@ -242,15 +313,14 @@ pub async fn discover_gateway(
     let gateway_base = gateway.url.trim_end_matches('/');
     debug!("Gateway base URL: {}", gateway_base);
 
-    // Step 3: Fetch routes to get route_id (cache-busted; the active gateway
-    // rotates and must not be served stale).
-    let routes_url = format!(
-        "{}/api/clientgate/routes?platform=Web&version={}",
-        gateway_base, version
-    );
-    let routes_response: RoutesResponse = fetch_json_cached(client, &routes_url, cache_dir, true)
-        .await
-        .context("Failed to fetch routes")?;
+    let routes_response: RoutesResponse = fetch_json_cached(
+        client,
+        &routes_url(gateway_base, package_version),
+        cache_dir,
+        false,
+    )
+    .await
+    .context("Failed to fetch routes")?;
 
     let route = routes_response
         .data
@@ -258,15 +328,10 @@ pub async fn discover_gateway(
         .first()
         .context("No routes found in response")?;
 
-    let route_id = route.id.clone();
-    let route_domain = &route.domain;
-    debug!("Route: domain={}, id={}", route_domain, route_id);
+    let endpoint = format!("wss://{}/gateway", route.domain);
+    info!("Discovered gateway: {} (route_id: {})", endpoint, route.id);
 
-    // Build WebSocket endpoint from route domain
-    let endpoint = format!("wss://{}/gateway", route_domain);
-    info!("Discovered gateway: {} (route_id: {})", endpoint, route_id);
-
-    Ok((endpoint, version, route_id))
+    Ok((endpoint, version, route.id.clone()))
 }
 
 /// Extract the Unity build version (`productVersion`, e.g. "4.0.45") from the
@@ -309,6 +374,28 @@ mod tests {
 
     fn cache_path(dir: &Path, url: &str) -> std::path::PathBuf {
         dir.join(format!("{:x}", Sha256::digest(url.as_bytes())))
+    }
+
+    /// The routes URL, character for character as the client asks for it.
+    ///
+    /// Taken from `captures/register_20260805_174145.json`, where a real browser
+    /// asks all five route hosts for exactly this. Two things this used to get
+    /// wrong are both in here: the `version` is the package version and not the
+    /// resource version, and `lang` is present.
+    #[test]
+    fn the_routes_url_is_the_one_the_client_asks_for() {
+        assert_eq!(
+            routes_url("https://route-5.maj-soul.com", "4.0.45"),
+            "https://route-5.maj-soul.com/api/clientgate/routes\
+             ?platform=Web&version=4.0.45&lang=chs_t"
+        );
+        // Every compiled-in host is one the captures show being asked, port and
+        // all — route-3 is the odd one on 8443.
+        assert!(CN_ROUTE_HOSTS.contains(&"https://route-3.maj-soul.com:8443"));
+        assert_eq!(CN_ROUTE_HOSTS.len(), 5);
+        for host in CN_ROUTE_HOSTS {
+            assert!(host.starts_with("https://route-"), "odd route host {host}");
+        }
     }
 
     #[test]

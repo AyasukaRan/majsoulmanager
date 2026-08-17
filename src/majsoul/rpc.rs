@@ -3,7 +3,7 @@ use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, oneshot};
@@ -12,7 +12,6 @@ use tokio_tungstenite::{
     tungstenite::{Message, client::IntoClientRequest},
 };
 use tracing::{debug, warn};
-use uuid::Uuid;
 
 const MS_HOST: &str = "https://game.maj-soul.com";
 
@@ -69,18 +68,28 @@ impl std::error::Error for ServerError {}
 mod wrapper {
     use anyhow::Result;
 
+    /// Wraps one request as `Wrapper { name, data }`.
+    ///
+    /// Field 2 is written even when the body is empty, because that is what the
+    /// real client does: nine different empty-bodied methods across five
+    /// captures — `loginSuccess`, `fetchInfo`, `fetchConnectionInfo` and the
+    /// rest — all carry `12 00`, and not one omits the field.
+    ///
+    /// Protobuf treats the two encodings as the same message, so omitting it
+    /// costs nothing and is never noticed locally. What it costs is on the wire:
+    /// every session this deployment opens sends a `loginSuccess` two bytes
+    /// shorter than any browser's, which is a length comparison away from being
+    /// spotted.
     pub fn encode(name: &str, data: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
         // Field 1: name (string)
         buf.push(0x0a);
         encode_varint(&mut buf, name.len() as u64);
         buf.extend_from_slice(name.as_bytes());
-        // Field 2: data (bytes)
-        if !data.is_empty() {
-            buf.push(0x12);
-            encode_varint(&mut buf, data.len() as u64);
-            buf.extend_from_slice(data);
-        }
+        // Field 2: data (bytes), present even when empty
+        buf.push(0x12);
+        encode_varint(&mut buf, data.len() as u64);
+        buf.extend_from_slice(data);
         buf
     }
 
@@ -162,7 +171,7 @@ mod wrapper {
     }
 }
 
-mod requests {
+pub mod requests {
     use super::wrapper::encode_varint;
 
     pub fn fetch_game_record(uuid: &str, version: &str) -> Vec<u8> {
@@ -202,8 +211,8 @@ mod requests {
         encode_string(&mut buf, 2, password_hash);
         // Field 3: reconnect = false
         encode_varint_field(&mut buf, 3, 0);
-        // Field 4: device — full ClientDeviceInfo (android web client)
-        encode_device(&mut buf);
+        // Field 4: device — ClientDeviceInfo, one machine per account
+        encode_device(&mut buf, account);
         // Field 5: random_key (string)
         encode_string(&mut buf, 5, random_key);
         // Field 6: client_version { resource, package }
@@ -250,30 +259,158 @@ mod requests {
         encode_varint(buf, value);
     }
 
-    /// Encode ClientDeviceInfo (field 4) copied from a real android web-client
-    /// login frame, so risk control does not flag the login as a bare script.
-    fn encode_device(buf: &mut Vec<u8>) {
+    /// The Chrome versions a `mac` persona may claim. Kept in step with what the
+    /// real client is seen sending; a version far from the fleet's is as much a
+    /// marker as a wrong one.
+    const CHROME_VERSIONS: [u32; 3] = [149, 150, 151];
+
+    /// Real Mac screen sizes. The device reports the *viewport*, not the screen,
+    /// so the height sent is this minus the browser's own furniture.
+    const MAC_SCREENS: [(u64, u64); 6] = [
+        (1512, 982),
+        (1440, 900),
+        (1728, 1117),
+        (1280, 800),
+        (1920, 1080),
+        (2560, 1440),
+    ];
+
+    /// One machine, derived from the account name and nothing else.
+    ///
+    /// Two properties, and both matter. It is *stable*, because an account whose
+    /// reported hardware changes between two logins is an anomaly no real person
+    /// produces. And it is *distinct per account*, because the alternative is
+    /// what this had before: every account in the pool reporting one identical
+    /// machine — same user agent, same 923×830 viewport — from one address. That
+    /// is the cheapest query the other side could possibly run to collect the
+    /// whole fleet in one go, and no amount of care taken at registration time
+    /// survives it.
+    ///
+    /// Derived rather than stored so it needs no migration and no file: the
+    /// account name is already the identity everything else keys on.
+    /// The GPU strings a Mac reports through WebGL, in the exact shape the
+    /// browser renders them. Only the telemetry sends this, and only these
+    /// spellings appear in the wild — inventing a format is more visible than
+    /// repeating one.
+    ///
+    /// ponytail: mac-only, matching the personas. Add a row per platform once
+    /// there is a capture of one.
+    const MAC_GPUS: [&str; 7] = [
+        "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)",
+        "ANGLE (Apple, ANGLE Metal Renderer: Apple M1 Pro, Unspecified Version)",
+        "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)",
+        "ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)",
+        "ANGLE (Apple, ANGLE Metal Renderer: Apple M4, Unspecified Version)",
+        "ANGLE (Intel, ANGLE Metal Renderer: Intel(R) UHD Graphics 630, Unspecified Version)",
+        "ANGLE (AMD, ANGLE Metal Renderer: AMD Radeon Pro 5500M, Unspecified Version)",
+    ];
+
+    /// One account's machine.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Persona {
+        pub chrome: u32,
+        /// What `device.f10`/`f11` report: the browser viewport, not the screen.
+        pub viewport_width: u64,
+        pub viewport_height: u64,
+        /// What the telemetry reports as `device_gpu_name`.
+        pub gpu: &'static str,
+    }
+
+    pub fn persona(account: &str) -> Persona {
+        // FNV-1a. Not for security — it only has to spread account names evenly
+        // over the tables and give the same answer every time.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in account.to_lowercase().bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let (width, height) = MAC_SCREENS[((hash >> 8) % MAC_SCREENS.len() as u64) as usize];
+        Persona {
+            chrome: CHROME_VERSIONS[(hash % CHROME_VERSIONS.len() as u64) as usize],
+            // The width is the screen's; the height is the screen's less the
+            // menu bar, tab strip and address bar — 220 to 259 pixels the page
+            // never sees.
+            viewport_width: width,
+            viewport_height: height - 220 - ((hash >> 16) % 40),
+            gpu: MAC_GPUS[((hash >> 24) % MAC_GPUS.len() as u64) as usize],
+        }
+    }
+
+    /// Encode ClientDeviceInfo (field 4), field for field as a captured real web
+    /// client sends it: `pc` / `pc` / `mac`, is_browser, `Chrome`, `web`, the
+    /// viewport, the user agent, screen_type 1.
+    ///
+    /// What this replaced claimed to be an Android frame and was wrong in three
+    /// checkable ways against five captures: it sent a field 4 (`android15`) the
+    /// real client does not send at all, screen_type 2 where every capture has
+    /// 1, and a fixed viewport shared by every account.
+    fn encode_device(buf: &mut Vec<u8>, account: &str) {
+        let Persona {
+            chrome,
+            viewport_width,
+            viewport_height,
+            ..
+        } = persona(account);
         let mut inner = Vec::new();
-        encode_string(&mut inner, 1, "mobile"); // platform
-        encode_string(&mut inner, 2, "phone"); // hardware
-        encode_string(&mut inner, 3, "android"); // os
-        encode_string(&mut inner, 4, "android15"); // os_version
+        encode_string(&mut inner, 1, "pc"); // platform
+        encode_string(&mut inner, 2, "pc"); // hardware
+        encode_string(&mut inner, 3, "mac"); // os
         encode_bool(&mut inner, 5, true); // is_browser
         encode_string(&mut inner, 6, "Chrome"); // software
         encode_string(&mut inner, 7, "web"); // sale_platform
-        encode_varint_field(&mut inner, 10, 923); // screen_width
-        encode_varint_field(&mut inner, 11, 830); // screen_height
-        encode_string(
-            &mut inner,
-            12,
-            "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36",
-        ); // user_agent
-        encode_varint_field(&mut inner, 13, 2); // screen_type
+        encode_varint_field(&mut inner, 10, viewport_width); // screen_width
+        encode_varint_field(&mut inner, 11, viewport_height); // screen_height
+        encode_string(&mut inner, 12, &user_agent(chrome)); // user_agent
+        encode_varint_field(&mut inner, 13, 1); // screen_type
 
         let tag = (4 << 3) | 2;
         encode_varint(buf, tag as u64);
         encode_varint(buf, inner.len() as u64);
         buf.extend(inner);
+    }
+
+    /// The user agent that goes with a Chrome version. It has to agree with
+    /// everything else this deployment claims to be: a login saying `mac` and a
+    /// user agent saying Windows is one comparison away from being spotted.
+    pub fn user_agent(chrome: u32) -> String {
+        format!(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/{chrome}.0.0.0 Safari/537.36"
+        )
+    }
+
+    /// What a browser attaches to a call the game page makes to Mahjong Soul's
+    /// HTTP API, taken from a captured request verbatim.
+    ///
+    /// All fifty API requests across five captures carry the same set. What this
+    /// replaced sent a user agent and nothing else — a caller claiming to be
+    /// Chrome while missing everything Chrome adds, which is a cheaper thing for
+    /// the other side to notice than a user agent is to fake.
+    ///
+    /// `content-type` on a GET looks wrong and is not: the client sets it, so it
+    /// is here. Copying what is sent beats copying what ought to be.
+    pub fn browser_headers(chrome: u32) -> reqwest::header::HeaderMap {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut headers = HeaderMap::new();
+        let mut put = |name: &'static str, value: String| {
+            if let Ok(value) = HeaderValue::from_str(&value) {
+                headers.insert(name, value);
+            }
+        };
+        put("accept", "*/*".into());
+        put("content-type", "text/html;charset=UTF-8".into());
+        put("origin", super::MS_HOST.into());
+        put("referer", format!("{}/", super::MS_HOST));
+        put(
+            "sec-ch-ua",
+            format!(
+                "\"Not=A?Brand\";v=\"99\", \"Google Chrome\";v=\"{chrome}\", \
+                 \"Chromium\";v=\"{chrome}\""
+            ),
+        );
+        put("sec-ch-ua-mobile", "?0".into());
+        put("sec-ch-ua-platform", "\"macOS\"".into());
+        headers
     }
 
     /// Encode ClientVersionInfo (field 6) { resource, package } — the client
@@ -292,9 +429,14 @@ mod requests {
 
     /// Build ReqRequestConnection for the route handshake (required before
     /// login). Verified against a captured real-client frame: type=1,
-    /// route_id, unix-second timestamp, and field 6 = "web". Sending type=3
-    /// (or no "web") leaves the session in a state where login is rejected
-    /// with server error 151.
+    /// route_id, unix-second timestamp, and field 6 = "Web". Sending type=3
+    /// (or no field 6 at all) leaves the session in a state where login is
+    /// rejected with server error 151.
+    ///
+    /// Capital W. Three 2026-08 captures carry `3203 576562` — `W` is `0x57` —
+    /// and this sent `web`, which the gateway accepts but no client sends.
+    /// The lower-case `web` in `encode_device` field 7 is a different field and
+    /// really is lower case: the same registration carries both spellings.
     pub fn build_request_connection(route_id: &str, timestamp: u64) -> Vec<u8> {
         let mut buf = Vec::new();
         // Field 2: type = 1
@@ -303,41 +445,119 @@ mod requests {
         encode_string(&mut buf, 3, route_id);
         // Field 4: timestamp (varint, unix seconds)
         encode_varint_field(&mut buf, 4, timestamp);
-        // Field 6: client kind = "web"
-        encode_string(&mut buf, 6, "web");
+        // Field 6: client kind = "Web"
+        encode_string(&mut buf, 6, "Web");
         buf
     }
 
-    /// Build ReqHeartbeat for Route.heartbeat
-    pub fn build_heartbeat() -> Vec<u8> {
+    /// Build ReqHeartbeat for Route.heartbeat.
+    ///
+    /// `5000/5000` is not a placeholder — it is what the client sends as the
+    /// *first* heartbeat of every connection, exactly, in all eleven connections
+    /// across five captures. Every heartbeat after that carries a measured round
+    /// trip instead: 110 of them span 1 to 1399 ms with a median of 253, and
+    /// `network_quality` is a second measurement close to but rarely equal to
+    /// `delay`.
+    ///
+    /// So the constant was right and the loop was missing. See
+    /// [`super::MajsoulRpc::start_heartbeat`].
+    pub fn build_heartbeat(delay_ms: u64, quality_ms: u64) -> Vec<u8> {
         let mut buf = Vec::new();
-        // Values copied from a captured real-client heartbeat.
-        encode_varint_field(&mut buf, 1, 5000); // delay
+        encode_varint_field(&mut buf, 1, delay_ms); // delay
         encode_varint_field(&mut buf, 2, 0); // no_operation_counter
         encode_varint_field(&mut buf, 3, 11); // platform (Web)
-        encode_varint_field(&mut buf, 4, 5000); // network_quality
+        encode_varint_field(&mut buf, 4, quality_ms); // network_quality
         buf
+    }
+
+    /// The first heartbeat of a connection, byte for byte as captured.
+    pub fn build_first_heartbeat() -> Vec<u8> {
+        build_heartbeat(5_000, 5_000)
     }
 }
 
-pub struct MajsoulRpc {
+/// Everything needed to send one request and wait for its answer.
+///
+/// Split out from [`MajsoulRpc`] so the heartbeat task can hold it: a heartbeat
+/// has to share the socket, the pending map *and* the request counter with
+/// ordinary calls, or the two would hand out the same message id.
+#[derive(Clone)]
+struct Channel {
     write: Arc<Mutex<futures_util::stream::SplitSink<WsStream, Message>>>,
     pending: Arc<Mutex<HashMap<u16, oneshot::Sender<Vec<u8>>>>>,
-    req_idx: AtomicU16,
+    req_idx: Arc<AtomicU16>,
+    /// The last round trip a heartbeat measured, in milliseconds, which is what
+    /// the next one reports. Starts at the 5000 the client opens every
+    /// connection with.
+    last_rtt: Arc<AtomicU64>,
+}
+
+pub struct MajsoulRpc {
+    channel: Channel,
     _read_task: tokio::task::JoinHandle<()>,
+    /// Aborted when the connection is dropped, which is what stops the
+    /// heartbeat outliving the socket it beats on.
+    heartbeat: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for MajsoulRpc {
+    fn drop(&mut self) {
+        if let Ok(mut handle) = self.heartbeat.try_lock()
+            && let Some(handle) = handle.take()
+        {
+            handle.abort();
+        }
+    }
 }
 
 impl MajsoulRpc {
     /// Connect directly or through a fixed HTTP CONNECT proxy. When a proxy
     /// is supplied there is deliberately no DIRECT fallback.
-    pub async fn connect_with_proxy(endpoint: &str, proxy: Option<&str>) -> Result<Self> {
+    pub async fn connect_with_proxy(
+        endpoint: &str,
+        proxy: Option<&str>,
+        chrome: u32,
+    ) -> Result<Self> {
         let mut request = endpoint.into_client_request()?;
-        request
-            .headers_mut()
-            .insert("Origin", MS_HOST.parse().unwrap());
+        {
+            // What Chrome sends on a WebSocket upgrade, measured by pointing a
+            // real headless Chrome at a bare socket and reading the request off
+            // the wire. Note what is *not* here: no `sec-ch-ua`, no
+            // `sec-fetch-*`, no `accept`. A browser attaches all of those to an
+            // HTTP request and none of them to a WebSocket handshake, so adding
+            // them would be as wrong as leaving these out.
+            //
+            // tungstenite writes Host, Connection, Upgrade, Sec-WebSocket-Key
+            // and Sec-WebSocket-Version itself. Their order relative to these
+            // cannot be set from here and does not match the browser's; that is
+            // the one part of the handshake this cannot fix.
+            let headers = request.headers_mut();
+            headers.insert("Pragma", "no-cache".parse().unwrap());
+            headers.insert("Cache-Control", "no-cache".parse().unwrap());
+            headers.insert(
+                "User-Agent",
+                requests::user_agent(chrome).parse().context("user agent")?,
+            );
+            headers.insert("Origin", MS_HOST.parse().unwrap());
+            headers.insert(
+                "Accept-Encoding",
+                "gzip, deflate, br, zstd".parse().unwrap(),
+            );
+            // Offered because the browser offers it. The gateway declines it —
+            // its `101` carries no `Sec-WebSocket-Extensions` even when this is
+            // sent — which matters, because tungstenite is built here without
+            // compression support and would read deflated frames as garbage.
+            // The handshake response is checked below rather than trusted.
+            headers.insert(
+                "Sec-WebSocket-Extensions",
+                "permessage-deflate; client_max_window_bits"
+                    .parse()
+                    .unwrap(),
+            );
+        }
 
         debug!("Connecting to {}", endpoint);
-        let (ws_stream, _) = if let Some(proxy) = proxy {
+        let (ws_stream, handshake) = if let Some(proxy) = proxy {
             let proxy_url = reqwest::Url::parse(proxy).context("Invalid proxy URL")?;
             if proxy_url.scheme() != "http" {
                 anyhow::bail!("Only http:// CONNECT proxies are currently supported");
@@ -390,6 +610,19 @@ impl MajsoulRpc {
                 .context("WebSocket connect failed")?
         };
 
+        // Offering permessage-deflate is only safe while the gateway keeps
+        // declining it. If it ever accepts, every frame after this arrives
+        // deflated and tungstenite — built here without compression — reads
+        // them as malformed. Failing here turns that into one clear error
+        // instead of a collector that silently stops understanding the server.
+        if let Some(accepted) = handshake.headers().get("sec-websocket-extensions") {
+            anyhow::bail!(
+                "gateway accepted a WebSocket extension this client cannot read \
+                 ({}); stop offering permessage-deflate in connect_with_proxy",
+                accepted.to_str().unwrap_or("unreadable")
+            );
+        }
+
         let (write, mut read) = ws_stream.split();
         let write = Arc::new(Mutex::new(write));
         let pending: Arc<Mutex<HashMap<u16, oneshot::Sender<Vec<u8>>>>> =
@@ -427,14 +660,64 @@ impl MajsoulRpc {
 
         debug!("Connected to Majsoul gateway");
         Ok(Self {
-            write,
-            pending,
-            req_idx: AtomicU16::new(1),
+            channel: Channel {
+                write,
+                pending,
+                req_idx: Arc::new(AtomicU16::new(1)),
+                last_rtt: Arc::new(AtomicU64::new(5_000)),
+            },
             _read_task: read_task,
+            heartbeat: Mutex::new(None),
         })
     }
 
     pub async fn call(&self, method: &str, request_data: &[u8]) -> Result<Vec<u8>> {
+        self.channel.call(method, request_data).await
+    }
+
+    /// Starts beating for the life of this connection.
+    ///
+    /// The cadence is the client's own, measured off five captures: six beats
+    /// half a second apart as the connection settles, then one every fifteen
+    /// seconds until the socket goes. Every connection in every capture does
+    /// this, including the ones the client opens to gateways it never logs in
+    /// through.
+    ///
+    /// What this replaced sent exactly one heartbeat, before the login, and then
+    /// nothing — so a collector session that stayed up for six hours sent one
+    /// beat in six hours. There is no rate limit to hide behind here and no cost
+    /// to paying it: the difference between a client and this was a query on
+    /// "sessions with no heartbeat in the last minute".
+    ///
+    /// Failures end the task rather than being reported. A heartbeat that cannot
+    /// be sent means the socket is gone, and the caller will find that out from
+    /// its own next request — which is the error worth surfacing.
+    pub async fn start_heartbeat(&self) {
+        let channel = self.channel.clone();
+        let task = tokio::spawn(async move {
+            // The settling burst. The first beat of the connection is sent by
+            // `route_connect`, so this picks up at the second.
+            for _ in 0..5 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if channel.beat().await.is_err() {
+                    return;
+                }
+            }
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                if channel.beat().await.is_err() {
+                    return;
+                }
+            }
+        });
+        if let Some(previous) = self.heartbeat.lock().await.replace(task) {
+            previous.abort();
+        }
+    }
+}
+
+impl Channel {
+    async fn call(&self, method: &str, request_data: &[u8]) -> Result<Vec<u8>> {
         let idx = self.req_idx.fetch_add(1, Ordering::SeqCst) % 60007;
 
         let wrapped = wrapper::encode(method, request_data);
@@ -463,6 +746,33 @@ impl MajsoulRpc {
         Ok(response)
     }
 
+    /// One heartbeat carrying the round trip the previous one measured.
+    ///
+    /// Measured rather than invented, because the captured values are a real
+    /// distribution — 1 to 1399 ms, median 253 — and a constant, or a random
+    /// number from a range, is a distribution of its own.
+    async fn beat(&self) -> Result<()> {
+        let started = std::time::Instant::now();
+        // Seeded from the last measurement the same way the client does: the
+        // first of a connection is 5000/5000 and every later one reports what
+        // was actually observed.
+        // ponytail: delay and network_quality get the same number. The captures
+        // have them equal in 3 of 8 samples and within a quarter otherwise, so
+        // this sits inside the real distribution; split them if that ever stops
+        // being true.
+        let previous = self.last_rtt.load(Ordering::Relaxed).clamp(1, 5_000);
+        self.call(
+            ".lq.Route.heartbeat",
+            &requests::build_heartbeat(previous, previous),
+        )
+        .await?;
+        let elapsed = started.elapsed().as_millis().clamp(1, 5_000) as u64;
+        self.last_rtt.store(elapsed, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+impl MajsoulRpc {
     pub async fn fetch_game_record(&self, uuid: &str, version: &str) -> Result<Vec<u8>> {
         let request = build_fetch_game_record_request(uuid, version);
         let response = self.call(FETCH_GAME_RECORD_METHOD, &request).await?;
@@ -523,7 +833,10 @@ impl MajsoulRpc {
     }
 
     pub async fn close(&self) -> Result<()> {
-        self.write.lock().await.close().await?;
+        if let Some(handle) = self.heartbeat.lock().await.take() {
+            handle.abort();
+        }
+        self.channel.write.lock().await.close().await?;
         Ok(())
     }
 
@@ -537,7 +850,7 @@ impl MajsoulRpc {
         package_version: &str,
         tag: &str,
         route_id: &str,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         use crate::majsoul::auth::hash_password;
 
         // Step 1: Route connection handshake (CRITICAL - required before login)
@@ -546,12 +859,24 @@ impl MajsoulRpc {
         // Step 2: Match the current official client: heartbeat belongs to
         // Route, not the legacy misspelled Lobby.heatbeat method.
         debug!("Sending route heartbeat");
-        let heartbeat = requests::build_heartbeat();
+        let heartbeat = requests::build_first_heartbeat();
         let hb_response = self.call(".lq.Route.heartbeat", &heartbeat).await?;
         debug!("Heartbeat response: {} bytes", hb_response.len());
 
+        // And then keep beating, which is what the client does and what this
+        // never did. Started here rather than after the login so the settling
+        // burst overlaps the login the way the captures show it doing.
+        self.start_heartbeat().await;
+
         let password_hash = hash_password(password);
-        let random_key = Uuid::new_v4().to_string();
+        // The machine's id, and it does not change.
+        //
+        // This was a fresh `Uuid::new_v4()` on every login, which for a pool
+        // account reconnecting every few minutes reads as the same person
+        // logging in from a new device all day. It is also the `device_id` the
+        // client reports in its telemetry, so it has to be something an account
+        // *has* rather than something a connection makes up.
+        let random_key = super::device_id(username);
         debug!("Authenticating with native login (account={})", username);
 
         // Build ReqLogin protobuf
@@ -586,16 +911,81 @@ impl MajsoulRpc {
         } else {
             debug!("Login successful (account={}, no token)", username);
         }
+        // `ResLogin.account_id`, field 2 as a varint. The telemetry cannot be
+        // sent without it, and it is the one field of the answer that is not
+        // this deployment's own to invent. Field 2 is also where the access
+        // token lives when it is a string, so the wire type has to be checked
+        // rather than assumed.
+        let account_id = crate::majsoul::proto::FieldIterator::new(&response)
+            .flatten()
+            .find(|field| field.number == 2 && field.wire_type == 0)
+            .and_then(|field| crate::majsoul::proto::extract_varint(field.data).ok())
+            .unwrap_or(0);
 
-        // Send loginSuccess
-        self.call(".lq.Lobby.loginSuccess", &[]).await?;
+        self.settle_into_the_lobby().await;
+        Ok(account_id)
+    }
 
-        // Send loginBeat with contract
-        let contract = "DF2vkXCnfeXp4WoGSBGNcJBufZiMN3UP";
-        let beat_req = requests::build_login_beat_request(contract);
-        self.call(".lq.Lobby.loginBeat", &beat_req).await?;
+    /// What the client does in the fifteen seconds after a login.
+    ///
+    /// Read off `captures/register_20260805_174145.json`, which is a real
+    /// browser: `fetchLastPrivacy`, two `loginBeat`s, then the lobby's own
+    /// contents — announcement, account info, the questionnaire, the challenge
+    /// pair, the seer report, the revive coin, the daily task — then, after a
+    /// pause, `fetchConnectionInfo` and `fetchRollingNotice`, and `loginSuccess`
+    /// only at the end.
+    ///
+    /// What this replaced was `login` → `loginSuccess` → `loginBeat`, three
+    /// frames inside fifty milliseconds, and then nothing but `fetchGameRecord`
+    /// for as long as the session lived. No browser produces that: the lobby is
+    /// a screen, and a client that logs in never draws it.
+    ///
+    /// Nothing here is checked and nothing here can fail the login. These are
+    /// reads whose answers are thrown away — the session is already up by the
+    /// time they run, and losing one to a refusal is not worth ending a
+    /// collector over. The delays are the captured ones rather than random,
+    /// because the shape is what is being copied.
+    async fn settle_into_the_lobby(&self) {
+        use std::time::Duration;
+        const CONTRACT: &str = "DF2vkXCnfeXp4WoGrBGNcJBufZiMN3uP";
 
-        Ok(())
+        // A constant embedded in the client, not a secret and not per session:
+        // fifteen frames across five captures, five accounts and three weeks all
+        // carry this exact string. What was here before differed from it at two
+        // positions (index 16 `r`→`S`, index 30 `u`→`U`), which means every
+        // login this deployment ever made was identifiable by one string
+        // comparison — no fingerprinting, no correlation, just a value no real
+        // client sends.
+        let beat = requests::build_login_beat_request(CONTRACT);
+
+        // (method, how long to wait before sending it) — the gaps the capture
+        // shows, to a tenth of a second.
+        let steps: [(&str, &[u8], u64); 14] = [
+            (".lq.Lobby.fetchLastPrivacy", &[], 860),
+            (".lq.Lobby.loginBeat", &beat, 340),
+            (".lq.Lobby.loginBeat", &beat, 1_220),
+            (".lq.Lobby.fetchAnnouncement", &[], 5_440),
+            (".lq.Lobby.fetchInfo", &[], 350),
+            (".lq.Lobby.fetchQuestionnaireList", &[], 280),
+            (".lq.Lobby.fetchChallengeInfo", &[], 10),
+            (".lq.Lobby.fetchChallengeSeason", &[], 10),
+            (".lq.Lobby.fetchSeerReportList", &[], 10),
+            (".lq.Lobby.fetchReviveCoinInfo", &[], 40),
+            (".lq.Lobby.fetchDailyTask", &[], 10),
+            (".lq.Lobby.fetchConnectionInfo", &[], 12_280),
+            (".lq.Lobby.fetchRollingNotice", &[], 5_000),
+            // Last, not first. In the capture it lands with three other frames
+            // in the same millisecond, twenty seconds after the lobby is drawn.
+            (".lq.Lobby.loginSuccess", &[], 890),
+        ];
+
+        for (method, body, wait_ms) in steps {
+            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+            if let Err(error) = self.call(method, body).await {
+                debug!("lobby settle step {method} did not answer: {error:#}");
+                return;
+            }
+        }
     }
 
     /// Extract error code from protobuf response
@@ -664,6 +1054,179 @@ impl MajsoulRpc {
 #[cfg(test)]
 mod tests {
     use super::MajsoulRpc;
+    use super::requests;
+
+    /// The first heartbeat of a connection is the captured constant, and every
+    /// one after it reports a measurement.
+    ///
+    /// Both halves are pinned because getting either wrong is invisible. The
+    /// constant looked like a placeholder and is not — eleven connections across
+    /// five captures open with exactly `5000/5000`. And a constant *after* the
+    /// first is the giveaway, because the client's later beats span 1 to 1399 ms
+    /// with a median of 253.
+    #[test]
+    fn the_first_heartbeat_is_the_captured_constant_and_later_ones_are_not() {
+        // f1=5000 f2=0 f3=11 f4=5000, the payload seen 11/11 times.
+        assert_eq!(
+            requests::build_first_heartbeat(),
+            vec![0x08, 0x88, 0x27, 0x10, 0x00, 0x18, 0x0b, 0x20, 0x88, 0x27]
+        );
+        assert_eq!(
+            requests::build_first_heartbeat(),
+            requests::build_heartbeat(5_000, 5_000)
+        );
+        // A measured beat differs from it, which is the whole point.
+        assert_ne!(
+            requests::build_heartbeat(253, 253),
+            requests::build_first_heartbeat()
+        );
+    }
+
+    /// An empty request body is still written as a field.
+    ///
+    /// `loginSuccess` is the one every session sends and the one this used to
+    /// get wrong: protobuf reads `12 00` and a missing field 2 as the same
+    /// message, so nothing here ever failed — the difference only exists on the
+    /// wire, where it is two bytes no browser is missing.
+    #[test]
+    fn an_empty_body_is_still_written_as_field_two() {
+        let frame = super::wrapper::encode(".lq.Lobby.loginSuccess", &[]);
+        assert_eq!(
+            &frame[frame.len() - 2..],
+            &[0x12, 0x00],
+            "an empty body must end in 12 00: {frame:02x?}"
+        );
+        // And a real body is unchanged: field 2, its length, then the bytes.
+        let carried = super::wrapper::encode(".lq.Lobby.login", &[0xaa, 0xbb]);
+        assert_eq!(&carried[carried.len() - 4..], &[0x12, 0x02, 0xaa, 0xbb]);
+        // Round-trips either way, which is what makes the omission invisible.
+        let (name, data) = super::wrapper::decode(&frame).unwrap();
+        assert_eq!(name, ".lq.Lobby.loginSuccess");
+        assert!(data.is_empty());
+    }
+
+    /// The handshake says `Web`, capital W.
+    ///
+    /// Pinned to the captured bytes because the wrong case is invisible: the
+    /// gateway accepts `web` and the session goes on to work, so nothing fails
+    /// and nothing is logged — the only consequence is that every session this
+    /// deployment opens carries a spelling no real client uses.
+    #[test]
+    fn the_route_handshake_spells_web_the_way_the_client_does() {
+        let frame = requests::build_request_connection("route-2", 1_785_922_697);
+        // Field 6, length 3, "Web" — `32 03 57 65 62` in three 2026-08 captures.
+        assert!(
+            frame
+                .windows(5)
+                .any(|w| w == [0x32, 0x03, 0x57, 0x65, 0x62]),
+            "requestConnection field 6 must be \"Web\": {frame:02x?}"
+        );
+    }
+
+    /// One machine per account, and the same one every time.
+    ///
+    /// Both halves are the point. Identical personas across accounts collect the
+    /// whole pool in one query; a persona that moves between logins of one
+    /// account is a machine that changed its screen size overnight.
+    #[test]
+    fn every_account_reports_its_own_stable_machine() {
+        let a = requests::persona("alice@example.com");
+        let b = requests::persona("bob@example.com");
+        assert_ne!(a, b, "two accounts must not report the same machine");
+        assert_eq!(
+            a,
+            requests::persona("alice@example.com"),
+            "an account's machine must not change between logins"
+        );
+        // Case is not identity: Mahjong Soul treats these as one account, and so
+        // does the pool's duplicate check, so they must get one machine.
+        assert_eq!(a, requests::persona("Alice@Example.com"));
+
+        let requests::Persona {
+            chrome,
+            viewport_width: width,
+            viewport_height: height,
+            gpu,
+        } = a;
+        assert!((149..=151).contains(&chrome));
+        assert!(gpu.starts_with("ANGLE ("), "odd gpu string {gpu}");
+        // A viewport, not a screen: shorter than any screen in the table by the
+        // browser's own furniture.
+        assert!(
+            (500..=1_400).contains(&height),
+            "odd viewport height {height}"
+        );
+        assert!(
+            (1_280..=2_560).contains(&width),
+            "odd viewport width {width}"
+        );
+        assert!(requests::user_agent(chrome).contains(&format!("Chrome/{chrome}.0.0.0")));
+        assert!(requests::user_agent(chrome).contains("Macintosh"));
+    }
+
+    /// An account's device id is stable, distinct, and shaped like a uuid.
+    ///
+    /// Stable because it is the machine's identity in two places at once — the
+    /// login's `random_key` and the telemetry's `device_id` — and a value that
+    /// changed per connection described an account acquiring a new computer
+    /// every few minutes. Shaped like a v4 uuid because anything parsing it
+    /// should see nothing remarkable.
+    #[test]
+    fn an_accounts_device_id_is_stable_and_looks_like_any_other_uuid() {
+        let a = super::super::device_id("alice@example.com");
+        assert_eq!(a, super::super::device_id("alice@example.com"));
+        assert_eq!(a, super::super::device_id("Alice@Example.COM"));
+        assert_ne!(a, super::super::device_id("bob@example.com"));
+
+        let parsed = uuid::Uuid::parse_str(&a).expect("a uuid");
+        assert_eq!(
+            parsed.get_version_num(),
+            4,
+            "must read as random, not hashed"
+        );
+        assert_eq!(a.len(), 36);
+    }
+
+    /// The device is the desktop web client's, field for field.
+    ///
+    /// What this replaced claimed to be Android and disagreed with all five
+    /// captures in three checkable ways, the worst of which — a field 4 the real
+    /// client never sends — is present or absent, not a matter of degree.
+    #[test]
+    fn the_login_device_matches_the_captured_web_client() {
+        let frame = requests::build_login_request(
+            "someone@example.com",
+            "0".repeat(64).as_str(),
+            "random",
+            "0.16.257",
+            "4.0.45",
+            "cn",
+        );
+        let contains = |needle: &[u8]| frame.windows(needle.len()).any(|w| w == needle);
+        // f1="pc" f2="pc" f3="mac" f7="web" (lower case here, unlike the
+        // handshake's "Web"), screen_type f13=1.
+        assert!(contains(b"\x0a\x02pc"), "device f1 must be pc");
+        assert!(contains(b"\x12\x02pc"), "device f2 must be pc");
+        assert!(contains(b"\x1a\x03mac"), "device f3 must be mac");
+        assert!(contains(b"\x3a\x03web"), "device f7 must be lower-case web");
+        assert!(
+            contains(&[0x68, 0x01]),
+            "device f13 (screen_type) must be 1"
+        );
+        assert!(
+            !contains(b"android"),
+            "the captured client is not an Android one"
+        );
+        // The login frame's own user agent has to be the one `user_agent` gives
+        // for this account, because that is what the HTTP side of the same
+        // session sends. This is the assertion that fails if the two ever drift
+        // apart again — which is exactly what a fleet-wide HTTP constant did.
+        let chrome = requests::persona("someone@example.com").chrome;
+        assert!(
+            contains(requests::user_agent(chrome).as_bytes()),
+            "device f12 must be the account's own user agent"
+        );
+    }
 
     #[test]
     fn decodes_multibyte_error_codes() {

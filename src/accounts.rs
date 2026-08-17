@@ -23,7 +23,7 @@
 //! which nothing can fetch a second time.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -175,9 +175,72 @@ impl<'a> PoolRef<'a> {
     }
 }
 
+/// What the last attempt to log in with an account did.
+///
+/// Deliberately not a boolean. "Failed" lumps together three things an operator
+/// has to act on differently: an account Mahjong Soul will never let in again, a
+/// refusal that says nothing bad about the account (it is logged in elsewhere,
+/// or this client's version is stale), and a network that was down. Only the
+/// first is worth replacing an account over.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountState {
+    /// Nothing has tried to log in since this process started. Not the same as
+    /// healthy, and shown as its own thing rather than as a green tick.
+    #[default]
+    Unknown,
+    Ok,
+    /// `503`. Terminal: the session that meets it will meet it again on every
+    /// retry, for ever.
+    Banned,
+    /// The server answered and refused with something other than `503`.
+    ///
+    /// Kept apart from `Unreachable` because an answer is evidence and a timeout
+    /// is not — but *not* called rejected, because several of these codes say
+    /// nothing bad about the account: `1005 ERR_ACC_ALREADY_LOGIN` means it is
+    /// logged in somewhere else and `151 ERR_CLIENT_VERSION` is this client's
+    /// own fault. The code is in `detail`; guessing at its meaning here would
+    /// put a wrong verdict on the screen.
+    Refused,
+    /// Nothing answered: the gateway, the network, the proxy.
+    Unreachable,
+}
+
+impl AccountState {
+    /// Whether logging in again could plausibly work.
+    ///
+    /// Only `Banned` is terminal. A refusal might be the account being logged in
+    /// elsewhere, which clears on its own, and an unreachable gateway is not
+    /// about the account at all — retrying both is right.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Banned)
+    }
+}
+
+/// The last thing that happened when this deployment logged in with an account.
+///
+/// Runtime only, never persisted. It describes this process's experience, and a
+/// verdict restored from disk after a restart would be a claim about a login
+/// nothing here made.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct AccountHealth {
+    pub state: AccountState,
+    /// When that happened, or `None` for an account nothing has tried. A
+    /// timestamp of "now" for an untried account would read as a fresh verdict.
+    pub at: Option<DateTime<Utc>>,
+    /// The error as it was reported, for a human to read. Empty when `Ok`.
+    pub detail: String,
+    /// Consecutive failures, reset by a success. An account failing once is
+    /// weather; the same one failing forty times is the thing to look at.
+    pub failures: u32,
+}
+
 pub struct AccountPool {
     path: PathBuf,
     document: RwLock<AccountDocument>,
+    /// Keyed by lower-cased username, the same way every other lookup in this
+    /// file treats these — they are e-mail logins and Mahjong Soul folds case.
+    health: RwLock<HashMap<String, AccountHealth>>,
 }
 
 impl AccountPool {
@@ -199,11 +262,53 @@ impl AccountPool {
         Ok(Self {
             path,
             document: RwLock::new(document),
+            health: RwLock::new(HashMap::new()),
         })
     }
 
     pub fn published(&self) -> AccountDocument {
         self.document.read().clone().published()
+    }
+
+    /// Records what logging in with an account just did.
+    ///
+    /// Called by whichever half opened the session. The pool is the only place
+    /// both halves already share, which is why the verdict lives here rather
+    /// than in either service's own status.
+    pub fn record_login(&self, username: &str, state: AccountState, detail: impl Into<String>) {
+        let detail = detail.into();
+        let mut health = self.health.write();
+        let entry = health.entry(username.to_lowercase()).or_default();
+        entry.failures = if state == AccountState::Ok {
+            0
+        } else {
+            entry.failures.saturating_add(1)
+        };
+        entry.state = state;
+        entry.at = Some(Utc::now());
+        entry.detail = detail;
+    }
+
+    /// Every account's last known state, by username as the document spells it.
+    ///
+    /// Driven by the document rather than by the health map, so an account that
+    /// nothing has tried yet appears as `Unknown` instead of not appearing —
+    /// "no row" and "not tried" look identical on a screen, and only one of them
+    /// is a reason to worry.
+    pub fn health(&self) -> BTreeMap<String, AccountHealth> {
+        let health = self.health.read();
+        self.document
+            .read()
+            .accounts
+            .iter()
+            .map(|account| {
+                let known = health
+                    .get(&account.username.to_lowercase())
+                    .cloned()
+                    .unwrap_or_default();
+                (account.username.clone(), known)
+            })
+            .collect()
     }
 
     pub fn update(&self, next: AccountDocument) -> Result<AccountDocument, WatchServiceError> {
@@ -410,6 +515,80 @@ mod tests {
             enabled: true,
             node: String::new(),
         }
+    }
+
+    /// Every account appears, whether or not anything has logged in with it.
+    ///
+    /// The absent row is the failure worth guarding against: "no entry" and
+    /// "never tried" render identically on a screen, and only one of them is a
+    /// reason to go and look.
+    #[test]
+    fn an_account_nothing_has_tried_is_reported_as_unknown_rather_than_missing() {
+        let store = pool(vec![
+            account("tried@example.com", AccountPurpose::Refetch),
+            account("untouched@example.com", AccountPurpose::Refetch),
+        ]);
+        store.record_login("tried@example.com", AccountState::Ok, "");
+
+        let health = store.health();
+        assert_eq!(health.len(), 2, "every account in the document has a row");
+        assert_eq!(health["tried@example.com"].state, AccountState::Ok);
+        assert!(health["tried@example.com"].at.is_some());
+
+        let untouched = &health["untouched@example.com"];
+        assert_eq!(untouched.state, AccountState::Unknown);
+        assert!(
+            untouched.at.is_none(),
+            "an untried account has no verdict, and no time for one either"
+        );
+    }
+
+    /// Case is not identity anywhere else in this file, and it is not here.
+    /// A collector configured with one spelling and the pool document with
+    /// another name the same Mahjong Soul account.
+    #[test]
+    fn a_verdict_recorded_under_one_spelling_is_found_under_the_other() {
+        let store = pool(vec![account("Live@Example.com", AccountPurpose::Watch)]);
+        store.record_login("live@example.com", AccountState::Banned, "503 banned");
+
+        let health = store.health();
+        // Keyed by the document's spelling, which is what an operator reads.
+        assert_eq!(health["Live@Example.com"].state, AccountState::Banned);
+        assert_eq!(health["Live@Example.com"].detail, "503 banned");
+    }
+
+    /// Only a ban is terminal.
+    ///
+    /// The pool retires a session on `is_terminal`, so a `true` here for
+    /// `Refused` would end a session over `1005 ERR_ACC_ALREADY_LOGIN` — an
+    /// account that is perfectly good and merely logged in somewhere else.
+    #[test]
+    fn only_a_ban_stops_the_pool_from_trying_again() {
+        assert!(AccountState::Banned.is_terminal());
+        assert!(!AccountState::Refused.is_terminal());
+        assert!(!AccountState::Unreachable.is_terminal());
+        assert!(!AccountState::Unknown.is_terminal());
+        assert!(!AccountState::Ok.is_terminal());
+    }
+
+    /// Consecutive failures accumulate and a success clears them, because the
+    /// number is there to tell weather from a wall.
+    #[test]
+    fn a_run_of_failures_is_counted_and_a_success_ends_it() {
+        let store = pool(vec![account("flaky@example.com", AccountPurpose::Refetch)]);
+        for _ in 0..3 {
+            store.record_login("flaky@example.com", AccountState::Unreachable, "网关超时");
+        }
+        assert_eq!(store.health()["flaky@example.com"].failures, 3);
+
+        store.record_login("flaky@example.com", AccountState::Ok, "");
+        let recovered = &store.health()["flaky@example.com"];
+        assert_eq!(recovered.failures, 0);
+        assert_eq!(recovered.state, AccountState::Ok);
+        assert!(
+            recovered.detail.is_empty(),
+            "a success carries no error text"
+        );
     }
 
     fn pool(accounts: Vec<StoredAccount>) -> AccountPool {
