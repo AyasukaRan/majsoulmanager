@@ -12,7 +12,7 @@ use mjai_management::auth::{
     VerifyEmailRequest,
 };
 use mjai_management::catalog::{
-    Catalog, Cursor, PaipuyaGame, PaipuyaPosition, RecordFilter, SeriesUnit, SeriesWindow,
+    Catalog, Cursor, GameUuid, PaipuyaGame, RecordFilter, SeriesUnit, SeriesWindow, SweepPosition,
 };
 use mjai_management::objects::Objects;
 use mjai_management::pack::PackStore;
@@ -2962,22 +2962,17 @@ async fn walks_the_paipuya_catalogue_by_keyset_and_skips_the_games_already_claim
 
     // The first two share a second, which is the case a cursor of seconds alone
     // gets wrong in one direction or the other.
-    let games: Vec<PaipuyaGame> = (0..6)
-        .map(|n| PaipuyaGame {
+    let games: Vec<GameUuid> = (0..6)
+        .map(|n| GameUuid {
             uuid: uuid(n),
             mode_id: 16,
             started_at: base + TimeDelta::seconds(if n == 0 { 0 } else { n as i64 - 1 }),
-            ended_at: base + TimeDelta::seconds(n as i64 + 600),
-            players: vec![format!("p{n}a"), format!("p{n}b")],
-            account_ids: vec![n as u64, n as u64 + 100],
-            scores: vec![25_000, 25_000],
         })
         .collect();
-    catalog.insert_paipuya_games(&games).await.unwrap();
-    // Written twice, exactly as the sync does at every page boundary: it
-    // re-requests from the last game's own second so nothing is skipped. The
-    // page must not hand the walk the same game twice.
-    catalog.insert_paipuya_games(&games[..1]).await.unwrap();
+    catalog.insert_game_uuids(&games).await.unwrap();
+    // Written twice, exactly as re-importing an overlapping date range does.
+    // The page must not hand the walk the same game twice.
+    catalog.insert_game_uuids(&games[..1]).await.unwrap();
 
     let mut ordered: Vec<(DateTime<Utc>, String)> = games
         .iter()
@@ -2986,7 +2981,7 @@ async fn walks_the_paipuya_catalogue_by_keyset_and_skips_the_games_already_claim
     ordered.sort();
 
     // Start one game short of the range so the first page is this test's rows.
-    let mut cursor = Some(PaipuyaPosition {
+    let mut cursor = Some(SweepPosition {
         started_at: base - TimeDelta::seconds(1),
         uuid: String::new(),
     });
@@ -3001,14 +2996,17 @@ async fn walks_the_paipuya_catalogue_by_keyset_and_skips_the_games_already_claim
             page_number < 12,
             "the walk did not reach the end of its rows"
         );
-        let page = catalog.paipuya_listings(cursor.as_ref(), 2).await.unwrap();
+        let page = catalog
+            .game_uuid_listings(cursor.as_ref(), 2)
+            .await
+            .unwrap();
         if page.is_empty() {
             break;
         }
-        cursor = page.last().map(|listing| listing.position.clone());
+        cursor = page.last().cloned();
         seen.extend(
             page.into_iter()
-                .map(|listing| (listing.position.started_at, listing.position.uuid))
+                .map(|position| (position.started_at, position.uuid))
                 .filter(|(_, uuid)| uuid.contains(&run.to_string())),
         );
         if seen.len() >= ordered.len() {
@@ -3023,7 +3021,7 @@ async fn walks_the_paipuya_catalogue_by_keyset_and_skips_the_games_already_claim
 
     // The cursor the walk actually keeps, round-tripped. It is the difference
     // between a restart costing one page and a restart costing the catalogue.
-    let resume = PaipuyaPosition {
+    let resume = SweepPosition {
         started_at: ordered[2].0,
         uuid: ordered[2].1.clone(),
     };
@@ -3065,6 +3063,80 @@ async fn walks_the_paipuya_catalogue_by_keyset_and_skips_the_games_already_claim
     let window = SeriesWindow::recent(SeriesUnit::Day, 7);
     let gap = catalog.paipuya_gap(window).await.unwrap();
     assert!(gap.missing <= gap.listed);
+
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+/// The one thing each of the two game tables must not be allowed to hold,
+/// refused at the door.
+///
+/// Both were held at once, and neither failure raised anything. A catalogue row
+/// with no players matches nothing, so the comparison card counted 191 million
+/// of them as missing and read 100%. A 牌谱屋 short id is not a uuid Mahjong
+/// Soul serves, so the walk spent one rate-limited request per row to be told
+/// the game does not exist — which logs identically to a game that has aged out.
+#[tokio::test]
+async fn refuses_catalogue_rows_and_work_list_rows_that_could_never_work() {
+    let (state, data_dir) = test_state().await;
+    let post = |uri: &'static str, body: String| {
+        api::router(state.clone()).oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+    };
+    let started_at = DateTime::from_timestamp(4_100_000_000, 0).unwrap();
+
+    let unmatchable = PaipuyaGame {
+        uuid: "260716-0000-0000-0000-000000000001".to_owned(),
+        mode_id: 16,
+        started_at,
+        ended_at: started_at + TimeDelta::seconds(600),
+        players: Vec::new(),
+        account_ids: Vec::new(),
+        scores: Vec::new(),
+    };
+    let response = post(
+        "/api/v1/paipuya/games",
+        serde_json::json!({ "games": [unmatchable] }).to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // What 牌谱屋 actually returns for every game: `_masked`, with an
+    // 11-character base58 id sitting in the `uuid` field.
+    let unfetchable = GameUuid {
+        uuid: "98yKIfZs7vZ".to_owned(),
+        mode_id: 16,
+        started_at,
+    };
+    let response = post(
+        "/api/v1/games/uuids",
+        serde_json::json!({ "games": [unfetchable] }).to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // The same row with a uuid Mahjong Soul would answer to is accepted, so the
+    // guard is the short id and not the endpoint being unreachable.
+    let fetchable = GameUuid {
+        uuid: format!("260716-{}", Uuid::new_v4()),
+        mode_id: 16,
+        started_at,
+    };
+    let response = post(
+        "/api/v1/games/uuids",
+        serde_json::json!({ "games": [fetchable] }).to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 
     std::fs::remove_dir_all(data_dir).unwrap();
 }

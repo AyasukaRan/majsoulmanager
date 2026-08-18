@@ -39,7 +39,7 @@ use crate::{
     },
     catalog::{
         CatalogError, Cursor, DEFAULT_TREND_SPAN, DownloadCounts, DownloadFormat, DownloadJob,
-        DownloadRequest, JobState, PaipuyaGame, PaipuyaGap, PaipuyaTotals, PlayerHit,
+        DownloadRequest, GameUuid, JobState, PaipuyaGame, PaipuyaGap, PaipuyaTotals, PlayerHit,
         PlayerSummary, Record, RecordFilter, RecordStats, RuleFilter, Series, SeriesUnit,
         SeriesWindow, StorageStats,
     },
@@ -97,6 +97,9 @@ pub fn router(state: AppState) -> Router {
         // Loading the catalogue changes what the pool will go and fetch, so it
         // sits with the rest of what an administrator decides.
         .route("/api/v1/paipuya/games", post(post_paipuya_games))
+        // The other half of the same decision: which uuids the pool may spend a
+        // request on. Not under `/paipuya/` — 牌谱屋 never served these.
+        .route("/api/v1/games/uuids", post(post_game_uuids))
         .route("/api/v1/paipuya/config", put(put_paipuya_config))
         .route("/api/v1/paipuya/actions", post(post_paipuya_action))
         .route(
@@ -1420,6 +1423,46 @@ async fn post_paipuya_games(
         )));
     }
     state.catalog.insert_paipuya_games(&batch.games).await?;
+    Ok(Json(PaipuyaAccepted {
+        accepted: batch.games.len(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct GameUuidBatch {
+    games: Vec<GameUuid>,
+}
+
+/// Adds full game uuids to the re-fetch walk's work list — what `majsoul2mjai`
+/// resolved for a date range, sent here so the pool has something it can
+/// actually ask Mahjong Soul for.
+///
+/// Deliberately a different table and a different endpoint from
+/// `post_paipuya_games`. 牌谱屋 masks every listing this deployment's key can
+/// see, so what that endpoint stores is an 11-character short id; both were in
+/// one column for a while and both readers broke silently.
+async fn post_game_uuids(
+    State(state): State<AppState>,
+    Json(batch): Json<GameUuidBatch>,
+) -> Result<Json<PaipuyaAccepted>, ApiError> {
+    if batch.games.len() > MAX_PAIPUYA_BATCH {
+        return Err(ApiError::BadRequest(format!(
+            "a batch must not exceed {MAX_PAIPUYA_BATCH} games"
+        )));
+    }
+    // Refused rather than stored, because the walk hands these straight to
+    // `fetchGameRecord`, which answers "no such game" to a short id — one
+    // spent request per row, and a log line that reads like ordinary
+    // attrition. A 牌谱屋 short id is 11 characters of base58 with no
+    // separator; every uuid Mahjong Soul issues has one.
+    if let Some(short) = batch.games.iter().find(|game| !game.uuid.contains('-')) {
+        return Err(ApiError::BadRequest(format!(
+            "game uuid {} looks like a 牌谱屋 short id, which Mahjong Soul will not serve; \
+             resolve it to a full uuid first",
+            short.uuid
+        )));
+    }
+    state.catalog.insert_game_uuids(&batch.games).await?;
     Ok(Json(PaipuyaAccepted {
         accepted: batch.games.len(),
     }))

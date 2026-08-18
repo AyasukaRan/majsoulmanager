@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 把本地枚举出来的 4 麻历史 uuid 导入 mjai.paipuya_games。
+# 把本地枚举出来的 4 麻历史 uuid 导入 mjai.game_uuids —— 补抓走查的工作清单。
 #
 # 数据来自 majsoul2mjai 的 rust-state, 分在两个文件里, 都以 (mode, short_uuid) 为键:
 #   resolved.tsv   mode \t short_uuid \t full_uuid            ← 雀魂要的完整 uuid
@@ -8,16 +8,17 @@
 # 做两亿行的 join 是几十秒的事 —— 所以两张 Log 引擎临时表各自灌进去, 一条
 # INSERT ... SELECT 收尾。
 #
-# 落到 mjai.paipuya_games 而不是新建表, 是因为要的正是那张表的消费方: refetch 的
-# 牌谱屋走查 (one_paipuya_pass) 按 (started_at, uuid) 分页, 先用 claimed_games 一次
-# 索引查询滤掉本地已有的, 再去雀魂取剩下的。换张表就得把那条链路重写一遍。
+# ⚠ 不要往 mjai.paipuya_games 灌 —— 那张表是牌谱屋目录, 存的是 11 位短 id 加昵称,
+#   只服务控制台那张缺口对比卡片 (paipuya_gap, 按开始时间和昵称集合匹配)。这批行没有
+#   昵称, 灌进去的后果是那张卡片对它们永远算成缺失, 实测报过 100%。两张表两个用途,
+#   细节见 migrations/clickhouse/004_game_uuids.sql。
 #
-# ⚠ players/scores 留空 —— 这两个文件里没有昵称。后果是控制台那张"缺口对比"卡片
-#   (paipuya_gap) 对这批行永远算成缺失: 它按 (开始时间, 排序后的昵称集合) 匹配, 空集
-#   配不上任何一局。补抓走查本身不受影响, 它按 uuid 判重。
+# ⚠ 这个脚本绕过 POST /api/v1/games/uuids 上那道"必须是完整 uuid"的守卫。它存在只是
+#   因为首次全量灌 1.91 亿行走 HTTP 要几千个来回, 直连是十几分钟。日常按区间增量用
+#   majsoul2mjai push-uuids, 那条路有守卫。
 #
 # ⚠ 1.91 亿局按补抓池现实吞吐是以年计的。导入本身很便宜 (几个 GB), 但它是个工作清单
-#   不是计划表 —— 配合 refetch 的 paipuya_from 圈定真正要的区间。
+#   不是计划表 —— 配合 refetch 的"从哪一天开始走"圈定真正要的区间。
 #
 # ── 两种跑法 ────────────────────────────────────────────────────────────────
 # 【本地】数据文件和 ClickHouse 在同一台机器上 —— 这是搬到局域网之后的常态, 因为那两个
@@ -110,28 +111,19 @@ push "$RESOLVED" import_4p_resolved 1,2,3
 echo "== 3/4 灌 short (mode, short_uuid, start_time) =="
 push "$SHORT" import_4p_short 1,2,3
 
-echo "== 4/4 连接并写入 paipuya_games =="
+echo "== 4/4 连接并写入 game_uuids =="
 # start_time 是 unix 秒。走 fromUnixTimestamp64Milli(x*1000) 而不是 toDateTime64(x,3):
 # 后者对整数入参的量纲是有歧义的 (秒还是 scale 后的单位), 猜错就是整批数据差 1000 倍。
 #
 # join_algorithm: 默认的哈希连接会把右表整个装进内存, 两亿行在这里是几个 G, 服务器
 # 未必扛得住。grace_hash 会溢写到磁盘, full_sorting_merge 兜底。
-# synced_at 显式给一个很旧的值, 而不是让它默认 now()。
-#
-# 它是 ReplacingMergeTree 的版本列 —— 同一个排序键 (started_at, uuid) 上保留版本最大
-# 的那条。牌谱屋同步写进来的行【带昵称】, 这里导入的行没有; 万一两边撞上同一个键,
-# 必须让带昵称的那条赢。给导入的行一个 1970 年, 这个方向就永远成立: 已经在表里的赢,
-# 之后同步补上的也赢。
-#
-# 目前其实撞不上 —— 同步存的是牌谱屋的 11 位短 id, 这里存的是雀魂的完整 uuid, 两个
-# 命名空间不相交。但那本身是个 bug (短 id 喂不进 fetchGameRecord), 修好之后就会撞,
-# 所以这个保险现在就上。synced_at 没有任何查询读, 只有引擎用。
-ch "INSERT INTO $DB.paipuya_games (uuid, mode_id, started_at, ended_at, players, account_ids, scores, synced_at)
+# imported_at 显式给 1970 而不是让它默认 now()。它是 ReplacingMergeTree 的版本列 ——
+# 同一个 (started_at, uuid) 上保留版本最大的那条。这批是批量灌进来的底料, 之后从
+# push-uuids 推同一局时版本更大, 赢的是后推的那条。没有查询读这一列, 只有引擎用。
+ch "INSERT INTO $DB.game_uuids (uuid, mode_id, started_at, imported_at)
     SELECT r.uuid,
            r.mode,
            fromUnixTimestamp64Milli(toInt64(s.start_time) * 1000, 'UTC'),
-           fromUnixTimestamp64Milli(toInt64(s.start_time) * 1000, 'UTC'),
-           [], [], [],
            toDateTime64('1970-01-01 00:00:00', 3, 'UTC')
     FROM $DB.import_4p_resolved AS r
     INNER JOIN $DB.import_4p_short AS s
@@ -142,8 +134,10 @@ ch "INSERT INTO $DB.paipuya_games (uuid, mode_id, started_at, ended_at, players,
 echo "== 结果 =="
 # 别名一律 ASCII: 这条查询要穿过 ssh 的一层引号, 中文标识符在那里会被拆坏,
 # ClickHouse 收到的是半个 UTF-8 序列, 报的是看不懂的 Unrecognized token。
-ch "SELECT count() AS games, min(started_at) AS earliest, max(started_at) AS latest FROM $DB.paipuya_games"
-ch "SELECT mode_id, count() AS games, countIf(length(players) = 0) AS imported FROM $DB.paipuya_games GROUP BY mode_id ORDER BY mode_id"
+ch "SELECT count() AS games, min(started_at) AS earliest, max(started_at) AS latest FROM $DB.game_uuids"
+# 短 id 一条都不该有 —— 有就是接错了文件, 那批行会让走查每局花一个请求换一句
+# 「雀魂没有提供这局的牌谱」。
+ch "SELECT mode_id, count() AS games, countIf(position(uuid, '-') = 0) AS short_ids FROM $DB.game_uuids GROUP BY mode_id ORDER BY mode_id"
 
 echo
 echo "临时表还留着, 核对完自己删 (两张加起来约 10GB):"

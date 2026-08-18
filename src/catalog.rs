@@ -27,10 +27,11 @@ const POSTGRES_SCHEMA: &str = include_str!("../migrations/postgres.sql");
 /// Applied in order at every boot, each statement separately. Splitting the
 /// schema across files rather than growing one keeps a table's definition, its
 /// comments and its later `ALTER`s in one place.
-const CLICKHOUSE_SCHEMA: [&str; 3] = [
+const CLICKHOUSE_SCHEMA: [&str; 4] = [
     include_str!("../migrations/clickhouse/001_records.sql"),
     include_str!("../migrations/clickhouse/002_player_games.sql"),
     include_str!("../migrations/clickhouse/003_paipuya_games.sql"),
+    include_str!("../migrations/clickhouse/004_game_uuids.sql"),
 ];
 
 const RECORDS_TABLE: &str = "mjai.records";
@@ -1682,7 +1683,7 @@ mod tests {
     /// while reporting the catalogue swept.
     #[test]
     fn the_catalogue_page_keeps_its_index_and_does_not_shadow_its_own_column() {
-        let paged = paipuya_listings_sql(true);
+        let paged = game_uuid_listings_sql(true);
         assert!(
             paged.contains("AS started_ms") && !paged.contains("AS started_at"),
             "the conversion must not be aliased onto the column it reads: {paged}"
@@ -1700,12 +1701,12 @@ mod tests {
         );
         // FINAL does not stop early for a LIMIT — it reads the rest of the key
         // range — which at half a billion rows is the whole table, once a page.
-        for sql in [paged.as_str(), &paipuya_listings_sql(false)] {
+        for sql in [paged.as_str(), &game_uuid_listings_sql(false)] {
             assert!(!sql.contains("FINAL"), "{sql}");
             assert!(sql.contains("ORDER BY started_at, uuid"), "{sql}");
         }
         // The first page has no cursor and therefore no predicate at all.
-        assert!(!paipuya_listings_sql(false).contains("WHERE"));
+        assert!(!game_uuid_listings_sql(false).contains("WHERE"));
     }
 
     #[test]
@@ -2201,6 +2202,30 @@ impl Catalog {
         Ok(())
     }
 
+    /// Adds full game uuids to the re-fetch walk's work list.
+    ///
+    /// Re-importing an overlapping range is expected — the enumerator resumes by
+    /// date range — and a repeat collapses at the next merge, the same way the
+    /// catalogue's own page-boundary duplicate does.
+    pub async fn insert_game_uuids(&self, games: &[GameUuid]) -> Result<(), CatalogError> {
+        if games.is_empty() {
+            return Ok(());
+        }
+        let rows: Vec<String> = games
+            .iter()
+            .map(|game| {
+                serde_json::json!({
+                    "uuid": game.uuid,
+                    "mode_id": game.mode_id,
+                    "started_at": game.started_at.timestamp_millis(),
+                })
+                .to_string()
+            })
+            .collect();
+        self.index.insert(GAME_UUIDS_TABLE, rows.join("\n")).await?;
+        Ok(())
+    }
+
     /// How many games 牌谱屋 lists in a window, and how many of them this corpus
     /// is missing.
     ///
@@ -2341,20 +2366,33 @@ impl Catalog {
     /// The whole catalogue's size and span, for the console to show without
     /// asking for a window first.
     pub async fn paipuya_totals(&self) -> Result<PaipuyaTotals, CatalogError> {
+        self.table_totals(PAIPUYA_TABLE).await
+    }
+
+    /// How many game uuids the walk has to work through, and the range they
+    /// span. Deliberately not `paipuya_totals`: that counts what 牌谱屋 listed,
+    /// and none of those short ids is something Mahjong Soul will serve.
+    pub async fn game_uuid_totals(&self) -> Result<PaipuyaTotals, CatalogError> {
+        self.table_totals(GAME_UUIDS_TABLE).await
+    }
+
+    /// Row count and `started_at` range of one of the two game tables.
+    ///
+    /// No FINAL: these are headline counts, and the same reasoning `stats`
+    /// documents applies — a re-synced or re-imported window reads a few rows
+    /// high until the parts merge.
+    async fn table_totals(&self, table: &str) -> Result<PaipuyaTotals, CatalogError> {
         #[derive(Default, Deserialize)]
         struct Row {
             games: u64,
             earliest: i64,
             latest: i64,
         }
-        // No FINAL: this is a headline count, and the same reasoning `stats`
-        // documents applies — a re-synced window reads a few rows high until
-        // the parts merge.
         let sql = format!(
             "SELECT count() AS games, \
              toUnixTimestamp(min(started_at)) AS earliest, \
              toUnixTimestamp(max(started_at)) AS latest \
-             FROM {PAIPUYA_TABLE}"
+             FROM {table}"
         );
         let rows: Vec<Row> = self.index.query(&sql, &[]).await?;
         let row = rows.into_iter().next().unwrap_or_default();
@@ -2369,8 +2407,13 @@ impl Catalog {
         })
     }
 
-    /// One page of the catalogue in its own sorting-key order, for the walk that
-    /// hands uuids to the re-fetch pool.
+    /// One page of known game uuids in the table's own sorting-key order, for
+    /// the walk that hands them to the re-fetch pool.
+    ///
+    /// Reads `mjai.game_uuids`, not `mjai.paipuya_games`. 牌谱屋 masks every
+    /// listing this deployment's key can see, so its `uuid` column holds an
+    /// 11-character short id — which `fetchGameRecord` refuses. The catalogue
+    /// answers "what is missing"; this answers "what can be asked for".
     ///
     /// Three things here are load-bearing and each of them is a silent failure
     /// rather than an error when it is got wrong.
@@ -2397,38 +2440,36 @@ impl Catalog {
     /// is the whole table per page. What it would have hidden is the duplicate
     /// the sync writes at each of its own page boundaries by design, and that is
     /// one adjacent pair in an ordered page, so the caller drops it.
-    pub async fn paipuya_listings(
+    pub async fn game_uuid_listings(
         &self,
-        after: Option<&PaipuyaPosition>,
+        after: Option<&SweepPosition>,
         limit: usize,
-    ) -> Result<Vec<PaipuyaListing>, CatalogError> {
+    ) -> Result<Vec<SweepPosition>, CatalogError> {
         #[derive(Deserialize)]
         struct Row {
             uuid: String,
             started_ms: i64,
         }
-        let sql = paipuya_listings_sql(after.is_some());
+        let sql = game_uuid_listings_sql(after.is_some());
         let mut params: Vec<(&str, String)> = vec![("limit", limit.to_string())];
         if let Some(after) = after {
             params.push(("after_ms", after.started_at.timestamp_millis().to_string()));
             params.push(("after_uuid", after.uuid.clone()));
         }
         let rows: Vec<Row> = self.index.query(&sql, &params).await?;
-        let mut listings: Vec<PaipuyaListing> = rows
+        let mut page: Vec<SweepPosition> = rows
             .into_iter()
             .filter_map(|row| {
-                Some(PaipuyaListing {
-                    position: PaipuyaPosition {
-                        started_at: DateTime::from_timestamp_millis(row.started_ms)?,
-                        uuid: row.uuid,
-                    },
+                Some(SweepPosition {
+                    started_at: DateTime::from_timestamp_millis(row.started_ms)?,
+                    uuid: row.uuid,
                 })
             })
             .collect();
         // Adjacent, because the page is ordered by the pair a ReplacingMergeTree
         // row is identified by.
-        listings.dedup_by(|a, b| a.position == b.position);
-        Ok(listings)
+        page.dedup();
+        Ok(page)
     }
 
     /// Which of these games have ever been stored, asked of the one place that
@@ -2457,23 +2498,20 @@ impl Catalog {
 
     /// Where a named walk left off, or `None` if it has never run or has
     /// finished a full pass over its source.
-    pub async fn refetch_cursor(
-        &self,
-        walk: &str,
-    ) -> Result<Option<PaipuyaPosition>, CatalogError> {
+    pub async fn refetch_cursor(&self, walk: &str) -> Result<Option<SweepPosition>, CatalogError> {
         let row: Option<(DateTime<Utc>, String)> =
             sqlx::query_as("SELECT started_at, uuid FROM refetch_cursor WHERE walk = $1")
                 .bind(walk)
                 .fetch_optional(&self.postgres)
                 .await?;
-        Ok(row.map(|(started_at, uuid)| PaipuyaPosition { started_at, uuid }))
+        Ok(row.map(|(started_at, uuid)| SweepPosition { started_at, uuid }))
     }
 
     /// Moves that bookmark, after the page it describes has been fetched.
     pub async fn set_refetch_cursor(
         &self,
         walk: &str,
-        position: &PaipuyaPosition,
+        position: &SweepPosition,
     ) -> Result<(), CatalogError> {
         sqlx::query(
             "INSERT INTO refetch_cursor (walk, started_at, uuid) VALUES ($1, $2, $3) \
@@ -2515,6 +2553,9 @@ impl Catalog {
 }
 
 const PAIPUYA_TABLE: &str = "mjai.paipuya_games";
+/// Full uuids the re-fetch walk can hand to Mahjong Soul. Not `PAIPUYA_TABLE`:
+/// see `migrations/clickhouse/004_game_uuids.sql` for why the two are apart.
+const GAME_UUIDS_TABLE: &str = "mjai.game_uuids";
 
 /// One game as 牌谱屋 lists it. Not a record: this deployment may or may not
 /// have the game itself.
@@ -2532,15 +2573,15 @@ pub struct PaipuyaGame {
     pub scores: Vec<i32>,
 }
 
-/// The statement [`Catalog::paipuya_listings`] sends, apart from its bindings.
+/// The statement [`Catalog::game_uuid_listings`] sends, apart from its bindings.
 ///
 /// Split out so the three rules its doc comment states can be asserted, because
 /// every one of them fails silently: the alias shadow returns a correct-looking
 /// page for ever, the missing scalar bound is only slow, and `FINAL` is only
 /// slower. None of them raises an error, and none of them is visible in a result.
-fn paipuya_listings_sql(with_cursor: bool) -> String {
+fn game_uuid_listings_sql(with_cursor: bool) -> String {
     let mut sql = format!(
-        "SELECT uuid, toUnixTimestamp64Milli(started_at) AS started_ms FROM {PAIPUYA_TABLE}"
+        "SELECT uuid, toUnixTimestamp64Milli(started_at) AS started_ms FROM {GAME_UUIDS_TABLE}"
     );
     if with_cursor {
         sql.push_str(
@@ -2553,19 +2594,23 @@ fn paipuya_listings_sql(with_cursor: bool) -> String {
     sql
 }
 
-/// A keyset position in `mjai.paipuya_games`, which is its whole sorting key.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PaipuyaPosition {
-    pub started_at: DateTime<Utc>,
+/// One row of the re-fetch walk's work list: a game uuid Mahjong Soul will
+/// accept. Nothing about the game itself — the protobuf that comes back
+/// describes it, and a second copy here would be the one to go stale.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GameUuid {
     pub uuid: String,
+    pub mode_id: i32,
+    pub started_at: DateTime<Utc>,
 }
 
-/// One catalogued game as the walk reads it: enough to fetch it and enough to
-/// say where the walk has got to. The players and the mode stay in ClickHouse —
-/// the protobuf that comes back describes itself.
-#[derive(Clone, Debug)]
-pub struct PaipuyaListing {
-    pub position: PaipuyaPosition,
+/// A keyset position in `mjai.game_uuids`, which is its whole sorting key —
+/// and everything the walk needs from a row, because the protobuf that comes
+/// back describes itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SweepPosition {
+    pub started_at: DateTime<Utc>,
+    pub uuid: String,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]

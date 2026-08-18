@@ -89,7 +89,7 @@ function RefetchStatusCard({
   const progress = status?.progress;
   const backlog = status?.backlog ?? null;
   const done = progress?.replaced ?? 0;
-  const sweeping = work === "paipuya_gap";
+  const sweeping = work === "known_games";
   // No bar for the sweep, and not because one is hard to draw. 牌谱屋 lists
   // three orders of magnitude more games than this corpus holds, so a
   // percentage would be this run's fetches over a number no year of fetching
@@ -342,16 +342,16 @@ function RefetchConfigCard({
             }
           >
             <option value="missing_pb">补索引里缺的原始牌谱</option>
-            <option value="paipuya_gap">抓牌谱屋收录、本地没有的对局</option>
+            <option value="known_games">抓已知 uuid、本地没有的对局</option>
           </select>
           <span className="block font-normal text-muted-foreground">
-            {config.work === "paipuya_gap"
-              ? "按开局时间走查上面同步下来的收录，每页先查一次「这局存过没有」，只有没存过的才发雀魂请求。走到哪存在库里，重启接着走；走完一遍回到开头重试被拒的。牌谱屋收录五亿多局，这个走查不会「跑完」。"
+            {config.work === "known_games"
+              ? "按开局时间走查 mjai.game_uuids 里的完整对局 uuid（majsoul2mjai 枚举解析出来的那批），每页先查一次「这局存过没有」，只有没存过的才发雀魂请求。走到哪存在库里，重启接着走；走完一遍回到开头重试被拒的。清单有一亿九千多万条，这个走查不会「跑完」。走的不是上面同步下来的牌谱屋收录——那边给的是 11 位短 id，雀魂不认。"
               : "重新抓取转换器修好之前入库那批记录的原始牌谱，替换索引里那一行。这一批是有限的，抓完就停。"}
           </span>
         </label>
 
-        {config.work === "paipuya_gap" ? (
+        {config.work === "known_games" ? (
           <label className="block space-y-1.5 text-xs font-medium">
             从哪一天开始走
             {/* Only the field is narrow. Constraining the label narrowed the
@@ -360,18 +360,18 @@ function RefetchConfigCard({
             <Input
               className="sm:max-w-[220px]"
               type="date"
-              value={config.paipuya_from?.slice(0, 10) ?? ""}
+              value={config.sweep_from?.slice(0, 10) ?? ""}
               onChange={(event) =>
                 onChange({
                   ...config,
-                  paipuya_from: event.target.value
+                  sweep_from: event.target.value
                     ? `${event.target.value}T00:00:00Z`
                     : null,
                 })
               }
             />
             <span className="block font-normal text-muted-foreground">
-              {"只在没有走查位置时用一次，之后以库里存的位置为准。牌谱屋从 2019 年起收录，本地语料从 2026-07 才开始——不填就是从 2019 走起，那一段本地一局都没有、也没人量过雀魂还给不给这么早的牌谱，额度会先花在那里。"}
+              {"只在没有走查位置时用一次，之后以库里存的位置为准。uuid 清单从 2019 年起，本地语料从 2026-07 才开始——不填就是从 2019 走起，那一段本地一局都没有、也没人量过雀魂还给不给这么早的牌谱，额度会先花在那里。"}
             </span>
           </label>
         ) : null}

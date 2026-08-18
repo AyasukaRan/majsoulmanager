@@ -292,14 +292,14 @@ export type RefetchServiceConfig = {
   enabled: boolean;
   /**
    * Where the walk gets its uuids. `missing_pb` repairs rows already in the
-   * index and finishes; `paipuya_gap` sweeps what 牌谱屋 lists and does not.
+   * index and finishes; `known_games` sweeps the resolved uuid list and does not.
    */
-  work: "missing_pb" | "paipuya_gap";
+  work: "missing_pb" | "known_games";
   /**
    * Where the 牌谱屋 walk starts when it has no stored position. Only a seed —
    * once the walk has a cursor this is ignored.
    */
-  paipuya_from: string | null;
+  sweep_from: string | null;
   server: "cn" | "en" | "jp";
   proxy_mode: "direct" | "mihomo" | "custom";
   custom_proxy_url: string | null;
