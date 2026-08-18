@@ -20,7 +20,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -137,8 +137,27 @@ pub struct PaipuyaConfig {
     pub api_key_header: String,
     /// Modes to sweep. Empty means all twelve.
     pub modes: Vec<i32>,
-    /// Where a mode with no cursor starts.
+    /// The left edge of the window to sweep.
+    ///
+    /// A floor, not just a seed: a mode whose cursor sits before it is moved
+    /// forward to it. Otherwise moving this later would do nothing on any
+    /// deployment that had already swept — the cursor would win every time, and
+    /// the field would look like a setting while being a one-off.
+    ///
+    /// Moving it *earlier* still needs the cursors cleared, because a cursor
+    /// past a game is the only record that the game was already asked for.
+    /// `POST /api/v1/paipuya/cursors/reset` does that, deliberately as its own
+    /// action: re-sweeping is thousands of requests against somebody else's
+    /// free service, which is not something a config save should do quietly.
     pub start_from: DateTime<Utc>,
+    /// The right edge, or `None` for "keep up with 牌谱屋 forever".
+    ///
+    /// With one set, a mode stops when its cursor reaches it, and the sweep is
+    /// a job that finishes rather than a service that runs. That is what makes
+    /// a bounded window — one year, one month — something an operator can ask
+    /// for and watch complete.
+    #[serde(default)]
+    pub sync_until: Option<DateTime<Utc>>,
     /// The floor on the gap between two requests leaving this process, counting
     /// every worker together.
     pub request_interval_ms: u64,
@@ -159,6 +178,7 @@ impl Default for PaipuyaConfig {
             api_key_header: "authorization".into(),
             modes: Vec::new(),
             start_from: CATALOGUE_START.parse().expect("a valid catalogue start"),
+            sync_until: None,
             // One request per second, which is what this deployment asked for.
             // It is far above what the site grants an unkeyed caller, so
             // without a key the sync will spend most of its time being refused.
@@ -184,6 +204,16 @@ impl PaipuyaConfig {
         {
             return Err(WatchServiceError::InvalidConfig(
                 "api_key_header is not a valid header name".into(),
+            ));
+        }
+        // The site refuses a range narrower than ten seconds, so a window that
+        // small is not a small window — it is a sweep that returns immediately
+        // and looks finished.
+        if let Some(until) = self.sync_until
+            && (until - self.start_from).num_seconds() < 10
+        {
+            return Err(WatchServiceError::InvalidConfig(
+                "结束时间要比开始时间至少晚 10 秒（牌谱屋不接受更窄的区间）".into(),
             ));
         }
         if let Some(mode) = self
@@ -254,6 +284,25 @@ pub struct PaipuyaProgress {
     pub cursors: BTreeMap<i32, DateTime<Utc>>,
 }
 
+/// Where one mode stands, as the console shows it.
+///
+/// Read from PostgreSQL rather than from [`PaipuyaProgress::cursors`], which
+/// only holds the modes that moved during *this* run and is emptied on every
+/// start. A stopped deployment answering "nothing" to "how far did you get" is
+/// the thing this exists to avoid.
+#[derive(Clone, Debug, Serialize)]
+pub struct PaipuyaModeProgress {
+    pub mode_id: i32,
+    /// One of the twelve `{players}p-{room}-{length}` tokens, which the console
+    /// already has a Chinese label for — so the name lives in one place rather
+    /// than being spelled out again here.
+    pub rule: String,
+    pub next_from: DateTime<Utc>,
+    /// Games this mode has contributed across every run, not just this one.
+    pub synced_games: u64,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct PaipuyaStatus {
     pub phase: ServicePhase,
@@ -262,6 +311,19 @@ pub struct PaipuyaStatus {
     pub last_error: Option<String>,
     pub has_key: bool,
     pub progress: PaipuyaProgress,
+    /// The window being swept, so the console can place a cursor in it without
+    /// re-deriving what `sync_until` means when it is unset.
+    pub window_start: DateTime<Utc>,
+    /// `None` is "keep up with live play", which the console draws as now.
+    pub window_end: Option<DateTime<Utc>>,
+    /// This process's clock at the moment of the read.
+    ///
+    /// Sent rather than left to the browser because an unbounded window's right
+    /// edge is *this* machine's now — the same clock the cursors are stamped
+    /// against — and because a percentage computed from the reader's clock
+    /// would drift with whatever the reader's clock is doing.
+    pub now: DateTime<Utc>,
+    pub modes: Vec<PaipuyaModeProgress>,
 }
 
 impl Default for PaipuyaStatus {
@@ -273,7 +335,36 @@ impl Default for PaipuyaStatus {
             last_error: None,
             has_key: false,
             progress: PaipuyaProgress::default(),
+            window_start: CATALOGUE_START.parse().expect("a valid catalogue start"),
+            window_end: None,
+            now: Utc::now(),
+            modes: Vec::new(),
         }
+    }
+}
+
+/// Where a mode's next page starts: its own cursor, but never behind the
+/// window.
+///
+/// The clamp is what makes 开始时间 a setting rather than a seed. Without it a
+/// cursor always won, so moving the window forward changed nothing on any
+/// deployment that had already swept — the box would accept the edit, save it,
+/// and the sweep would carry on from 2019.
+///
+/// It is deliberately one-directional. A cursor *ahead* of the window is the
+/// sweep's own progress and is kept; widening the window backwards needs the
+/// cursors cleared, because re-reading years of catalogue is a cost somebody
+/// should have to ask for.
+fn sweep_from(cursor: Option<DateTime<Utc>>, start_from: DateTime<Utc>) -> DateTime<Utc> {
+    cursor.map_or(start_from, |cursor| cursor.max(start_from))
+}
+
+/// The rule token for a mode, or a readable stand-in for one this build does
+/// not know. Never an error: a status read must not fail over a label.
+fn rule_token(mode: i32) -> String {
+    match mode_metadata(mode) {
+        Ok((room, length, players)) => format!("{players}p-{room}-{length}"),
+        Err(_) => format!("mode-{mode}"),
     }
 }
 
@@ -379,11 +470,82 @@ impl PaipuyaSupervisor {
         self.config().published()
     }
 
-    pub fn status(&self) -> PaipuyaStatus {
+    /// The stored status with the window and every mode's stored position
+    /// folded in, so one console poll sees one consistent picture.
+    ///
+    /// The cursor read can fail — it is a database query on a page that is
+    /// mostly about something else — and when it does the answer is the rest of
+    /// the status rather than an error: the phase, the counters and the window
+    /// are all still true, and a page that renders none of them because
+    /// PostgreSQL hiccuped is worse than one missing its progress bars.
+    pub async fn status(&self) -> PaipuyaStatus {
+        let config = self.config();
         let mut status = self.runtime.read().clone();
-        status.has_key = self.config.read().api_key.is_some();
+        status.has_key = config.api_key.is_some();
         status.progress = self.progress.read().clone();
+        status.window_start = config.start_from;
+        status.window_end = config.sync_until;
+        status.now = Utc::now();
+        status.modes = match self.dependencies.catalog.paipuya_cursors().await {
+            Ok(cursors) => cursors
+                .into_iter()
+                .map(|cursor| PaipuyaModeProgress {
+                    mode_id: cursor.mode_id,
+                    rule: rule_token(cursor.mode_id),
+                    next_from: cursor.next_from,
+                    synced_games: cursor.synced_games,
+                    updated_at: cursor.updated_at,
+                })
+                .collect(),
+            Err(error) => {
+                tracing::warn!(%error, "读不到牌谱屋同步进度");
+                Vec::new()
+            }
+        };
         status
+    }
+
+    /// Sends every mode back to the start of the window. The catalogue keeps
+    /// its games and its totals; what moves is the position.
+    ///
+    /// Its own action rather than a side effect of saving the window, because
+    /// re-sweeping is thousands of requests against somebody else's free
+    /// service. It is needed whenever the window moves to somewhere a cursor
+    /// has already passed — widening it backwards, or setting an 结束时间 in the
+    /// past — because a cursor beyond the window makes every mode return with
+    /// nothing to do.
+    ///
+    /// The sweep is stopped first, and it has to be: `sync_mode` reads its
+    /// position once and then holds it in a local for the life of the mode, so
+    /// a rewind landing under a running sweep is written straight back after
+    /// the next page — for exactly the modes that were in flight, and not for
+    /// the others. That is a half-applied rewind reporting success, which is
+    /// worse than refusing.
+    pub async fn reset_cursors(&self) -> Result<u64, WatchServiceError> {
+        let running = self.runtime.read().phase != ServicePhase::Stopped;
+        if running {
+            self.stop().await;
+        }
+        let start_from = self.config().start_from;
+        let moved = self
+            .dependencies
+            .catalog
+            .rewind_paipuya_cursors(start_from)
+            .await
+            .map_err(|error| WatchServiceError::InvalidConfig(error.to_string()))?;
+        self.report(
+            WatchLogLevel::Warn,
+            format!(
+                "已把 {moved} 个模式的游标退回 {}{}",
+                start_from.format("%Y-%m-%d %H:%M:%S"),
+                if running {
+                    "，同步已停下，重新点「开始同步」才会走"
+                } else {
+                    "，下次同步从这里重新走一遍"
+                }
+            ),
+        );
+        Ok(moved)
     }
 
     pub async fn update_config(
@@ -425,7 +587,7 @@ impl PaipuyaSupervisor {
             WatchAction::Start | WatchAction::Reload => self.start().await?,
             WatchAction::Stop => self.stop().await,
         }
-        Ok(self.status())
+        Ok(self.status().await)
     }
 
     pub async fn start_if_enabled(self: &Arc<Self>) -> Result<(), WatchServiceError> {
@@ -477,6 +639,11 @@ impl PaipuyaSupervisor {
         // task per mode: the request rate is fixed by the pacer either way, and
         // this keeps the number of live HTTP connections to what was asked for.
         let queue = Arc::new(Mutex::new(config.selected_modes()));
+        // Counted down rather than joined. The handles belong to `self.tasks`
+        // so that `stop` can abort them, and a task that joined them would have
+        // to take them away first. Whichever worker takes this to zero is the
+        // one that saw the sweep end.
+        let live = Arc::new(AtomicUsize::new(config.concurrency));
         let mut tasks = Vec::with_capacity(config.concurrency);
         for _ in 0..config.concurrency {
             let supervisor = Arc::clone(self);
@@ -484,18 +651,22 @@ impl PaipuyaSupervisor {
             let client = client.clone();
             let pacer = Arc::clone(&pacer);
             let queue = Arc::clone(&queue);
+            let live = Arc::clone(&live);
             tasks.push(tokio::spawn(async move {
                 loop {
                     let Some(mode) = queue.lock().await.pop() else {
-                        return;
+                        break;
                     };
                     if supervisor.generation.load(Ordering::SeqCst) != generation {
-                        return;
+                        break;
                     }
                     if let Err(error) = supervisor.sync_mode(&config, &client, &pacer, mode).await {
                         supervisor.fail(&format!("模式 {mode} 同步中止：{error:#}"));
-                        return;
+                        break;
                     }
+                }
+                if live.fetch_sub(1, Ordering::SeqCst) == 1 {
+                    supervisor.complete(generation);
                 }
             }));
         }
@@ -504,6 +675,10 @@ impl PaipuyaSupervisor {
     }
 
     async fn stop(&self) {
+        // Moved before the abort so that a worker which finishes on its own in
+        // the same moment cannot report the sweep as completed: `complete`
+        // checks the generation it was started under.
+        self.generation.fetch_add(1, Ordering::SeqCst);
         self.stop_tasks().await;
         let mut runtime = self.runtime.write();
         runtime.phase = ServicePhase::Stopped;
@@ -532,6 +707,38 @@ impl PaipuyaSupervisor {
         self.dependencies.logs.append(level, LOG_SOURCE, message);
     }
 
+    /// The last worker's parting note: every mode is done and nothing is left
+    /// running.
+    ///
+    /// Without it a finished sweep leaves the console reading 同步中 for ever.
+    /// That was survivable while the sweep never ended — it only stopped when
+    /// it caught up with live play, and more games were always coming — and it
+    /// stops being survivable the moment 结束时间 makes this a job that
+    /// completes.
+    fn complete(&self, generation: u64) {
+        if self.generation.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        {
+            let mut runtime = self.runtime.write();
+            // A mode that gave up already said why, and that is the more useful
+            // thing for the page to go on showing.
+            if runtime.phase == ServicePhase::Failed {
+                return;
+            }
+            runtime.phase = ServicePhase::Stopped;
+            runtime.updated_at = Utc::now();
+        }
+        let progress = self.progress.read().clone();
+        self.report(
+            WatchLogLevel::Info,
+            format!(
+                "牌谱屋同步结束：本次收录 {} 局，请求 {} 次，被拒 {} 次",
+                progress.synced, progress.requests, progress.refused
+            ),
+        );
+    }
+
     fn fail(&self, message: &str) {
         {
             let mut runtime = self.runtime.write();
@@ -550,18 +757,48 @@ impl PaipuyaSupervisor {
         pacer: &Pacer,
         mode: i32,
     ) -> anyhow::Result<()> {
-        let mut from = self
-            .dependencies
-            .catalog
-            .paipuya_cursor(mode)
-            .await?
-            .unwrap_or(config.start_from);
+        let mut from = sweep_from(
+            self.dependencies.catalog.paipuya_cursor(mode).await?,
+            config.start_from,
+        );
         loop {
-            let to = Utc::now();
+            let to = config.sync_until.unwrap_or_else(Utc::now);
             // The site refuses a range narrower than ten seconds, and a cursor
-            // that has caught up with now is exactly that. Nothing to do until
-            // more games are played.
+            // that has reached the right edge is exactly that.
             if (to - from).num_seconds() < 10 {
+                // Said out loud only for a bounded window. Without one this is
+                // "caught up with live play", which the mode reports when its
+                // last page comes back short; with one it is the mode finishing
+                // the job, and an operator who set an end time is waiting to be
+                // told exactly that.
+                if config.sync_until.is_some() {
+                    if from > to {
+                        // Not finished — never started. The cursor is past the
+                        // window, so there is nothing between the two edges to
+                        // ask for, and calling that 已同步 would be a completed
+                        // job with zero requests behind it. This is the shape a
+                        // deployment lands in the moment it asks for a
+                        // *historical* window after having caught up, which is
+                        // the main reason to want an 结束时间 at all.
+                        self.report(
+                            WatchLogLevel::Warn,
+                            format!(
+                                "模式 {mode} 的游标在 {}，已经晚于设定的结束时间（{}），\
+                                 这一轮一个请求都没发；要重抓这一段，先点「重置游标」",
+                                from.format("%Y-%m-%d %H:%M:%S"),
+                                to.format("%Y-%m-%d %H:%M:%S")
+                            ),
+                        );
+                    } else {
+                        self.report(
+                            WatchLogLevel::Info,
+                            format!(
+                                "模式 {mode} 已同步到设定的结束时间（{}）",
+                                to.format("%Y-%m-%d %H:%M:%S")
+                            ),
+                        );
+                    }
+                }
                 return Ok(());
             }
             pacer.tick().await;
@@ -650,7 +887,12 @@ impl PaipuyaSupervisor {
                 self.report(
                     WatchLogLevel::Info,
                     format!(
-                        "模式 {mode} 已追平牌谱屋（走到 {}）",
+                        "模式 {mode} 已{}（走到 {}）",
+                        if config.sync_until.is_some() {
+                            "同步完设定区间"
+                        } else {
+                            "追平牌谱屋"
+                        },
                         from.format("%Y-%m-%d %H:%M:%S")
                     ),
                 );
@@ -714,6 +956,70 @@ mod tests {
         assert!(!config.enabled);
         assert!(config.api_key.is_none());
         assert_eq!(config.selected_modes().len(), 12, "all ranked modes");
+    }
+
+    /// The window's left edge has to beat a cursor behind it, or 开始时间 is a
+    /// box that accepts an edit and changes nothing.
+    #[test]
+    fn the_window_drags_a_lagging_cursor_forward_but_never_pushes_one_back() {
+        let day = |text: &str| text.parse::<DateTime<Utc>>().expect("a valid moment");
+        let window = day("2026-01-01T00:00:00Z");
+
+        // Never swept: the window is where it starts.
+        assert_eq!(sweep_from(None, window), window);
+        // Swept, but from before the window — moving 开始时间 forward skips
+        // ahead rather than being ignored.
+        assert_eq!(
+            sweep_from(Some(day("2019-09-01T00:00:00Z")), window),
+            window
+        );
+        // Swept past it: that is progress, and it is kept. Going back is what
+        // clearing the cursors is for.
+        let ahead = day("2026-06-01T00:00:00Z");
+        assert_eq!(sweep_from(Some(ahead), window), ahead);
+    }
+
+    /// A window narrower than the site's own minimum range is a sweep that
+    /// returns immediately and reads as finished.
+    #[test]
+    fn a_window_must_be_wide_enough_for_the_site_to_answer() {
+        let start = "2026-01-01T00:00:00Z"
+            .parse::<DateTime<Utc>>()
+            .expect("a valid moment");
+        let with_until = |seconds: i64| PaipuyaConfig {
+            start_from: start,
+            sync_until: Some(start + chrono::TimeDelta::seconds(seconds)),
+            ..PaipuyaConfig::default()
+        };
+        assert!(with_until(9).validate().is_err());
+        assert!(
+            with_until(-86_400).validate().is_err(),
+            "an end before the start"
+        );
+        assert!(with_until(10).validate().is_ok());
+        // And no end at all is the default: keep up with live play.
+        assert!(PaipuyaConfig::default().sync_until.is_none());
+    }
+
+    /// A configuration written before the window had a right edge.
+    #[test]
+    fn a_stored_configuration_without_an_end_keeps_meaning_forever() {
+        let document = serde_json::json!({
+            "revision": 4,
+            "enabled": true,
+            "base_url": "https://5-data.amae-koromo.com",
+            "api_key": null,
+            "api_key_header": "authorization",
+            "modes": [],
+            "start_from": "2019-08-23T00:00:00Z",
+            "request_interval_ms": 1_000,
+            "concurrency": 4,
+            "page_size": 500,
+        });
+        let config: PaipuyaConfig =
+            serde_json::from_value(document).expect("a pre-window document still loads");
+        assert!(config.sync_until.is_none());
+        config.validate().unwrap();
     }
 
     #[test]

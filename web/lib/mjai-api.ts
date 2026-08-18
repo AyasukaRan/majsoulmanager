@@ -401,11 +401,24 @@ export type PaipuyaConfig = {
   api_key: string | null;
   api_key_header: string;
   modes: number[];
+  /** Left edge of the window. A cursor behind it is dragged up to it. */
   start_from: string;
+  /** Right edge, or `null` for "keep up with live play forever". */
+  sync_until: string | null;
   /** Floor on the gap between two requests, counting every worker together. */
   request_interval_ms: number;
   concurrency: number;
   page_size: number;
+};
+
+/** Where one mode's sweep stands, as PostgreSQL holds it between runs. */
+export type PaipuyaModeProgress = {
+  mode_id: number;
+  /** One of the twelve rule tokens, for {@link ruleLabel}. */
+  rule: string;
+  next_from: string;
+  synced_games: number;
+  updated_at: string;
 };
 
 export type PaipuyaStatus = {
@@ -421,6 +434,12 @@ export type PaipuyaStatus = {
     refused: number;
     cursors: Record<string, string>;
   };
+  /** The window being swept; `window_end` null means "up to now". */
+  window_start: string;
+  window_end: string | null;
+  /** The backend's clock at the read, which is the right edge of an open window. */
+  now: string;
+  modes: PaipuyaModeProgress[];
 };
 
 export type InstalledWatchModule = {

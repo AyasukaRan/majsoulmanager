@@ -99,6 +99,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/paipuya/games", post(post_paipuya_games))
         .route("/api/v1/paipuya/config", put(put_paipuya_config))
         .route("/api/v1/paipuya/actions", post(post_paipuya_action))
+        .route(
+            "/api/v1/paipuya/cursors/reset",
+            post(post_paipuya_cursor_reset),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_admin_session,
@@ -1479,7 +1483,7 @@ async fn put_paipuya_config(
 }
 
 async fn get_paipuya_status(State(state): State<AppState>) -> Json<PaipuyaStatus> {
-    Json(state.paipuya.status())
+    Json(state.paipuya.status().await)
 }
 
 async fn post_paipuya_action(
@@ -1487,6 +1491,17 @@ async fn post_paipuya_action(
     Json(request): Json<WatchActionRequest>,
 ) -> Result<Json<PaipuyaStatus>, ApiError> {
     Ok(Json(state.paipuya.apply_action(request.action).await?))
+}
+
+/// Throws away every mode's position so the next sweep walks the window again.
+///
+/// A write, and behind the same admin gate as the rest of the sync's writes:
+/// what it costs is thousands of requests to somebody else's free service.
+async fn post_paipuya_cursor_reset(
+    State(state): State<AppState>,
+) -> Result<Json<PaipuyaStatus>, ApiError> {
+    state.paipuya.reset_cursors().await?;
+    Ok(Json(state.paipuya.status().await))
 }
 
 #[derive(Deserialize)]
