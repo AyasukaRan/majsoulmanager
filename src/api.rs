@@ -48,6 +48,7 @@ use crate::{
     mihomo::{MihomoAction, MihomoError, MihomoStatus, ProxySelection, SubscriptionUpdate},
     paipuya::{PaipuyaConfig, PaipuyaStatus},
     refetch_service::{RefetchRuntimeStatus, RefetchServiceConfig},
+    register_service::{AccountRegisterProgress, AccountRegisterRequest},
     watch_log::WatchLogEntry,
     watch_service::{
         InstallModuleRequest, InstalledModule, ServicePhase, WatchAction, WatchDashboard,
@@ -92,11 +93,23 @@ pub fn router(state: AppState) -> Router {
         // last login with each one did — but an account name is itself the thing
         // the route above is restricted for.
         .route("/api/v1/accounts/health", get(get_account_health))
+        .route(
+            "/api/v1/accounts/register/status",
+            get(get_account_register_status),
+        )
         .route("/api/v1/refetch/config", put(put_refetch_config))
         .route("/api/v1/refetch/actions", post(post_refetch_action))
         // Loading the catalogue changes what the pool will go and fetch, so it
         // sits with the rest of what an administrator decides.
         .route("/api/v1/paipuya/games", post(post_paipuya_games))
+        // Session-only, like everything else that decides what the deployment
+        // does. Registration creates credentials and spends somebody's mailboxes;
+        // the API key that collectors hold must not be able to start one.
+        .route("/api/v1/accounts/register", post(post_account_register))
+        .route(
+            "/api/v1/accounts/register/stop",
+            post(post_account_register_stop),
+        )
         .route("/api/v1/paipuya/config", put(put_paipuya_config))
         .route("/api/v1/paipuya/actions", post(post_paipuya_action))
         .route(
@@ -365,6 +378,40 @@ async fn get_account_health(
     State(state): State<AppState>,
 ) -> Json<BTreeMap<String, AccountHealth>> {
     Json(state.accounts.health())
+}
+
+/// Starts a registration run. Returns immediately with the opening progress —
+/// a batch takes tens of minutes, so the answer to "did it start" cannot wait
+/// for "did it finish".
+async fn post_account_register(
+    State(state): State<AppState>,
+    Json(request): Json<AccountRegisterRequest>,
+) -> Result<Json<AccountRegisterProgress>, ApiError> {
+    state.register.start(request)?;
+    Ok(Json(state.register.status()))
+}
+
+/// Ends the run after the account currently in flight.
+///
+/// Not sooner: an account abandoned midway exists on Mahjong Soul's side with a
+/// password that only lived inside the run.
+async fn post_account_register_stop(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let stopping = state.register.stop();
+    Json(serde_json::json!({
+        "stopping": stopping,
+        "status": state.register.status(),
+    }))
+}
+
+/// Where a registration run has got to, and what each account did.
+///
+/// Behind the same door as the account list: it names the addresses being
+/// registered. It carries no password and no mailbox credential — the password
+/// went into the pool, which is the only place it belongs.
+async fn get_account_register_status(
+    State(state): State<AppState>,
+) -> Json<AccountRegisterProgress> {
+    Json(state.register.status())
 }
 
 async fn put_accounts(

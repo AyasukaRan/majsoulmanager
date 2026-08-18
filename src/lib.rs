@@ -18,6 +18,7 @@ pub mod paipuya;
 pub mod recovery;
 pub mod refetch;
 pub mod refetch_service;
+pub mod register_service;
 pub mod replay;
 pub mod watch;
 pub mod watch_log;
@@ -35,6 +36,7 @@ use objects::Objects;
 use pack::PackStore;
 use paipuya::{PaipuyaDependencies, PaipuyaSupervisor};
 use refetch_service::{RefetchDependencies, RefetchSupervisor};
+use register_service::RegisterService;
 use watch::WatchRegistry;
 use watch_log::WatchLogBuffer;
 use watch_service::WatchSupervisor;
@@ -56,6 +58,10 @@ pub struct AppState {
     pub refetch: Arc<refetch::RefetchBroker>,
     pub refetch_service: Arc<RefetchSupervisor>,
     pub paipuya: Arc<PaipuyaSupervisor>,
+    /// Creating accounts. Holds the collectors' module store because that
+    /// is where an installed registrar lives, and the pool because a new
+    /// account has to be stored the moment it exists.
+    pub register: Arc<RegisterService>,
     pub export_dir: PathBuf,
 }
 
@@ -146,6 +152,11 @@ impl AppState {
             logs: Arc::clone(&watch_logs),
             watch: Arc::clone(&watch_service),
         })?);
+        let register = Arc::new(RegisterService::new(
+            watch_service.module_store(),
+            Arc::clone(&accounts),
+            Arc::clone(&watch_logs),
+        ));
         // Its own service, sharing only the log buffer: it never touches
         // Mahjong Soul, and the catalogue it writes is not the corpus.
         let paipuya = Arc::new(PaipuyaSupervisor::new(PaipuyaDependencies {
@@ -166,6 +177,7 @@ impl AppState {
             refetch,
             refetch_service,
             paipuya,
+            register,
             config: Arc::new(config),
             export_dir,
         })

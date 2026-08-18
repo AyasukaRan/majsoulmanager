@@ -2723,6 +2723,79 @@ fn watch_config_request(body: &str, session: &str) -> Request<Body> {
         .unwrap()
 }
 
+/// What a fresh deployment gets when it presses 开始注册.
+///
+/// Registration has no builtin — rustls cannot produce Chrome's ClientHello and
+/// a brand new account has nothing else to be judged on — so on a deployment
+/// with no registrar installed the button must say so. The failure this guards
+/// against is the run starting anyway and reporting a first account that failed
+/// somewhere deep in a module that was never there.
+///
+/// The empty batch is checked first and separately, because an operator who
+/// pasted nothing needs to hear about the empty box rather than about modules.
+#[tokio::test]
+async fn registration_says_what_is_missing_before_it_starts_anything() {
+    let (state, data_dir) = test_state().await;
+    let session = admin_session(&state);
+    let post = |body: &'static str| {
+        api::router(state.clone()).oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/accounts/register")
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-mjai-user-session", session.clone())
+                .body(Body::from(body))
+                .unwrap(),
+        )
+    };
+
+    let empty = post(r##"{"mailboxes":["   ","# 注释"]}"##).await.unwrap();
+    assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+    let reported = json_body(empty).await["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        reported.contains("邮箱凭据"),
+        "an empty batch should name the empty box, said: {reported}"
+    );
+
+    let unregistered = post(r#"{"mailboxes":["someone@example.com----key"]}"#)
+        .await
+        .unwrap();
+    assert_eq!(unregistered.status(), StatusCode::BAD_REQUEST);
+    let reported = json_body(unregistered).await["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        reported.contains("register") && reported.contains("模块"),
+        "a deployment with no registrar should be told which module to install, \
+         said: {reported}"
+    );
+
+    // Nothing started, so nothing is running and no mailbox was spent. Behind
+    // the session too: the status names the addresses being registered.
+    let status = api::router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/accounts/register/status")
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .header("x-mjai-user-session", session.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    let status = json_body(status).await;
+    assert_eq!(status["running"], false);
+    assert_eq!(status["total"], 0);
+
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
 /// The bootstrap administrator's session. Changing what the collectors do needs
 /// one: the machine key says the request came from a deployment that holds it,
 /// and cannot say who is behind it.
@@ -2739,13 +2812,18 @@ fn admin_session(state: &AppState) -> String {
 
 /// Every route that changes what the collectors do, so that one added to the
 /// table without the guard is caught here rather than in production.
-const COLLECTOR_CONTROL_ROUTES: [(&str, &str); 6] = [
+const COLLECTOR_CONTROL_ROUTES: [(&str, &str); 8] = [
     ("PUT", "/api/v1/watch/config"),
     ("POST", "/api/v1/watch/actions"),
     ("POST", "/api/v1/watch/modules"),
     ("PUT", "/api/v1/watch/proxy/subscription"),
     ("PUT", "/api/v1/watch/proxy/selection"),
     ("POST", "/api/v1/watch/proxy/actions"),
+    // Registration creates credentials and spends the operator's mailboxes.
+    // The machine key that every collector holds must not be able to start
+    // one, and neither must an ordinary member.
+    ("POST", "/api/v1/accounts/register"),
+    ("POST", "/api/v1/accounts/register/stop"),
 ];
 
 /// The console holds the machine key and attaches it to whatever a browser asks

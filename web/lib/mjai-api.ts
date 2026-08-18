@@ -280,6 +280,40 @@ export type AccountHealth = {
 /** Keyed by username, as the account document spells it. */
 export type AccountHealthMap = Record<string, AccountHealth>;
 
+/** One account a registration run tried to create. */
+export type AccountRegisterOutcome = {
+  /** The address only. The mailbox credential never leaves the backend. */
+  email: string;
+  ok: boolean;
+  account_id: number | null;
+  nickname: string | null;
+  /** Which step failed. Empty on success. */
+  stage: string;
+  detail: string;
+  at: string;
+};
+
+/**
+ * Where a registration run has got to.
+ *
+ * No passwords: a created account goes straight into the pool, disabled, and
+ * that is the only place its password exists. This is polled every few seconds
+ * while a run is going, which is not somewhere credentials should live.
+ */
+export type AccountRegisterProgress = {
+  running: boolean;
+  total: number;
+  done: number;
+  succeeded: number;
+  failed: number;
+  /** The address in flight, so a run inside a mailbox poll does not look stuck. */
+  current: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  message: string | null;
+  outcomes: AccountRegisterOutcome[];
+};
+
 /**
  * The re-fetch pool. It logs in with accounts of its own rather than borrowing a
  * collector's session, so `concurrency` is how many sessions run at once — and
