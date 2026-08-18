@@ -3078,16 +3078,22 @@ async fn walks_the_paipuya_catalogue_by_keyset_and_skips_the_games_already_claim
 #[tokio::test]
 async fn refuses_catalogue_rows_and_work_list_rows_that_could_never_work() {
     let (state, data_dir) = test_state().await;
-    let post = |uri: &'static str, body: String| {
-        api::router(state.clone()).oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(uri)
-                .header(header::AUTHORIZATION, "Bearer test-secret")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(body))
-                .unwrap(),
-        )
+    // Two endpoints, two ways in, and that is the point rather than an accident:
+    // the catalogue is loaded by an administrator in the console, the work list
+    // by a collector holding the API key. `majsoul2mjai push-uuids` has a key
+    // and no browser session, so putting the work list behind the admin group
+    // would answer 401 to the only caller it has.
+    let session = admin_session(&state);
+    let post = |uri: &'static str, body: String, admin: bool| {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, "Bearer test-secret");
+        if admin {
+            request = request.header("x-mjai-user-session", session.clone());
+        }
+        api::router(state.clone()).oneshot(request.body(Body::from(body)).unwrap())
     };
     let started_at = DateTime::from_timestamp(4_100_000_000, 0).unwrap();
 
@@ -3103,6 +3109,7 @@ async fn refuses_catalogue_rows_and_work_list_rows_that_could_never_work() {
     let response = post(
         "/api/v1/paipuya/games",
         serde_json::json!({ "games": [unmatchable] }).to_string(),
+        true,
     )
     .await
     .unwrap();
@@ -3118,6 +3125,7 @@ async fn refuses_catalogue_rows_and_work_list_rows_that_could_never_work() {
     let response = post(
         "/api/v1/games/uuids",
         serde_json::json!({ "games": [unfetchable] }).to_string(),
+        false,
     )
     .await
     .unwrap();
@@ -3133,6 +3141,7 @@ async fn refuses_catalogue_rows_and_work_list_rows_that_could_never_work() {
     let response = post(
         "/api/v1/games/uuids",
         serde_json::json!({ "games": [fetchable] }).to_string(),
+        false,
     )
     .await
     .unwrap();

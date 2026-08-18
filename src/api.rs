@@ -97,9 +97,6 @@ pub fn router(state: AppState) -> Router {
         // Loading the catalogue changes what the pool will go and fetch, so it
         // sits with the rest of what an administrator decides.
         .route("/api/v1/paipuya/games", post(post_paipuya_games))
-        // The other half of the same decision: which uuids the pool may spend a
-        // request on. Not under `/paipuya/` — 牌谱屋 never served these.
-        .route("/api/v1/games/uuids", post(post_game_uuids))
         .route("/api/v1/paipuya/config", put(put_paipuya_config))
         .route("/api/v1/paipuya/actions", post(post_paipuya_action))
         .route(
@@ -112,6 +109,12 @@ pub fn router(state: AppState) -> Router {
         ));
     let protected = Router::new()
         .route("/api/v1/records", post(ingest).get(search))
+        // Beside `/records` rather than with the `/paipuya/` routes, because it
+        // is the same kind of thing: a collector holding the API key posting
+        // what it found. The admin group is session-only — `majsoul2mjai
+        // push-uuids` has a key and no browser — and loading a work list is not
+        // a decision an administrator makes in the console.
+        .route("/api/v1/games/uuids", post(post_game_uuids))
         .route("/api/v1/records/batch", post(ingest_batch))
         .route("/api/v1/records/{id}", get(get_record))
         .route("/api/v1/records/{id}/raw", get(get_raw))
