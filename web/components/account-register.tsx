@@ -79,8 +79,11 @@ export function AccountRegisterCard() {
     }
   }, []);
 
+  // Off the render pass, the way the pool card loads its own document: a poll
+  // that resolves synchronously would set state inside the effect body.
   useEffect(() => {
-    void poll();
+    const initial = window.setTimeout(() => void poll(), 0);
+    return () => window.clearTimeout(initial);
   }, [poll]);
 
   // Only while something is running. A finished run's numbers do not change, and
