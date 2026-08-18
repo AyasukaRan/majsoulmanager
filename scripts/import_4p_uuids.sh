@@ -116,12 +116,23 @@ echo "== 4/4 连接并写入 paipuya_games =="
 #
 # join_algorithm: 默认的哈希连接会把右表整个装进内存, 两亿行在这里是几个 G, 服务器
 # 未必扛得住。grace_hash 会溢写到磁盘, full_sorting_merge 兜底。
-ch "INSERT INTO $DB.paipuya_games (uuid, mode_id, started_at, ended_at, players, account_ids, scores)
+# synced_at 显式给一个很旧的值, 而不是让它默认 now()。
+#
+# 它是 ReplacingMergeTree 的版本列 —— 同一个排序键 (started_at, uuid) 上保留版本最大
+# 的那条。牌谱屋同步写进来的行【带昵称】, 这里导入的行没有; 万一两边撞上同一个键,
+# 必须让带昵称的那条赢。给导入的行一个 1970 年, 这个方向就永远成立: 已经在表里的赢,
+# 之后同步补上的也赢。
+#
+# 目前其实撞不上 —— 同步存的是牌谱屋的 11 位短 id, 这里存的是雀魂的完整 uuid, 两个
+# 命名空间不相交。但那本身是个 bug (短 id 喂不进 fetchGameRecord), 修好之后就会撞,
+# 所以这个保险现在就上。synced_at 没有任何查询读, 只有引擎用。
+ch "INSERT INTO $DB.paipuya_games (uuid, mode_id, started_at, ended_at, players, account_ids, scores, synced_at)
     SELECT r.uuid,
            r.mode,
            fromUnixTimestamp64Milli(toInt64(s.start_time) * 1000, 'UTC'),
            fromUnixTimestamp64Milli(toInt64(s.start_time) * 1000, 'UTC'),
-           [], [], []
+           [], [], [],
+           toDateTime64('1970-01-01 00:00:00', 3, 'UTC')
     FROM $DB.import_4p_resolved AS r
     INNER JOIN $DB.import_4p_short AS s
       ON r.mode = s.mode AND r.short_uuid = s.short_uuid
@@ -129,8 +140,10 @@ ch "INSERT INTO $DB.paipuya_games (uuid, mode_id, started_at, ended_at, players,
     SETTINGS join_algorithm = 'grace_hash,full_sorting_merge'"
 
 echo "== 结果 =="
-ch "SELECT count() AS 总数, min(started_at) AS 最早, max(started_at) AS 最新 FROM $DB.paipuya_games"
-ch "SELECT mode_id, count() FROM $DB.paipuya_games GROUP BY mode_id ORDER BY mode_id"
+# 别名一律 ASCII: 这条查询要穿过 ssh 的一层引号, 中文标识符在那里会被拆坏,
+# ClickHouse 收到的是半个 UTF-8 序列, 报的是看不懂的 Unrecognized token。
+ch "SELECT count() AS games, min(started_at) AS earliest, max(started_at) AS latest FROM $DB.paipuya_games"
+ch "SELECT mode_id, count() AS games, countIf(length(players) = 0) AS imported FROM $DB.paipuya_games GROUP BY mode_id ORDER BY mode_id"
 
 echo
 echo "临时表还留着, 核对完自己删 (两张加起来约 10GB):"
