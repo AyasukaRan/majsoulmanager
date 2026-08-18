@@ -2268,6 +2268,53 @@ impl Catalog {
         Ok(row.map(|row| row.0))
     }
 
+    /// Every mode's bookmark, for the console to show where the sweep is.
+    ///
+    /// Read from here rather than from the supervisor's own counters because
+    /// those are per run: they start empty and are cleared on stop, so a
+    /// console asking a stopped deployment "how far did this get" would be told
+    /// nothing. This row survives both.
+    pub async fn paipuya_cursors(&self) -> Result<Vec<PaipuyaModeCursor>, CatalogError> {
+        let rows: Vec<(i32, DateTime<Utc>, i64, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT mode_id, next_from, synced_games, updated_at FROM paipuya_cursor \
+             ORDER BY mode_id",
+        )
+        .fetch_all(&self.postgres)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(mode_id, next_from, synced_games, updated_at)| PaipuyaModeCursor {
+                    mode_id,
+                    next_from,
+                    synced_games: synced_games.max(0) as u64,
+                    updated_at,
+                },
+            )
+            .collect())
+    }
+
+    /// Moves every mode's bookmark back to `next_from`, so the next sweep walks
+    /// the window again. The catalogue itself is untouched — what moves is the
+    /// position, not the games.
+    ///
+    /// An `UPDATE` rather than a `DELETE`, and that is the whole point of the
+    /// distinction: `synced_games` counts what this deployment has ever pulled
+    /// for that mode, which rewinding does not undo. Dropping the row reset it
+    /// to zero, and the console's 目录累计 — which is the sum of these — fell off
+    /// a cliff the moment somebody rewound.
+    pub async fn rewind_paipuya_cursors(
+        &self,
+        next_from: DateTime<Utc>,
+    ) -> Result<u64, CatalogError> {
+        let moved = sqlx::query("UPDATE paipuya_cursor SET next_from = $1, updated_at = now()")
+            .bind(next_from)
+            .execute(&self.postgres)
+            .await?
+            .rows_affected();
+        Ok(moved)
+    }
+
     /// Moves that bookmark, after the page it describes has landed. `added` is
     /// accumulated rather than replaced, so the row also says how much of the
     /// catalogue this deployment has ever pulled.
@@ -2534,6 +2581,17 @@ pub struct PaipuyaTotals {
     pub games: u64,
     pub earliest: Option<DateTime<Utc>>,
     pub latest: Option<DateTime<Utc>>,
+}
+
+/// Where one mode's sweep has got to, as the `paipuya_cursor` row holds it.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct PaipuyaModeCursor {
+    pub mode_id: i32,
+    /// The moment the next page will be asked for.
+    pub next_from: DateTime<Utc>,
+    /// Games this mode has contributed to the catalogue across every run.
+    pub synced_games: u64,
+    pub updated_at: DateTime<Utc>,
 }
 
 fn player_game_json(game: &PlayerGame) -> String {

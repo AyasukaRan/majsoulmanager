@@ -443,3 +443,63 @@ test("contains shadcn configuration and no disposable starter", async () => {
   await access(new URL("../public/og.png", import.meta.url));
   await assert.rejects(access(new URL("app/_sites-preview", projectRoot)));
 });
+
+test("a sync cursor is placed in the window by time, and clamped to it", async () => {
+  const { day, windowPercent } = await import("../lib/paipuya-progress.mjs");
+  const start = "2026-01-01T00:00:00Z";
+  const end = "2026-01-11T00:00:00Z";
+
+  assert.equal(day("2026-03-12T07:41:09Z"), "2026-03-12");
+  assert.equal(windowPercent(start, start, end), 0);
+  assert.equal(windowPercent("2026-01-06T00:00:00Z", start, end), 50);
+  assert.equal(windowPercent(end, start, end), 100);
+
+  // A cursor outside the window is not an error — 结束时间 moved back after the
+  // sweep passed it, or 开始时间 moved forward before it started — and neither
+  // may draw a bar hanging off its track.
+  assert.equal(windowPercent("2019-08-23T00:00:00Z", start, end), 0);
+  assert.equal(windowPercent("2027-01-01T00:00:00Z", start, end), 100);
+
+  // A window with no width is a sweep that returns immediately, which is
+  // finished rather than not started.
+  assert.equal(windowPercent(start, start, start), 100);
+  assert.equal(windowPercent(start, end, start), 100);
+  // Nothing parseable: draw nothing rather than NaN.
+  assert.equal(windowPercent(undefined, start, end), 0);
+});
+
+test("the 牌谱屋 sync exposes both edges of its window, and the backend's clock", async () => {
+  const [source, api, service] = await Promise.all([
+    readFile(new URL("../components/paipuya-sync.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../lib/mjai-api.ts", import.meta.url), "utf8"),
+    readFile(new URL("../../src/paipuya.rs", import.meta.url), "utf8"),
+  ]);
+  assert.match(api, /sync_until: string \| null;/);
+  assert.match(source, /同步开始时间/);
+  assert.match(source, /同步结束时间/);
+  // The bars are drawn against the backend's clock, never the browser's: the
+  // cursors are stamped against it, and `react-hooks/purity` refuses a
+  // `Date.now()` in render anyway.
+  assert.match(source, /status\?\.window_end \?\? status\?\.now/);
+  assert.doesNotMatch(source, /Date\.now\(\)/);
+  // Progress comes from PostgreSQL rather than this run's counters, so a
+  // stopped deployment still says how far it got.
+  assert.match(service, /catalog\.paipuya_cursors\(\)/);
+  assert.match(service, /fn sweep_from/);
+  assert.match(source, /role="progressbar"/);
+
+  // A cursor past the right edge clamps to a full bar, and a full bar reads as
+  // finished — which is the one thing it is not: that mode fetches nothing at
+  // all until it is rewound. Both halves have to say so.
+  assert.match(source, /const beyond = Date\.parse\(mode\.next_from\) > windowEnd/);
+  assert.match(source, /在窗口之后/);
+  assert.match(service, /已经晚于设定的结束时间/);
+  // Rewinding keeps the totals and stops the sweep first: a worker holds its
+  // position in a local and writes it back after the next page, so a rewind
+  // under a running sweep half-applies.
+  assert.match(service, /self\.stop\(\)\.await/);
+  assert.match(
+    await readFile(new URL("../../src/catalog.rs", import.meta.url), "utf8"),
+    /UPDATE paipuya_cursor SET next_from/,
+  );
+});
