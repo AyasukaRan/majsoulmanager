@@ -35,6 +35,11 @@ const MAX_MODULE_BYTES: usize = 64 * 1024 * 1024;
 pub enum ModuleKind {
     Login,
     PbFetch,
+    /// Creating accounts. Unlike the other two this has no builtin: a brand new
+    /// account has no history to be judged on but its handshake, and rustls
+    /// cannot produce Chrome's. Without a module installed, registration is
+    /// refused rather than done badly.
+    Register,
 }
 
 impl ModuleKind {
@@ -42,6 +47,7 @@ impl ModuleKind {
         match self {
             Self::Login => "login",
             Self::PbFetch => "pb_fetch",
+            Self::Register => "register",
         }
     }
 }
@@ -621,7 +627,7 @@ pub struct ModuleStore {
 }
 
 impl ModuleStore {
-    fn new(root: PathBuf, logs: Arc<WatchLogBuffer>) -> Result<Self, WatchServiceError> {
+    pub fn new(root: PathBuf, logs: Arc<WatchLogBuffer>) -> Result<Self, WatchServiceError> {
         std::fs::create_dir_all(&root)?;
         Ok(Self { root, logs })
     }
@@ -652,7 +658,7 @@ impl ModuleStore {
         if !self.root.exists() {
             return Ok(result);
         }
-        for kind in [ModuleKind::Login, ModuleKind::PbFetch] {
+        for kind in [ModuleKind::Login, ModuleKind::PbFetch, ModuleKind::Register] {
             let kind_dir = self.root.join(kind.directory());
             let Ok(names) = std::fs::read_dir(kind_dir) else {
                 continue;
@@ -682,6 +688,10 @@ impl ModuleStore {
                         active: match kind {
                             ModuleKind::Login => &selected == login_active,
                             ModuleKind::PbFetch => &selected == pb_active,
+                            // Nothing to choose between: there is no builtin
+                            // registrar, so an installed one is the one that
+                            // runs.
+                            ModuleKind::Register => true,
                         },
                     });
                 }
@@ -695,6 +705,46 @@ impl ModuleStore {
             ))
         });
         Ok(result)
+    }
+
+    /// The one installed module of a kind that has no builtin.
+    ///
+    /// The caller does not choose: there is nothing to choose between when the
+    /// alternative to an installed registrar is not registering at all. Two of
+    /// them is an error rather than a silent pick, because which one ran would
+    /// otherwise only be visible in the accounts it produced.
+    pub fn sole(&self, kind: ModuleKind) -> Result<ModuleRef, WatchServiceError> {
+        let installed: Vec<ModuleRef> = self
+            .list(&ModuleRef::builtin(), &ModuleRef::builtin())?
+            .into_iter()
+            .filter(|module| module.kind == kind && !module.builtin)
+            .map(|module| ModuleRef {
+                name: module.name,
+                version: module.version,
+            })
+            .collect();
+        match installed.len() {
+            // Not `ModuleNotInstalled`, whose message names a version that was
+            // asked for. Nothing was asked for here — the answer is that this
+            // deployment has no registrar at all, and the operator reads it off
+            // a button rather than out of a log.
+            0 => Err(WatchServiceError::InvalidConfig(format!(
+                "没装 {} 模块。这一类没有内建实现（内建的 TLS 指纹和 Chrome 对不上），\
+                 先在采集设置的「模块」里装一个",
+                kind.directory()
+            ))),
+            1 => Ok(installed.into_iter().next().expect("length checked")),
+            _ => Err(WatchServiceError::InvalidConfig(format!(
+                "装了 {} 个 {} 模块，先卸掉多余的：{}",
+                installed.len(),
+                kind.directory(),
+                installed
+                    .iter()
+                    .map(|module| format!("{}@{}", module.name, module.version))
+                    .collect::<Vec<_>>()
+                    .join("、")
+            ))),
+        }
     }
 
     pub async fn install(
@@ -777,7 +827,7 @@ impl ModuleStore {
         Ok(())
     }
 
-    async fn worker(
+    pub(crate) async fn worker(
         &self,
         kind: ModuleKind,
         module: &ModuleRef,
@@ -973,6 +1023,11 @@ impl PluginWorker {
             "open_session" => Duration::from_secs(120),
             // One RPC. Game records are large and the far side is rate limited.
             "rpc" => Duration::from_secs(60),
+            // A whole account: a code to send, a mailbox to poll for it (two
+            // minutes of tries), then a session that pauses where a person
+            // filling in a form would. Rushing any of that is the thing the
+            // module exists to avoid, so the deadline has to allow it.
+            "register" => Duration::from_secs(900),
             // Health checks and teardown answer immediately or not at all.
             _ => Duration::from_secs(5),
         }
@@ -1031,7 +1086,7 @@ impl PluginWorker {
             .unwrap_or_else(|| serde_json::json!({})))
     }
 
-    async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) {
         let mut child = self.child.lock().await;
         let _ = child.start_kill();
         let _ = child.wait().await;
@@ -1042,7 +1097,7 @@ pub struct WatchSupervisor {
     config_path: PathBuf,
     config: RwLock<WatchServiceConfig>,
     runtime: RwLock<WatchRuntimeStatus>,
-    modules: ModuleStore,
+    modules: Arc<ModuleStore>,
     registry: Arc<WatchRegistry>,
     dependencies: Arc<ManagedWatchDependencies>,
     logs: Arc<WatchLogBuffer>,
@@ -1108,7 +1163,10 @@ impl WatchSupervisor {
             config_path,
             config: RwLock::new(config),
             runtime: RwLock::new(WatchRuntimeStatus::default()),
-            modules: ModuleStore::new(watch_dir.join("modules"), Arc::clone(&logs))?,
+            modules: Arc::new(ModuleStore::new(
+                watch_dir.join("modules"),
+                Arc::clone(&logs),
+            )?),
             registry,
             dependencies,
             logs,
@@ -1175,6 +1233,12 @@ impl WatchSupervisor {
         let config = self.config.read();
         self.modules
             .list(&config.login_module, &config.pb_fetch_module)
+    }
+
+    /// The module store, for the registrar — which installs nothing and runs on
+    /// its own schedule, but reads the same directory.
+    pub fn module_store(&self) -> Arc<ModuleStore> {
+        Arc::clone(&self.modules)
     }
 
     pub async fn install_module(

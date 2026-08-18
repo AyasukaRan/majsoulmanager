@@ -12,7 +12,7 @@ use mjai_management::auth::{
     VerifyEmailRequest,
 };
 use mjai_management::catalog::{
-    Catalog, Cursor, PaipuyaGame, PaipuyaPosition, RecordFilter, SeriesUnit, SeriesWindow,
+    Catalog, Cursor, GameUuid, PaipuyaGame, RecordFilter, SeriesUnit, SeriesWindow, SweepPosition,
 };
 use mjai_management::objects::Objects;
 use mjai_management::pack::PackStore;
@@ -2723,6 +2723,79 @@ fn watch_config_request(body: &str, session: &str) -> Request<Body> {
         .unwrap()
 }
 
+/// What a fresh deployment gets when it presses 开始注册.
+///
+/// Registration has no builtin — rustls cannot produce Chrome's ClientHello and
+/// a brand new account has nothing else to be judged on — so on a deployment
+/// with no registrar installed the button must say so. The failure this guards
+/// against is the run starting anyway and reporting a first account that failed
+/// somewhere deep in a module that was never there.
+///
+/// The empty batch is checked first and separately, because an operator who
+/// pasted nothing needs to hear about the empty box rather than about modules.
+#[tokio::test]
+async fn registration_says_what_is_missing_before_it_starts_anything() {
+    let (state, data_dir) = test_state().await;
+    let session = admin_session(&state);
+    let post = |body: &'static str| {
+        api::router(state.clone()).oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/accounts/register")
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-mjai-user-session", session.clone())
+                .body(Body::from(body))
+                .unwrap(),
+        )
+    };
+
+    let empty = post(r##"{"mailboxes":["   ","# 注释"]}"##).await.unwrap();
+    assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+    let reported = json_body(empty).await["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        reported.contains("邮箱凭据"),
+        "an empty batch should name the empty box, said: {reported}"
+    );
+
+    let unregistered = post(r#"{"mailboxes":["someone@example.com----key"]}"#)
+        .await
+        .unwrap();
+    assert_eq!(unregistered.status(), StatusCode::BAD_REQUEST);
+    let reported = json_body(unregistered).await["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        reported.contains("register") && reported.contains("模块"),
+        "a deployment with no registrar should be told which module to install, \
+         said: {reported}"
+    );
+
+    // Nothing started, so nothing is running and no mailbox was spent. Behind
+    // the session too: the status names the addresses being registered.
+    let status = api::router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/accounts/register/status")
+                .header(header::AUTHORIZATION, "Bearer test-secret")
+                .header("x-mjai-user-session", session.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    let status = json_body(status).await;
+    assert_eq!(status["running"], false);
+    assert_eq!(status["total"], 0);
+
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
 /// The bootstrap administrator's session. Changing what the collectors do needs
 /// one: the machine key says the request came from a deployment that holds it,
 /// and cannot say who is behind it.
@@ -2739,13 +2812,18 @@ fn admin_session(state: &AppState) -> String {
 
 /// Every route that changes what the collectors do, so that one added to the
 /// table without the guard is caught here rather than in production.
-const COLLECTOR_CONTROL_ROUTES: [(&str, &str); 6] = [
+const COLLECTOR_CONTROL_ROUTES: [(&str, &str); 8] = [
     ("PUT", "/api/v1/watch/config"),
     ("POST", "/api/v1/watch/actions"),
     ("POST", "/api/v1/watch/modules"),
     ("PUT", "/api/v1/watch/proxy/subscription"),
     ("PUT", "/api/v1/watch/proxy/selection"),
     ("POST", "/api/v1/watch/proxy/actions"),
+    // Registration creates credentials and spends the operator's mailboxes.
+    // The machine key that every collector holds must not be able to start
+    // one, and neither must an ordinary member.
+    ("POST", "/api/v1/accounts/register"),
+    ("POST", "/api/v1/accounts/register/stop"),
 ];
 
 /// The console holds the machine key and attaches it to whatever a browser asks
@@ -2962,22 +3040,17 @@ async fn walks_the_paipuya_catalogue_by_keyset_and_skips_the_games_already_claim
 
     // The first two share a second, which is the case a cursor of seconds alone
     // gets wrong in one direction or the other.
-    let games: Vec<PaipuyaGame> = (0..6)
-        .map(|n| PaipuyaGame {
+    let games: Vec<GameUuid> = (0..6)
+        .map(|n| GameUuid {
             uuid: uuid(n),
             mode_id: 16,
             started_at: base + TimeDelta::seconds(if n == 0 { 0 } else { n as i64 - 1 }),
-            ended_at: base + TimeDelta::seconds(n as i64 + 600),
-            players: vec![format!("p{n}a"), format!("p{n}b")],
-            account_ids: vec![n as u64, n as u64 + 100],
-            scores: vec![25_000, 25_000],
         })
         .collect();
-    catalog.insert_paipuya_games(&games).await.unwrap();
-    // Written twice, exactly as the sync does at every page boundary: it
-    // re-requests from the last game's own second so nothing is skipped. The
-    // page must not hand the walk the same game twice.
-    catalog.insert_paipuya_games(&games[..1]).await.unwrap();
+    catalog.insert_game_uuids(&games).await.unwrap();
+    // Written twice, exactly as re-importing an overlapping date range does.
+    // The page must not hand the walk the same game twice.
+    catalog.insert_game_uuids(&games[..1]).await.unwrap();
 
     let mut ordered: Vec<(DateTime<Utc>, String)> = games
         .iter()
@@ -2986,7 +3059,7 @@ async fn walks_the_paipuya_catalogue_by_keyset_and_skips_the_games_already_claim
     ordered.sort();
 
     // Start one game short of the range so the first page is this test's rows.
-    let mut cursor = Some(PaipuyaPosition {
+    let mut cursor = Some(SweepPosition {
         started_at: base - TimeDelta::seconds(1),
         uuid: String::new(),
     });
@@ -3001,14 +3074,17 @@ async fn walks_the_paipuya_catalogue_by_keyset_and_skips_the_games_already_claim
             page_number < 12,
             "the walk did not reach the end of its rows"
         );
-        let page = catalog.paipuya_listings(cursor.as_ref(), 2).await.unwrap();
+        let page = catalog
+            .game_uuid_listings(cursor.as_ref(), 2)
+            .await
+            .unwrap();
         if page.is_empty() {
             break;
         }
-        cursor = page.last().map(|listing| listing.position.clone());
+        cursor = page.last().cloned();
         seen.extend(
             page.into_iter()
-                .map(|listing| (listing.position.started_at, listing.position.uuid))
+                .map(|position| (position.started_at, position.uuid))
                 .filter(|(_, uuid)| uuid.contains(&run.to_string())),
         );
         if seen.len() >= ordered.len() {
@@ -3023,7 +3099,7 @@ async fn walks_the_paipuya_catalogue_by_keyset_and_skips_the_games_already_claim
 
     // The cursor the walk actually keeps, round-tripped. It is the difference
     // between a restart costing one page and a restart costing the catalogue.
-    let resume = PaipuyaPosition {
+    let resume = SweepPosition {
         started_at: ordered[2].0,
         uuid: ordered[2].1.clone(),
     };
@@ -3065,6 +3141,89 @@ async fn walks_the_paipuya_catalogue_by_keyset_and_skips_the_games_already_claim
     let window = SeriesWindow::recent(SeriesUnit::Day, 7);
     let gap = catalog.paipuya_gap(window).await.unwrap();
     assert!(gap.missing <= gap.listed);
+
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+/// The one thing each of the two game tables must not be allowed to hold,
+/// refused at the door.
+///
+/// Both were held at once, and neither failure raised anything. A catalogue row
+/// with no players matches nothing, so the comparison card counted 191 million
+/// of them as missing and read 100%. A 牌谱屋 short id is not a uuid Mahjong
+/// Soul serves, so the walk spent one rate-limited request per row to be told
+/// the game does not exist — which logs identically to a game that has aged out.
+#[tokio::test]
+async fn refuses_catalogue_rows_and_work_list_rows_that_could_never_work() {
+    let (state, data_dir) = test_state().await;
+    // Two endpoints, two ways in, and that is the point rather than an accident:
+    // the catalogue is loaded by an administrator in the console, the work list
+    // by a collector holding the API key. `majsoul2mjai push-uuids` has a key
+    // and no browser session, so putting the work list behind the admin group
+    // would answer 401 to the only caller it has.
+    let session = admin_session(&state);
+    let post = |uri: &'static str, body: String, admin: bool| {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, "Bearer test-secret");
+        if admin {
+            request = request.header("x-mjai-user-session", session.clone());
+        }
+        api::router(state.clone()).oneshot(request.body(Body::from(body)).unwrap())
+    };
+    let started_at = DateTime::from_timestamp(4_100_000_000, 0).unwrap();
+
+    let unmatchable = PaipuyaGame {
+        uuid: "260716-0000-0000-0000-000000000001".to_owned(),
+        mode_id: 16,
+        started_at,
+        ended_at: started_at + TimeDelta::seconds(600),
+        players: Vec::new(),
+        account_ids: Vec::new(),
+        scores: Vec::new(),
+    };
+    let response = post(
+        "/api/v1/paipuya/games",
+        serde_json::json!({ "games": [unmatchable] }).to_string(),
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // What 牌谱屋 actually returns for every game: `_masked`, with an
+    // 11-character base58 id sitting in the `uuid` field.
+    let unfetchable = GameUuid {
+        uuid: "98yKIfZs7vZ".to_owned(),
+        mode_id: 16,
+        started_at,
+    };
+    let response = post(
+        "/api/v1/games/uuids",
+        serde_json::json!({ "games": [unfetchable] }).to_string(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // The same row with a uuid Mahjong Soul would answer to is accepted, so the
+    // guard is the short id and not the endpoint being unreachable.
+    let fetchable = GameUuid {
+        uuid: format!("260716-{}", Uuid::new_v4()),
+        mode_id: 16,
+        started_at,
+    };
+    let response = post(
+        "/api/v1/games/uuids",
+        serde_json::json!({ "games": [fetchable] }).to_string(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 
     std::fs::remove_dir_all(data_dir).unwrap();
 }

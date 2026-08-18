@@ -17,11 +17,11 @@ Watch 是 `mjai-management-api` 进程内的受管后台任务。API 负责队�
 5. 新任务使用新模块建立会话；旧任务被取消，其模块进程随之退出。
 6. 安装、健康检查或启动失败时保留原配置和原版本。
 
-模块目录按 `watch/modules/{login|pb_fetch}/{name}/{version}` 隔离。不要在
+模块目录按 `watch/modules/{login|pb_fetch|register}/{name}/{version}` 隔离。不要在
 模块 stdout 写日志；stdout 只用于协议，日志写 stderr。模块 stderr 会被逐行
 采集进服务日志缓冲并展示在管理台「服务日志」面板（单行截断 8KB），因此
-不要在 stderr 回显收到的请求参数（如 `open_session` 的密码、代理凭据）；
-后端会对已知机密做替换兜底，但不能覆盖变形输出。
+不要在 stderr 回显收到的请求参数（如 `open_session` 的密码、代理凭据、
+`register` 的邮箱凭据串）；后端会对已知机密做替换兜底，但不能覆盖变形输出。
 
 ## 通用传输
 
@@ -87,6 +87,29 @@ PB 模块只负责牌谱相关 protobuf，可与任意 Login 模块组合：
 
 业务错误应返回 `ok:false`，后端会保留 UUID 状态与待处理队列，并按 Watch
 重连/重试策略处理。
+
+## Register 模块
+
+注册雀魂账号，由控制台账号池页面的「注册新账号」发起：
+
+- `register`
+  - 参数：`mailbox`（取码凭据串，里面含邮箱地址）、可选 `password`、
+    `nickname`、`proxy`、`poll_tries`、`poll_interval`、`mimic`
+  - 结果：`ok`、`email`、成功时 `password`、`account_id`、`nickname`；
+    失败时 `stage`（`send_code` / `fetch_code` / `signup` / `websocket` …）
+    和 `error`
+
+一次调用一个账号，循环在后端。一个账号要发码、轮询邮箱、再跑一段刻意放慢的会话，
+所以这个方法的超时是 **900 秒**，而不是 `rpc` 的 60 秒。
+
+**这一类没有 builtin。** 其余两类不装模块就用内建实现，注册不装就直接拒绝：
+rustls 造不出 Chrome 的 ClientHello，而一个刚出生的账号除了它的握手之外没有任何
+历史可看，用一个一眼假的指纹去建号比不建更糟。
+
+也**不需要在任何地方选中**它 —— 没有可选项，装了的那个就是跑的那个。装两个会报错
+让人卸掉一个：到底哪个建的号，事后只能从账号本身去猜。
+
+现成实现见 [`modules/register/curl-chrome`](../modules/register/curl-chrome/README.md)。
 
 ## manifest
 

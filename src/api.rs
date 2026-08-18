@@ -39,7 +39,7 @@ use crate::{
     },
     catalog::{
         CatalogError, Cursor, DEFAULT_TREND_SPAN, DownloadCounts, DownloadFormat, DownloadJob,
-        DownloadRequest, JobState, PaipuyaGame, PaipuyaGap, PaipuyaTotals, PlayerHit,
+        DownloadRequest, GameUuid, JobState, PaipuyaGame, PaipuyaGap, PaipuyaTotals, PlayerHit,
         PlayerSummary, Record, RecordFilter, RecordStats, RuleFilter, Series, SeriesUnit,
         SeriesWindow, StorageStats,
     },
@@ -48,6 +48,7 @@ use crate::{
     mihomo::{MihomoAction, MihomoError, MihomoStatus, ProxySelection, SubscriptionUpdate},
     paipuya::{PaipuyaConfig, PaipuyaStatus},
     refetch_service::{RefetchRuntimeStatus, RefetchServiceConfig},
+    register_service::{AccountRegisterProgress, AccountRegisterRequest},
     watch_log::WatchLogEntry,
     watch_service::{
         InstallModuleRequest, InstalledModule, ServicePhase, WatchAction, WatchDashboard,
@@ -92,11 +93,23 @@ pub fn router(state: AppState) -> Router {
         // last login with each one did — but an account name is itself the thing
         // the route above is restricted for.
         .route("/api/v1/accounts/health", get(get_account_health))
+        .route(
+            "/api/v1/accounts/register/status",
+            get(get_account_register_status),
+        )
         .route("/api/v1/refetch/config", put(put_refetch_config))
         .route("/api/v1/refetch/actions", post(post_refetch_action))
         // Loading the catalogue changes what the pool will go and fetch, so it
         // sits with the rest of what an administrator decides.
         .route("/api/v1/paipuya/games", post(post_paipuya_games))
+        // Session-only, like everything else that decides what the deployment
+        // does. Registration creates credentials and spends somebody's mailboxes;
+        // the API key that collectors hold must not be able to start one.
+        .route("/api/v1/accounts/register", post(post_account_register))
+        .route(
+            "/api/v1/accounts/register/stop",
+            post(post_account_register_stop),
+        )
         .route("/api/v1/paipuya/config", put(put_paipuya_config))
         .route("/api/v1/paipuya/actions", post(post_paipuya_action))
         .route(
@@ -109,6 +122,12 @@ pub fn router(state: AppState) -> Router {
         ));
     let protected = Router::new()
         .route("/api/v1/records", post(ingest).get(search))
+        // Beside `/records` rather than with the `/paipuya/` routes, because it
+        // is the same kind of thing: a collector holding the API key posting
+        // what it found. The admin group is session-only — `majsoul2mjai
+        // push-uuids` has a key and no browser — and loading a work list is not
+        // a decision an administrator makes in the console.
+        .route("/api/v1/games/uuids", post(post_game_uuids))
         .route("/api/v1/records/batch", post(ingest_batch))
         .route("/api/v1/records/{id}", get(get_record))
         .route("/api/v1/records/{id}/raw", get(get_raw))
@@ -359,6 +378,40 @@ async fn get_account_health(
     State(state): State<AppState>,
 ) -> Json<BTreeMap<String, AccountHealth>> {
     Json(state.accounts.health())
+}
+
+/// Starts a registration run. Returns immediately with the opening progress —
+/// a batch takes tens of minutes, so the answer to "did it start" cannot wait
+/// for "did it finish".
+async fn post_account_register(
+    State(state): State<AppState>,
+    Json(request): Json<AccountRegisterRequest>,
+) -> Result<Json<AccountRegisterProgress>, ApiError> {
+    state.register.start(request)?;
+    Ok(Json(state.register.status()))
+}
+
+/// Ends the run after the account currently in flight.
+///
+/// Not sooner: an account abandoned midway exists on Mahjong Soul's side with a
+/// password that only lived inside the run.
+async fn post_account_register_stop(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let stopping = state.register.stop();
+    Json(serde_json::json!({
+        "stopping": stopping,
+        "status": state.register.status(),
+    }))
+}
+
+/// Where a registration run has got to, and what each account did.
+///
+/// Behind the same door as the account list: it names the addresses being
+/// registered. It carries no password and no mailbox credential — the password
+/// went into the pool, which is the only place it belongs.
+async fn get_account_register_status(
+    State(state): State<AppState>,
+) -> Json<AccountRegisterProgress> {
+    Json(state.register.status())
 }
 
 async fn put_accounts(
@@ -1420,6 +1473,46 @@ async fn post_paipuya_games(
         )));
     }
     state.catalog.insert_paipuya_games(&batch.games).await?;
+    Ok(Json(PaipuyaAccepted {
+        accepted: batch.games.len(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct GameUuidBatch {
+    games: Vec<GameUuid>,
+}
+
+/// Adds full game uuids to the re-fetch walk's work list — what `majsoul2mjai`
+/// resolved for a date range, sent here so the pool has something it can
+/// actually ask Mahjong Soul for.
+///
+/// Deliberately a different table and a different endpoint from
+/// `post_paipuya_games`. 牌谱屋 masks every listing this deployment's key can
+/// see, so what that endpoint stores is an 11-character short id; both were in
+/// one column for a while and both readers broke silently.
+async fn post_game_uuids(
+    State(state): State<AppState>,
+    Json(batch): Json<GameUuidBatch>,
+) -> Result<Json<PaipuyaAccepted>, ApiError> {
+    if batch.games.len() > MAX_PAIPUYA_BATCH {
+        return Err(ApiError::BadRequest(format!(
+            "a batch must not exceed {MAX_PAIPUYA_BATCH} games"
+        )));
+    }
+    // Refused rather than stored, because the walk hands these straight to
+    // `fetchGameRecord`, which answers "no such game" to a short id — one
+    // spent request per row, and a log line that reads like ordinary
+    // attrition. A 牌谱屋 short id is 11 characters of base58 with no
+    // separator; every uuid Mahjong Soul issues has one.
+    if let Some(short) = batch.games.iter().find(|game| !game.uuid.contains('-')) {
+        return Err(ApiError::BadRequest(format!(
+            "game uuid {} looks like a 牌谱屋 short id, which Mahjong Soul will not serve; \
+             resolve it to a full uuid first",
+            short.uuid
+        )));
+    }
+    state.catalog.insert_game_uuids(&batch.games).await?;
     Ok(Json(PaipuyaAccepted {
         accepted: batch.games.len(),
     }))

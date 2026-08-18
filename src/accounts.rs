@@ -311,6 +311,58 @@ impl AccountPool {
             .collect()
     }
 
+    /// Adds accounts the registrar just created, without the console's revision
+    /// check.
+    ///
+    /// A registration run lasts tens of minutes and produces one account at a
+    /// time. Demanding the revision an operator's browser last read would throw
+    /// away every account after the first note they edit meanwhile — and an
+    /// account that was created and then not stored is gone: its password only
+    /// ever existed in the run that made it.
+    ///
+    /// Appending is safe where a whole-document PUT is not: no existing row is
+    /// read, changed or reordered, and a username already in the pool is skipped
+    /// rather than overwritten. Returns how many were added.
+    pub fn append(&self, accounts: Vec<StoredAccount>) -> Result<usize, WatchServiceError> {
+        if accounts.is_empty() {
+            return Ok(0);
+        }
+        let mut document = self.document.write();
+        // Built into a candidate document and validated before anything is
+        // committed: a bad row must not leave the in-memory pool holding
+        // accounts that were never written to disk.
+        let mut next = document.clone();
+        let mut seen: HashSet<String> = next
+            .accounts
+            .iter()
+            .map(|account| account.username.trim().to_lowercase())
+            .collect();
+        let mut added = 0;
+        for mut account in accounts {
+            account.username = account.username.trim().to_owned();
+            // `insert` is the duplicate check: it covers both "already in the
+            // pool" and "twice in this batch", and the second one is real —
+            // two mailbox lines can carry the same address.
+            if account.username.is_empty() || !seen.insert(account.username.to_lowercase()) {
+                continue;
+            }
+            if account.id.is_empty() {
+                account.id = uuid::Uuid::new_v4().to_string();
+            }
+            next.accounts.push(account);
+            added += 1;
+        }
+        if added == 0 {
+            return Ok(0);
+        }
+        next.validate()?;
+        next.revision = next.revision.saturating_add(1);
+        next.updated_at = Some(Utc::now());
+        persist_secret_json(&self.path, &next)?;
+        *document = next;
+        Ok(added)
+    }
+
     pub fn update(&self, next: AccountDocument) -> Result<AccountDocument, WatchServiceError> {
         let mut next = next;
         let submitted = next.revision;
@@ -588,6 +640,59 @@ mod tests {
         assert!(
             recovered.detail.is_empty(),
             "a success carries no error text"
+        );
+    }
+
+    /// What the registrar needs from `append`: a repeat is skipped, not an
+    /// error, and it does not take the rest of the batch with it.
+    ///
+    /// The registrar calls this once per account, mid-run, and a run is normally
+    /// started over a mailbox file that partly overlaps the last one. If a
+    /// duplicate failed the call, the accounts after it in that batch would be
+    /// created on Mahjong Soul's side and then dropped — and a created account
+    /// that was not stored is gone, because its password only existed inside the
+    /// run. The revision has to move too, or a console reading r0 would think
+    /// nothing had happened.
+    #[test]
+    fn appending_skips_what_is_already_there_and_keeps_the_rest() {
+        let store = pool(vec![account("taken@example.com", AccountPurpose::Refetch)]);
+        let before = store.published().revision;
+
+        let added = store
+            .append(vec![
+                account("taken@example.com", AccountPurpose::Refetch),
+                account("fresh@example.com", AccountPurpose::Refetch),
+                // Twice in one batch, which two mailbox lines carrying the same
+                // address produce. Both must not land: the document would fail
+                // its own duplicate check and the whole append would be lost.
+                account("fresh@example.com", AccountPurpose::Refetch),
+                // Case is not a difference: Mahjong Soul treats these as one
+                // account, so a pair differing only in case is the collision the
+                // pool exists to prevent wearing a disguise.
+                account("TAKEN@example.com", AccountPurpose::Refetch),
+            ])
+            .unwrap();
+        assert_eq!(added, 1, "only the one that was not already there");
+
+        let document = store.published();
+        assert_eq!(document.accounts.len(), 2);
+        assert!(
+            document.accounts.iter().all(|row| !row.id.is_empty()),
+            "every appended row gets an id, which is what keeps its password \
+             through a later rename"
+        );
+        assert!(
+            document.revision > before,
+            "a console holding the old revision has to be told the pool moved"
+        );
+
+        // Nothing at all is not an error either — it is what re-running the same
+        // mailbox file looks like.
+        assert_eq!(
+            store
+                .append(vec![account("fresh@example.com", AccountPurpose::Refetch)])
+                .unwrap(),
+            0
         );
     }
 

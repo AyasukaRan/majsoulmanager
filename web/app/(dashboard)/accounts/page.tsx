@@ -1,4 +1,5 @@
 import { AccountPoolCard } from "@/components/account-pool";
+import { AccountRegisterCard } from "@/components/account-register";
 
 export default function AccountsPage() {
   return (
@@ -12,6 +13,9 @@ export default function AccountsPage() {
         </p>
       </div>
       <AccountPoolCard />
+      {/* Below the pool, not above: registering is the occasional thing, and
+          what an operator opens this page for is the list. */}
+      <AccountRegisterCard />
     </div>
   );
 }

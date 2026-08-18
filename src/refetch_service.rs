@@ -106,16 +106,25 @@ const LOG_SOURCE: &str = "refetch";
 /// on the page next to the box.
 const MAX_REQUEST_DELAY_MS: u64 = 60_000;
 
-/// The name the 牌谱屋 walk keeps its position under. One row in
+/// The name the `mjai.game_uuids` walk keeps its position under. One row in
 /// `refetch_cursor`; the `MissingPb` walk has none, because its own filter is
 /// its position — a record it has repaired stops matching `pb_size = 0`.
-const PAIPUYA_WALK: &str = "paipuya";
+///
+/// Not the `"paipuya"` this walk used while it read the 牌谱屋 catalogue: a
+/// position in that table is a short id, and resuming from one in this table
+/// would start the sweep at whatever sorts after an 11-character string.
+const KNOWN_GAMES_WALK: &str = "known_games";
 
-/// What `records.source` says about a game this pool went and got because 牌谱屋
-/// listed it. Not `majsoul-watch`: nobody here was in the game, and the column
-/// is how an export tells "collected live" from "swept afterwards" apart. It has
-/// no bearing on deduplication — that is scoped by the game's own uuid, under a
-/// namespace constant that deliberately does not follow this name.
+/// What `records.source` says about a game this pool swept up rather than
+/// collected live. Not `majsoul-watch`: nobody here was in the game, and the
+/// column is how an export tells the two apart. It has no bearing on
+/// deduplication — that is scoped by the game's own uuid, under a namespace
+/// constant that deliberately does not follow this name.
+///
+/// Still `"paipuya"` after the walk moved off `mjai.paipuya_games`, because it
+/// is a stored column value: changing it would split one kind of record across
+/// two names, and every uuid the sweep works through was enumerated from 牌谱屋
+/// in the first place.
 const PAIPUYA_SOURCE: &str = "paipuya";
 
 /// What this field defaulted to before the console grew an account pool.
@@ -135,11 +144,16 @@ pub enum RefetchWork {
     /// that finishes.
     #[default]
     MissingPb,
-    /// Games 牌谱屋 lists that this corpus has never stored. Unbounded by
-    /// comparison — the catalogue is three orders of magnitude larger than the
-    /// corpus — so it is a sweep that runs until it is stopped, not a repair
-    /// that completes.
-    PaipuyaGap,
+    /// Games in `mjai.game_uuids` that this corpus has never stored: the uuids
+    /// `majsoul2mjai` enumerated and resolved. Unbounded by comparison — that
+    /// list is two orders of magnitude larger than the corpus — so it is a
+    /// sweep that runs until it is stopped, not a repair that completes.
+    ///
+    /// `alias` because deployments have this stored as `paipuya_gap`, from when
+    /// the walk read the 牌谱屋 catalogue directly. It never worked: every uuid
+    /// there is an 11-character masked id, and Mahjong Soul refused all of them.
+    #[serde(alias = "paipuya_gap")]
+    KnownGames,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -155,18 +169,19 @@ pub struct RefetchServiceConfig {
     /// was written for.
     #[serde(default)]
     pub work: RefetchWork,
-    /// Where the 牌谱屋 walk starts when it has no stored position. Ignored once
-    /// it has one — the cursor is the position, this is only its seed.
+    /// Where the `KnownGames` walk starts when it has no stored position.
+    /// Ignored once it has one — the cursor is the position, this is only its
+    /// seed.
     ///
-    /// It matters more than a start date usually does. The catalogue runs from
+    /// It matters more than a start date usually does. The uuid list runs from
     /// 2019 and this corpus begins in 2026-07, so a walk left to start at the
     /// beginning spends years on games that were never going to be here, none
     /// of which the claim check can skip, and all of which are the population
     /// nobody has measured Mahjong Soul's retention for (#81). Pointing it at
     /// the recent end first is how a deployment finds out whether the old end
     /// is worth walking at all.
-    #[serde(default)]
-    pub paipuya_from: Option<DateTime<Utc>>,
+    #[serde(default, alias = "sweep_from")]
+    pub sweep_from: Option<DateTime<Utc>>,
     pub server: String,
     #[serde(default)]
     pub proxy_mode: WatchProxyMode,
@@ -192,7 +207,7 @@ impl Default for RefetchServiceConfig {
             revision: 1,
             enabled: false,
             work: RefetchWork::MissingPb,
-            paipuya_from: None,
+            sweep_from: None,
             server: "cn".into(),
             proxy_mode: WatchProxyMode::Mihomo,
             custom_proxy_url: None,
@@ -1057,7 +1072,7 @@ impl RefetchSupervisor {
     async fn walk(&self, generation: u64, work: RefetchWork) -> anyhow::Result<String> {
         if let Some(done) = match work {
             RefetchWork::MissingPb => self.announce_missing_pb().await?,
-            RefetchWork::PaipuyaGap => self.announce_paipuya_gap().await?,
+            RefetchWork::KnownGames => self.announce_known_games().await?,
         } {
             return Ok(done);
         }
@@ -1066,7 +1081,7 @@ impl RefetchSupervisor {
             self.progress.write().pass = pass;
             let (scanned, replaced) = match work {
                 RefetchWork::MissingPb => self.one_pass(generation).await?,
-                RefetchWork::PaipuyaGap => self.one_paipuya_pass(generation).await?,
+                RefetchWork::KnownGames => self.one_known_games_pass(generation).await?,
             };
             self.report(
                 WatchLogLevel::Info,
@@ -1074,7 +1089,7 @@ impl RefetchSupervisor {
                     RefetchWork::MissingPb => {
                         format!("第 {pass} 轮补抓结束：扫描 {scanned} 条，替换 {replaced} 条")
                     }
-                    RefetchWork::PaipuyaGap => {
+                    RefetchWork::KnownGames => {
                         format!("第 {pass} 轮补抓结束：走查 {scanned} 局，入库 {replaced} 局")
                     }
                 },
@@ -1089,15 +1104,15 @@ impl RefetchSupervisor {
                     (RefetchWork::MissingPb, _) => {
                         "补抓结束：剩下的记录雀魂都不再提供，或者重转结果不能替换原记录".to_owned()
                     }
-                    // Deliberately not "the corpus holds everything 牌谱屋
-                    // lists". A pass that resumed near the end of the catalogue
-                    // and ran off it looks identical from here, and saying the
-                    // gap is closed on the strength of the last few thousand
-                    // rows would be a claim about half a billion games.
-                    (RefetchWork::PaipuyaGap, 0) => {
-                        "本轮没有要抓的对局：走到的这一段牌谱屋收录的本地都有了".to_owned()
+                    // Deliberately not "the corpus holds every known game". A
+                    // pass that resumed near the end of the list and ran off it
+                    // looks identical from here, and saying the gap is closed on
+                    // the strength of the last few thousand rows would be a
+                    // claim about a hundred and ninety million games.
+                    (RefetchWork::KnownGames, 0) => {
+                        "本轮没有要抓的对局：走到的这一段本地都有了".to_owned()
                     }
-                    (RefetchWork::PaipuyaGap, _) => {
+                    (RefetchWork::KnownGames, _) => {
                         "补抓结束：这一轮缺的对局雀魂都不再提供".to_owned()
                     }
                 });
@@ -1153,7 +1168,7 @@ impl RefetchSupervisor {
     /// write a second row per game that nothing can ever collapse: `record_id`
     /// is in the sorting key. Refusing to start is the only safe answer, and it
     /// costs one indexed lookup.
-    async fn announce_paipuya_gap(&self) -> anyhow::Result<Option<String>> {
+    async fn announce_known_games(&self) -> anyhow::Result<Option<String>> {
         if !self
             .dependencies
             .catalog
@@ -1166,31 +1181,32 @@ impl RefetchSupervisor {
             );
         }
         // No `backlog`: `start()` already cleared it, and there is no figure to
-        // put there. The catalogue's size is not what this run set out to fetch
-        // — three orders of magnitude of it is already held or never served —
-        // so a bar drawn against it would read zero for the life of the sweep.
-        // The walk reports where it has read to instead.
-        let totals = self.dependencies.catalog.paipuya_totals().await?;
+        // put there. The list's size is not what this run set out to fetch —
+        // two orders of magnitude of it is already held or never served — so a
+        // bar drawn against it would read zero for the life of the sweep. The
+        // walk reports where it has read to instead.
+        let totals = self.dependencies.catalog.game_uuid_totals().await?;
         if totals.games == 0 {
             return Ok(Some(
-                "牌谱屋的对局信息还没同步过，没有缺口可抓；先在上面把「牌谱屋同步」跑起来"
+                "对局 uuid 清单是空的，没有可抓的对局；\
+                 用 majsoul2mjai 枚举出完整 uuid 后导入 mjai.game_uuids 再来"
                     .to_owned(),
             ));
         }
         let resuming = self
             .dependencies
             .catalog
-            .refetch_cursor(PAIPUYA_WALK)
+            .refetch_cursor(KNOWN_GAMES_WALK)
             .await?;
         self.report(
             WatchLogLevel::Info,
             match &resuming {
                 Some(position) => format!(
-                    "牌谱屋已同步 {} 局，从上次走到的 {} 接着比对",
+                    "已知对局 uuid {} 条，从上次走到的 {} 接着比对",
                     totals.games,
                     position.started_at.format("%Y-%m-%d %H:%M:%S")
                 ),
-                None => format!("牌谱屋已同步 {} 局，从头开始比对", totals.games),
+                None => format!("已知对局 uuid {} 条，从头开始比对", totals.games),
             },
         );
         Ok(None)
@@ -1321,14 +1337,14 @@ impl RefetchSupervisor {
     /// unlike the pb repair, whose work is re-derived from `pb_size = 0` on every
     /// pass, nothing here would ever record that those games were skipped. So the
     /// pass stops where it is and leaves the cursor for the next one.
-    async fn one_paipuya_pass(&self, generation: u64) -> anyhow::Result<(u64, u64)> {
+    async fn one_known_games_pass(&self, generation: u64) -> anyhow::Result<(u64, u64)> {
         let catalog = &self.dependencies.catalog;
-        let mut cursor = catalog.refetch_cursor(PAIPUYA_WALK).await?.or_else(|| {
+        let mut cursor = catalog.refetch_cursor(KNOWN_GAMES_WALK).await?.or_else(|| {
             // A seed, not a filter: an empty uuid sorts below every real one, so
             // this is the position just before the first game of that second.
             self.config()
-                .paipuya_from
-                .map(|started_at| crate::catalog::PaipuyaPosition {
+                .sweep_from
+                .map(|started_at| crate::catalog::SweepPosition {
                     started_at,
                     uuid: String::new(),
                 })
@@ -1339,11 +1355,13 @@ impl RefetchSupervisor {
             if self.generation.load(Ordering::SeqCst) != generation {
                 return Ok((scanned, replaced));
             }
-            let page = catalog.paipuya_listings(cursor.as_ref(), PAGE_SIZE).await?;
-            let Some(last) = page.last().map(|listing| listing.position.clone()) else {
-                // The end of the catalogue. Back to the beginning, so the next
-                // pass asks Mahjong Soul again for whatever it refused.
-                catalog.clear_refetch_cursor(PAIPUYA_WALK).await?;
+            let page = catalog
+                .game_uuid_listings(cursor.as_ref(), PAGE_SIZE)
+                .await?;
+            let Some(last) = page.last().cloned() else {
+                // The end of the list. Back to the beginning, so the next pass
+                // asks Mahjong Soul again for whatever it refused.
+                catalog.clear_refetch_cursor(KNOWN_GAMES_WALK).await?;
                 return Ok((scanned, replaced));
             };
             scanned += page.len() as u64;
@@ -1355,10 +1373,7 @@ impl RefetchSupervisor {
             // wrong one to bet an account's rate limit on, because a renamed
             // player or a rounded second reads as missing. A game uuid does not
             // drift.
-            let uuids: Vec<String> = page
-                .iter()
-                .map(|listing| listing.position.uuid.clone())
-                .collect();
+            let uuids: Vec<String> = page.iter().map(|position| position.uuid.clone()).collect();
             let hashes: Vec<Vec<u8>> = uuids.iter().map(|uuid| game_claim_hash(uuid)).collect();
             let held = catalog.claimed_games(&hashes).await?;
             let wanted = unclaimed(uuids, &held);
@@ -1413,7 +1428,7 @@ impl RefetchSupervisor {
             }
             // After the page's fetches, never before: a cursor that ran ahead of
             // them would skip whatever was in flight when the process stopped.
-            catalog.set_refetch_cursor(PAIPUYA_WALK, &last).await?;
+            catalog.set_refetch_cursor(KNOWN_GAMES_WALK, &last).await?;
             cursor = Some(last);
 
             if scanned - reported >= PROGRESS_EVERY {
@@ -2217,7 +2232,7 @@ mod tests {
             "client_version": null,
         }))
         .unwrap();
-        assert_eq!(chosen.work, RefetchWork::PaipuyaGap);
+        assert_eq!(chosen.work, RefetchWork::KnownGames);
     }
 
     /// The decision that spends an account's rate limit.

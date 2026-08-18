@@ -12,8 +12,22 @@ COPY migrations ./migrations
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim AS runtime
+# python3 and curl_cffi are here for the protocol modules, which run as child
+# processes and find their interpreter through their own shebang.
+#
+# Not optional for registration: it has no builtin, because rustls cannot
+# produce Chrome's ClientHello and a brand new account has nothing else to be
+# judged on. An image without this can install the module and still not run it.
+# The login module becomes usable as a side effect; it stays off by default.
+#
+# `--break-system-packages` because bookworm marks its Python externally managed
+# (PEP 668). There is no system package manager to conflict with inside a
+# single-purpose image, and the alternative — a venv — would need its bin on
+# PATH ahead of /usr/bin for a shebang that says `python3` to find it.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates curl python3 python3-pip \
+    && pip3 install --no-cache-dir --break-system-packages 'curl_cffi>=0.14' \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 mjai
 

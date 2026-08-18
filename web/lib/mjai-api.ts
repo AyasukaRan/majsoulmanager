@@ -280,6 +280,40 @@ export type AccountHealth = {
 /** Keyed by username, as the account document spells it. */
 export type AccountHealthMap = Record<string, AccountHealth>;
 
+/** One account a registration run tried to create. */
+export type AccountRegisterOutcome = {
+  /** The address only. The mailbox credential never leaves the backend. */
+  email: string;
+  ok: boolean;
+  account_id: number | null;
+  nickname: string | null;
+  /** Which step failed. Empty on success. */
+  stage: string;
+  detail: string;
+  at: string;
+};
+
+/**
+ * Where a registration run has got to.
+ *
+ * No passwords: a created account goes straight into the pool, disabled, and
+ * that is the only place its password exists. This is polled every few seconds
+ * while a run is going, which is not somewhere credentials should live.
+ */
+export type AccountRegisterProgress = {
+  running: boolean;
+  total: number;
+  done: number;
+  succeeded: number;
+  failed: number;
+  /** The address in flight, so a run inside a mailbox poll does not look stuck. */
+  current: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  message: string | null;
+  outcomes: AccountRegisterOutcome[];
+};
+
 /**
  * The re-fetch pool. It logs in with accounts of its own rather than borrowing a
  * collector's session, so `concurrency` is how many sessions run at once — and
@@ -292,14 +326,14 @@ export type RefetchServiceConfig = {
   enabled: boolean;
   /**
    * Where the walk gets its uuids. `missing_pb` repairs rows already in the
-   * index and finishes; `paipuya_gap` sweeps what 牌谱屋 lists and does not.
+   * index and finishes; `known_games` sweeps the resolved uuid list and does not.
    */
-  work: "missing_pb" | "paipuya_gap";
+  work: "missing_pb" | "known_games";
   /**
    * Where the 牌谱屋 walk starts when it has no stored position. Only a seed —
    * once the walk has a cursor this is ignored.
    */
-  paipuya_from: string | null;
+  sweep_from: string | null;
   server: "cn" | "en" | "jp";
   proxy_mode: "direct" | "mihomo" | "custom";
   custom_proxy_url: string | null;
