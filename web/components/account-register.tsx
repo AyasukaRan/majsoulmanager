@@ -28,6 +28,27 @@ const PURPOSES: Array<{ value: StoredAccount["purpose"]; label: string }> = [
 ];
 
 /**
+ * Where the addresses come from.
+ *
+ * `list` is prepared third-party mailboxes — a consumable, and the last batch
+ * ran out. `cloud` is a self-hosted Cloud Mail instance: one fresh address per
+ * account, opened at registration time, with the code read back out of the same
+ * instance. Nothing to buy and no naming pattern carried over between batches.
+ */
+type MailSource = "list" | "cloud";
+
+/**
+ * Where the non-secret half of the Cloud Mail settings is remembered.
+ *
+ * The password and the token are deliberately not in here. Either one is the
+ * key to every mailbox on that instance, and localStorage is readable by
+ * anything that gets a script onto this page. The instance address and the
+ * administrator's address are not secrets, and they are the tedious part to
+ * retype.
+ */
+const CLOUD_MAIL_KEY = "mjai.cloud-mail";
+
+/**
  * How often the progress is polled while a run is going.
  *
  * One account takes minutes, so this is not about smoothness — it is so that a
@@ -51,6 +72,10 @@ function countMailboxes(text: string): number {
  * nothing else to be judged on. Without one, 开始注册 answers with what to
  * install rather than doing it badly.
  *
+ * Mailboxes come from one of two places, see {@link MailSource}. Cloud Mail is
+ * the one that scales: the module opens an address per account, so a run is a
+ * number rather than a list somebody had to source first.
+ *
  * Each account that succeeds lands in the pool **disabled**, one at a time, as
  * it finishes. That is deliberate and it is why this is worth a background run
  * rather than a request: an account that was created and not stored is gone —
@@ -58,7 +83,12 @@ function countMailboxes(text: string): number {
  * page must not be able to lose the ones already made.
  */
 export function AccountRegisterCard() {
+  const [source, setSource] = useState<MailSource>("list");
   const [mailboxes, setMailboxes] = useState("");
+  const [cloudUrl, setCloudUrl] = useState("");
+  const [cloudAdmin, setCloudAdmin] = useState("");
+  const [cloudPassword, setCloudPassword] = useState("");
+  const [count, setCount] = useState(5);
   const [purpose, setPurpose] = useState<StoredAccount["purpose"]>("refetch");
   const [note, setNote] = useState("");
   const [proxy, setProxy] = useState("");
@@ -86,6 +116,27 @@ export function AccountRegisterCard() {
     return () => window.clearTimeout(initial);
   }, [poll]);
 
+  // Same reason for the timeout, plus localStorage does not exist while this
+  // renders on the server.
+  useEffect(() => {
+    const restore = window.setTimeout(() => {
+      const saved = window.localStorage.getItem(CLOUD_MAIL_KEY);
+      if (!saved) return;
+      try {
+        const remembered = JSON.parse(saved) as {
+          base_url?: string;
+          admin_email?: string;
+        };
+        setCloudUrl(remembered.base_url ?? "");
+        setCloudAdmin(remembered.admin_email ?? "");
+      } catch {
+        // Somebody else's key, or a half-written one. Typing them again is a
+        // smaller problem than a card that refuses to render.
+      }
+    }, 0);
+    return () => window.clearTimeout(restore);
+  }, []);
+
   // Only while something is running. A finished run's numbers do not change, and
   // a timer left going would keep the page awake for nothing.
   useEffect(() => {
@@ -94,28 +145,60 @@ export function AccountRegisterCard() {
     return () => window.clearInterval(timer);
   }, [progress?.running, poll]);
 
-  const pending = countMailboxes(mailboxes);
+  const cloudReady =
+    cloudUrl.trim().length > 0 &&
+    cloudAdmin.trim().length > 0 &&
+    cloudPassword.length > 0;
+  const pending =
+    source === "cloud"
+      ? cloudReady
+        ? count
+        : 0
+      : countMailboxes(mailboxes);
   const running = progress?.running ?? false;
 
   async function start() {
     await run("注册启动失败", async () => {
+      const common = {
+        purpose,
+        note,
+        proxy: proxy.trim() || null,
+        mimic,
+      };
+      // No domain: the module asks the instance which ones it receives and
+      // spreads the batch over them.
+      const cloud = {
+        base_url: cloudUrl.trim(),
+        admin_email: cloudAdmin.trim(),
+        admin_password: cloudPassword,
+      };
       const started = await jsonRequest<AccountRegisterProgress>(
         "/api/accounts/register",
         {
           method: "POST",
-          body: JSON.stringify({
-            mailboxes: mailboxes.split("\n"),
-            purpose,
-            note,
-            proxy: proxy.trim() || null,
-            mimic,
-          }),
+          body: JSON.stringify(
+            source === "cloud"
+              ? { ...common, cloud_mail: cloud, count }
+              : { ...common, mailboxes: mailboxes.split("\n") },
+          ),
         },
       );
       setProgress(started);
-      // Cleared on success only: a batch that was refused for a bad line has to
-      // still be on screen to be fixed.
-      setMailboxes("");
+      // Remembered on success only, so a rejected address is not the one that
+      // comes back next time. The password is never stored — see CLOUD_MAIL_KEY.
+      if (source === "cloud") {
+        window.localStorage.setItem(
+          CLOUD_MAIL_KEY,
+          JSON.stringify({
+            base_url: cloud.base_url,
+            admin_email: cloud.admin_email,
+          }),
+        );
+      } else {
+        // Cleared on success only: a batch that was refused for a bad line has
+        // to still be on screen to be fixed.
+        setMailboxes("");
+      }
       return `开始注册 ${started.total} 个账号，进度在下面`;
     });
   }
@@ -138,23 +221,92 @@ export function AccountRegisterCard() {
         <CardDescription>
           用装好的 register 模块直接注册，成功的号会立刻以「停用」状态写进上面的账号池，
           确认后自己启用。拟真开着时一个号 3~5 分钟，中途关掉页面不影响已经建好的。
+          邮箱可以自己备，也可以给一个 Cloud Mail 实例，让它一个号现开一个。
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        <label className="block space-y-1.5 text-xs font-medium">
-          邮箱凭据（一行一个，行首 # 跳过）
-          <textarea
-            className="block h-28 w-full rounded-md border bg-transparent px-3 py-2 font-mono text-xs"
-            placeholder={"abcd1234@outlook.com----密码----clientId----refreshToken"}
-            value={mailboxes}
+        <label className="block space-y-1.5 text-xs font-medium sm:w-64">
+          邮箱来源
+          <select
+            className={selectClass}
+            value={source}
             disabled={running}
-            onChange={(event) => setMailboxes(event.target.value)}
-          />
-          <span className="block font-normal text-muted-foreground">
-            凭据串里含邮箱地址，注册用地址、取码用整串。它不会出现在日志和进度里 ——
-            那两处只有邮箱地址。
-          </span>
+            onChange={(event) => setSource(event.target.value as MailSource)}
+          >
+            <option value="list">凭据列表（自己备好的邮箱）</option>
+            <option value="cloud">Cloud Mail（现开邮箱）</option>
+          </select>
         </label>
+
+        {source === "list" ? (
+          <label className="block space-y-1.5 text-xs font-medium">
+            邮箱凭据（一行一个，行首 # 跳过）
+            <textarea
+              className="block h-28 w-full rounded-md border bg-transparent px-3 py-2 font-mono text-xs"
+              placeholder={"abcd1234@outlook.com----密码----clientId----refreshToken"}
+              value={mailboxes}
+              disabled={running}
+              onChange={(event) => setMailboxes(event.target.value)}
+            />
+            <span className="block font-normal text-muted-foreground">
+              凭据串里含邮箱地址，注册用地址、取码用整串。它不会出现在日志和进度里 ——
+              那两处只有邮箱地址。
+            </span>
+          </label>
+        ) : (
+          <div className="space-y-3">
+            <div className="grid gap-3 sm:grid-cols-4">
+              <label className="space-y-1.5 text-xs font-medium sm:col-span-2">
+                实例地址
+                <Input
+                  value={cloudUrl}
+                  disabled={running}
+                  placeholder="https://mail.example.com"
+                  onChange={(event) => setCloudUrl(event.target.value)}
+                />
+              </label>
+              <label className="space-y-1.5 text-xs font-medium">
+                管理员邮箱
+                <Input
+                  value={cloudAdmin}
+                  disabled={running}
+                  placeholder="admin@example.com"
+                  onChange={(event) => setCloudAdmin(event.target.value)}
+                />
+              </label>
+              <label className="space-y-1.5 text-xs font-medium">
+                管理员密码
+                <Input
+                  type="password"
+                  value={cloudPassword}
+                  disabled={running}
+                  onChange={(event) => setCloudPassword(event.target.value)}
+                />
+              </label>
+            </div>
+            <label className="block space-y-1.5 text-xs font-medium sm:w-40">
+              注册数量
+              <Input
+                type="number"
+                min={1}
+                max={200}
+                value={count}
+                disabled={running}
+                onChange={(event) =>
+                  setCount(Math.max(0, Number(event.target.value) || 0))
+                }
+              />
+            </label>
+            <p className="text-xs text-muted-foreground">
+              域名不用填 —— 开跑前先问一次实例在收哪几个，然后把这批号随机分到上面去。
+              地址和管理员邮箱记在本机，密码不记：拿着它能读这个实例上所有人的邮件。
+            </p>
+            <p className="text-xs text-muted-foreground">
+              得是你有管理员账号的实例。公共的临时邮箱站不行 —— 那边注册要过人机验证，
+              而且多半关了「一个账号多个邮箱」，一个地址只能注册一个雀魂号。
+            </p>
+          </div>
+        )}
 
         <div className="grid gap-3 sm:grid-cols-3">
           <label className="space-y-1.5 text-xs font-medium">

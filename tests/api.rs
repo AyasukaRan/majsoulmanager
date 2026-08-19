@@ -2761,6 +2761,37 @@ async fn registration_says_what_is_missing_before_it_starts_anything() {
         "an empty batch should name the empty box, said: {reported}"
     );
 
+    // No token and only half of the administrator credentials: neither way in
+    // is complete, and finding that out per account would burn the run.
+    let half_filled = post(
+        r#"{"cloud_mail":{"base_url":"https://mail.example.com","admin_email":"admin@example.com"},"count":3}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(half_filled.status(), StatusCode::BAD_REQUEST);
+    let reported = json_body(half_filled).await["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        reported.contains("Cloud Mail") && reported.contains("令牌"),
+        "a Cloud Mail run with no way in should say what is missing, said: {reported}"
+    );
+
+    let no_count = post(r#"{"cloud_mail":{"base_url":"https://mail.example.com","token":"t"}}"#)
+        .await
+        .unwrap();
+    assert_eq!(no_count.status(), StatusCode::BAD_REQUEST);
+    let reported = json_body(no_count).await["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        reported.contains("数量"),
+        "a Cloud Mail run has no list to take its length from, so a missing count \
+         has to be refused by name, said: {reported}"
+    );
+
     let unregistered = post(r#"{"mailboxes":["someone@example.com----key"]}"#)
         .await
         .unwrap();
@@ -2773,6 +2804,26 @@ async fn registration_says_what_is_missing_before_it_starts_anything() {
         reported.contains("register") && reported.contains("模块"),
         "a deployment with no registrar should be told which module to install, \
          said: {reported}"
+    );
+
+    // An address and administrator credentials get as far as the module check
+    // with no `mailboxes` and no domain — the domain is read off the instance,
+    // and the failure mode if the two paths were ever wired the other way round
+    // is a run that demands a list it was meant to replace.
+    let cloud = post(
+        r#"{"cloud_mail":{"base_url":"https://mail.example.com","admin_email":"admin@example.com","admin_password":"hunter2"},"count":2}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(cloud.status(), StatusCode::BAD_REQUEST);
+    let reported = json_body(cloud).await["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        reported.contains("register") && reported.contains("模块"),
+        "a Cloud Mail run should stop at the missing registrar, not at the missing \
+         mailbox list, said: {reported}"
     );
 
     // Nothing started, so nothing is running and no mailbox was spent. Behind
