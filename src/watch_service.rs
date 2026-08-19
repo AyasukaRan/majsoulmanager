@@ -613,8 +613,8 @@ pub enum WatchServiceError {
     ModuleNotInstalled(String, String),
     #[error("module package is invalid: {0}")]
     InvalidModule(String),
-    #[error("module failed health check: {0}")]
-    ModuleHealth(String),
+    #[error("module call failed: {0}")]
+    ModuleFailed(String),
     #[error("watch service IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("watch service serialization error: {0}")]
@@ -955,10 +955,10 @@ impl PluginWorker {
             .spawn()
             .map_err(WatchServiceError::Io)?;
         let input = child.stdin.take().ok_or_else(|| {
-            WatchServiceError::ModuleHealth("module stdin was not available".into())
+            WatchServiceError::ModuleFailed("module stdin was not available".into())
         })?;
         let output = child.stdout.take().ok_or_else(|| {
-            WatchServiceError::ModuleHealth("module stdout was not available".into())
+            WatchServiceError::ModuleFailed("module stdout was not available".into())
         })?;
         if let Some(stderr) = child.stderr.take() {
             let source = format!("module:{module_name}");
@@ -1055,24 +1055,24 @@ impl PluginWorker {
         let read = async { self.output.lock().await.read_line(&mut line).await };
         let deadline = Self::deadline(method);
         let bytes = tokio::time::timeout(deadline, read).await.map_err(|_| {
-            WatchServiceError::ModuleHealth(format!(
+            WatchServiceError::ModuleFailed(format!(
                 "模块的 {method} 在 {} 秒内没有回应",
                 deadline.as_secs()
             ))
         })??;
         if bytes == 0 {
-            return Err(WatchServiceError::ModuleHealth(format!(
+            return Err(WatchServiceError::ModuleFailed(format!(
                 "模块在处理 {method} 时退出了"
             )));
         }
         let response: serde_json::Value = serde_json::from_str(&line)?;
         if response.get("id").and_then(|value| value.as_u64()) != Some(id) {
-            return Err(WatchServiceError::ModuleHealth(
+            return Err(WatchServiceError::ModuleFailed(
                 "module returned a response with the wrong request id".into(),
             ));
         }
         if response.get("ok").and_then(|value| value.as_bool()) != Some(true) {
-            return Err(WatchServiceError::ModuleHealth(
+            return Err(WatchServiceError::ModuleFailed(
                 response
                     .get("error")
                     .and_then(serde_json::Value::as_str)

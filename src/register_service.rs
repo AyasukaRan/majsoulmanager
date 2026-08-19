@@ -36,6 +36,17 @@ const LOG_SOURCE: &str = "register";
 /// still going tomorrow.
 const MAX_BATCH: usize = 200;
 
+/// How many failures in a row end a run early.
+///
+/// A batch that fails on every account is failing for one reason, and none of
+/// those reasons get better by trying another ninety-seven times: a module too
+/// old for the request, a mailbox service out of quota, a proxy that is down.
+/// Observed the expensive way — a hundred accounts each reported the same error
+/// from a module that predated the field being sent.
+///
+/// Three rather than one, so a single flaky account does not end a batch.
+const GIVE_UP_AFTER: usize = 3;
+
 /// A Cloud Mail instance, used as the mailbox supply.
 ///
 /// With one of these a run needs no mailbox list at all: the module opens a
@@ -376,6 +387,7 @@ impl RegisterService {
             None => None,
         };
 
+        let mut streak = 0usize;
         for (index, mailbox) in jobs.into_iter().enumerate() {
             if self.generation.load(Ordering::SeqCst) != generation {
                 worker.shutdown().await;
@@ -413,7 +425,23 @@ impl RegisterService {
                 )
                 .await;
             let outcome = self.settle(&address, answer, &request);
+            let failure = (!outcome.ok).then(|| format!("[{}] {}", outcome.stage, outcome.detail));
             self.progress.write().outcomes.push(outcome);
+
+            match failure {
+                Some(detail) => {
+                    streak = failures_in_a_row(streak, false);
+                    if streak >= GIVE_UP_AFTER {
+                        worker.shutdown().await;
+                        let skipped = total - index - 1;
+                        return Ok(format!(
+                            "连着 {GIVE_UP_AFTER} 个都失败了，剩下 {skipped} 个没有再试。\
+                             最后一个的原因：{detail}"
+                        ));
+                    }
+                }
+                None => streak = failures_in_a_row(streak, true),
+            }
         }
         worker.shutdown().await;
         let progress = self.progress.read();
@@ -619,6 +647,14 @@ fn jobs_for(request: &AccountRegisterRequest) -> Result<Vec<Option<String>>, Wat
     Ok(mailboxes)
 }
 
+/// Failures in a row, cleared by any success.
+///
+/// In a row, not in total: a batch where every third account fails is annoying
+/// but working, and a running total would stop it at the third failure.
+fn failures_in_a_row(current: usize, ok: bool) -> usize {
+    if ok { 0 } else { current + 1 }
+}
+
 fn too_many(count: usize) -> WatchServiceError {
     WatchServiceError::InvalidConfig(format!(
         "一次最多 {MAX_BATCH} 个，这次是 {count}；一个号要几分钟，分批跑"
@@ -770,6 +806,27 @@ mod tests {
             ..Default::default()
         };
         assert!(jobs_for(&request(&[], Some(config), 2)).is_ok());
+    }
+
+    /// A run ends early only on failures that are actually consecutive.
+    ///
+    /// Counting totals instead would kill a batch that is mostly working —
+    /// three scattered failures out of a hundred is a normal batch, three in a
+    /// row is a batch where something is wrong with every account.
+    #[test]
+    fn a_success_clears_the_failure_streak() {
+        let mut streak = 0;
+        for ok in [false, false, true, false, false] {
+            streak = failures_in_a_row(streak, ok);
+        }
+        assert_eq!(streak, 2, "中间那次成功该把连败清零");
+        assert!(streak < GIVE_UP_AFTER, "这样的一批不该被中止");
+
+        let mut streak = 0;
+        for ok in [false, false, false] {
+            streak = failures_in_a_row(streak, ok);
+        }
+        assert!(streak >= GIVE_UP_AFTER, "连着三个失败就该停");
     }
 
     /// Only the address, never the credential.
