@@ -1759,9 +1759,9 @@ impl From<WatchServiceError> for ApiError {
             | WatchServiceError::ModuleNotInstalled(_, _) => {
                 ApiError::BadRequest(error.to_string())
             }
-            WatchServiceError::ModuleHealth(_) => ApiError::Conflict(error.to_string()),
-            // 412 rather than 409, which module health already uses: the two
-            // need different answers from a client. A failed health check means
+            WatchServiceError::ModuleFailed(_) => ApiError::Conflict(error.to_string()),
+            // 412 rather than 409, which a failed module call already uses: the
+            // two need different answers from a client. A module failure means
             // fix the module and try again with the same edit; a revision
             // conflict means the edit itself is against a document that no
             // longer exists and has to be rebuilt on the current one.
