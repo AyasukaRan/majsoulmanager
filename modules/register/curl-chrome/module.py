@@ -87,6 +87,7 @@ CLOUD_MAIL_GEN_TOKEN = "/api/public/genToken"
 CLOUD_MAIL_ADD_USER = "/api/public/addUser"
 CLOUD_MAIL_EMAIL_LIST = "/api/public/emailList"
 CLOUD_MAIL_WEBSITE_CONFIG = "/api/setting/websiteConfig"
+CLOUD_MAIL_LOGIN = "/api/login"
 # 客户端遥测 (阿里云 SLS)。参数里直接带 account_id, 所以服务端不需要任何指纹关联:
 # 拿账号表 join 一下日志表就知道这个号从没跑过客户端。
 TELEMETRY_URL = "https://majsoul-hk-client.cn-hongkong.log.aliyuncs.com/logstores/client/track"
@@ -531,17 +532,42 @@ async def cloud_mail_resolve(session, cfg: dict, proxy: str | None) -> dict:
         cfg["token"] = token
 
     site = await _cloud_mail_call(session, cfg, CLOUD_MAIL_WEBSITE_CONFIG, None, proxy) or {}
-    # domainList 里的域名带 @ 前缀 ("@example.com")
-    domains = [d.strip().lstrip("@") for d in (site.get("domainList") or []) if d.strip()]
+    domains = _cloud_mail_domains(site)
+    if not domains and (cfg.get("admin_email") or "").strip():
+        # 站点可以把域名藏在登录之后 (loginDomain=1), 那时 websiteConfig 对没有登录态
+        # 的请求返回空数组。刚拿到的开放 API 令牌顶不上 —— 那一头验的是 JWT, 拿它去
+        # 换只会得到同一个空数组。
+        jwt = await _cloud_mail_login(session, cfg, proxy)
+        site = await _cloud_mail_call(session, {**cfg, "token": jwt},
+                                      CLOUD_MAIL_WEBSITE_CONFIG, None, proxy) or {}
+        domains = _cloud_mail_domains(site)
+
     wanted = (cfg.get("domain") or "").strip().lstrip("@")
     if wanted:
         if domains and wanted not in domains:
             raise RuntimeError(f"{wanted} 不在这个实例收信的域名里: {'、'.join(domains)}")
         domains = [wanted]
     if not domains:
-        raise RuntimeError("实例没报出可用域名, 手填一个 domain")
+        raise RuntimeError("实例没报出可用域名（可能把域名藏在登录之后了）, 手填一个 domain")
     return {"token": token, "domains": domains,
             "min_prefix": int(site.get("minEmailPrefix") or 0)}
+
+
+def _cloud_mail_domains(site: dict) -> list[str]:
+    """websiteConfig 里的可用域名。带 @ 前缀 ("@example.com"), 剥掉。"""
+    return [d.strip().lstrip("@") for d in (site.get("domainList") or []) if d.strip()]
+
+
+async def _cloud_mail_login(session, cfg: dict, proxy: str | None) -> str:
+    """用管理员账号登录, 拿一个 JWT。只为读到被隐藏的域名列表。"""
+    data = await _cloud_mail_call(
+        session, {**cfg, "token": ""}, CLOUD_MAIL_LOGIN,
+        {"email": (cfg.get("admin_email") or "").strip(),
+         "password": cfg.get("admin_password") or ""}, proxy)
+    jwt = ((data or {}).get("token") or "").strip()
+    if not jwt:
+        raise RuntimeError("登录成功但没拿到 JWT")
+    return jwt
 
 
 def gen_local_part(min_len: int = 0) -> str:
@@ -583,7 +609,7 @@ async def fetch_code_cloud_mail(session, cfg: dict, address: str, since_ts: floa
 
     toEmail 走 LIKE, 不带 % 就是等值匹配。不按发件人过滤: 这个地址是本次现开的,
     收件箱里只可能有这一封, 而按发件人过滤会在雀魂换发信域名的那天变成静默空等。"""
-    body = {"toEmail": address, "type": 0, "timeSort": "desc", "num": 1, "size": 5}
+    body = {"toEmail": address, "type": 0, "isDel": 0, "timeSort": "desc", "num": 1, "size": 5}
     last_msg = ""
     for _ in range(tries):
         try:

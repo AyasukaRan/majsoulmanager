@@ -31,7 +31,7 @@ Alpine/musl 要先确认有对应轮子。
 控制台的「模块」里上传,或直接放到数据目录下:
 
 ```
-<data_dir>/watch/modules/register/curl-chrome/1.1.0/
+<data_dir>/watch/modules/register/curl-chrome/1.1.1/
     manifest.json
     module.py
 ```
@@ -90,6 +90,7 @@ abcd1234@outlook.com----密码----clientId----refreshToken
 
 - `GET /api/setting/websiteConfig` —— **不需要鉴权**,`domainList` 就是这个实例真的在收信
   的域名(带 `@` 前缀),`minEmailPrefix` 是本地名长度下限。有它才能只填一个地址。
+- `POST /api/login` —— 只在域名被藏起来时用,见下。
 - `POST /api/public/genToken` —— 拿令牌。**全站只有一个令牌,重新生成会让旧的立刻失效**,
   所以一整批只换一次:每个号各换一次的话,并发起来就是后一个把前一个正在轮询的令牌顶掉。
 - `POST /api/public/addUser` —— 建邮箱。**必须在发码之前建好**:收件 worker 对没有对应
@@ -98,8 +99,12 @@ abcd1234@outlook.com----密码----clientId----refreshToken
 
 `Authorization` 头放**裸令牌**,不是 `Bearer` —— worker 拿这个头的值直接和 KV 里的比对。
 
-三个坑是文档没写的,踩了都不报错:
+四个坑是文档没写的,踩了都不报错:
 
+- 站点可以把域名列表**藏在登录之后**(`loginDomain: 1`),那时 `websiteConfig` 对没有登录态
+  的请求返回**空数组**。刚换来的开放 API 令牌顶不上 —— worker 那头是拿 `Authorization`
+  当 **JWT** 验的,一个 uuid 令牌验不过,照样是空数组。所以要先 `POST /api/login` 拿 JWT
+  再问一次。填了令牌但没填管理员密码的话就登不了,那种情况只能手填域名。
 - 业务失败也是 **HTTP 200**,错误在 body 的 `code`/`message` 里。只看状态码会把"令牌不对"
   当成成功。
 - `createTime` 是 **UTC**,paopaodw 那边给的是北京时间。抄错时区的表现是每封邮件都被当成
