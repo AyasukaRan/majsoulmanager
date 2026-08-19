@@ -2806,6 +2806,35 @@ async fn registration_says_what_is_missing_before_it_starts_anything() {
          said: {reported}"
     );
 
+    // A temp-mail key is a complete source on its own — no instance, no domain,
+    // no list — so it too has to reach the module check rather than be turned
+    // away for a missing mailbox.
+    let temp = post(r#"{"temp_mail":{"api_key":"sk-probe"},"count":2}"#)
+        .await
+        .unwrap();
+    assert_eq!(temp.status(), StatusCode::BAD_REQUEST);
+    let reported = json_body(temp).await["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        reported.contains("register") && reported.contains("模块"),
+        "a temp-mail run should stop at the missing registrar, said: {reported}"
+    );
+
+    let no_key = post(r#"{"temp_mail":{"api_key":"  "},"count":2}"#)
+        .await
+        .unwrap();
+    assert_eq!(no_key.status(), StatusCode::BAD_REQUEST);
+    let reported = json_body(no_key).await["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        reported.contains("API key"),
+        "a temp-mail run with no key should name it, said: {reported}"
+    );
+
     // An address and administrator credentials get as far as the module check
     // with no `mailboxes` and no domain — the domain is read off the instance,
     // and the failure mode if the two paths were ever wired the other way round

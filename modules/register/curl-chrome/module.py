@@ -22,19 +22,19 @@
 
 密码算法 HMAC-SHA256(key="lailai", 明文) -> 64 hex。发码时间窗内无图形验证码。
 
-邮箱从哪来
-----------
-凭据串 (`mailbox`) 是原来的路子: 一行一个第三方邮箱, 用完就没了。
-`cloud_mail` 是另一条: 给一个 Cloud Mail 实例, 每个号在上面现开一个地址, 再从同一个
-实例把码读回来 —— 邮箱不再是要人肉备货的消耗品。两者二选一, 给了 `cloud_mail` 就不
-看 `mailbox`。
+邮箱从哪来 (三选一, 见 open_mailbox)
+-----------------------------------
+`mailbox`     凭据串, 原来的路子: 一行一个第三方邮箱, 用完就没了。
+`cloud_mail`  给一个 Cloud Mail 实例, 每个号在上面现开一个地址。得是你有管理员账号的
+              实例: 开放 API 走令牌不过 Turnstile, 而公共实例那条"注册个普通用户"的
+              路要过人机验证, 多半还关了"一个账号多个邮箱"。调用方先调一次
+              `cloud_mail_resolve` 把地址补全成 {令牌, 域名列表, 前缀下限}, 再把结果
+              逐个传给 `register`。
+`temp_mail`   给一个 API key, 一个 GET 换一个地址。最省事的一条: 不用建号、不用问域名,
+              地址每次换一个域名, 本地名也像真人。代价是这些邮箱在服务方眼皮底下 ——
+              验证码信他们看得见, 也就意味着这些雀魂账号的找回邮箱不是你独占的。
 
-要能全自动, 这个实例得是你有管理员账号的 (自建的, 或者别人给了你管理员权限)。开放
-API 走令牌, 不过 Turnstile; 而公共实例那条"注册个普通用户"的路要过人机验证, 而且
-多半还关了"一个账号多个邮箱", 一个地址只能注册一个雀魂号, 自动不起来。
-
-调用方先调一次 `cloud_mail_resolve` 把地址补全成 {令牌, 域名列表, 前缀下限}, 再把结果
-逐个传给 `register`。
+给了不止一个时按 cloud_mail > temp_mail > mailbox 取, 只跑一条。
 
 协议
 ----
@@ -88,6 +88,11 @@ CLOUD_MAIL_ADD_USER = "/api/public/addUser"
 CLOUD_MAIL_EMAIL_LIST = "/api/public/emailList"
 CLOUD_MAIL_WEBSITE_CONFIG = "/api/setting/websiteConfig"
 CLOUD_MAIL_LOGIN = "/api/login"
+# 另一种现开邮箱: 一个 API key, 一个 GET 换地址, 收件箱也是一个 GET。没有建号那一步,
+# 也不用问域名 —— 它每次给的地址就换一个域名。
+TEMP_MAIL_BASE = "https://mail.chatgpt.org.uk"
+TEMP_MAIL_GENERATE = "/api/generate-email"
+TEMP_MAIL_EMAILS = "/api/emails"
 # 客户端遥测 (阿里云 SLS)。参数里直接带 account_id, 所以服务端不需要任何指纹关联:
 # 拿账号表 join 一下日志表就知道这个号从没跑过客户端。
 TELEMETRY_URL = "https://majsoul-hk-client.cn-hongkong.log.aliyuncs.com/logstores/client/track"
@@ -629,6 +634,73 @@ async def fetch_code_cloud_mail(session, cfg: dict, address: str, since_ts: floa
         f"轮询 {tries} 次未取到验证码 (最后: {last_msg or '收件箱里一直是空的'})")
 
 
+# ============================ 临时邮箱 API ============================
+async def _temp_mail_get(session, cfg: dict, path: str, params: dict | None,
+                         proxy: str | None):
+    """打一次临时邮箱 API, 返回 data。
+
+    `X-API-Key` 少了不是 401 而是 Cloudflare 的一页 403 HTML —— 那一层挡在应用前面,
+    没有这个头根本到不了 API。同理这个服务只认像浏览器的客户端: 用 urllib 直接打会被
+    403 挡掉, 我们走 curl_cffi 才过得去。"""
+    base = (cfg.get("base_url") or TEMP_MAIL_BASE).strip().rstrip("/")
+    key = (cfg.get("api_key") or "").strip()
+    if not key:
+        raise RuntimeError("临时邮箱的 api_key 是空的")
+    r = await session.get(
+        base + path,
+        params=params or None,
+        headers={"X-API-Key": key, "Accept": "application/json"},
+        **_no_proxy({"proxy": proxy}),
+    )
+    try:
+        j = json.loads(r.text)
+    except Exception:
+        raise RuntimeError(f"HTTP {r.status_code}, 返回的不是 JSON: {r.text[:200]}")
+    if not j.get("success"):
+        raise RuntimeError(f"{path} HTTP {r.status_code}: {j.get('error')}")
+    return j.get("data") or {}
+
+
+async def temp_mail_open(session, cfg: dict, proxy: str | None) -> str:
+    """现开一个临时邮箱地址。
+
+    地址是服务端给的, 不是我们拼的 —— 它每次换一个域名, 本地名也是"首字母+姓氏+
+    数字"的样子。这两条自己做都做不好, 而它们正是一批号最容易被认出来的地方。"""
+    data = await _temp_mail_get(session, cfg, TEMP_MAIL_GENERATE, None, proxy)
+    address = (data.get("email") or "").strip()
+    if not address:
+        raise RuntimeError("generate-email 没有返回地址")
+    return address
+
+
+async def fetch_code_temp_mail(session, cfg: dict, address: str, since_ts: float,
+                               tries: int, interval: float, proxy: str | None) -> str:
+    """轮询临时邮箱收件箱取验证码。
+
+    `timestamp` 是 Unix 秒, 这一条比另外两个来源都省事 —— 不用解析时间字符串, 也就
+    没有时区可抄错。正文在 `content`; `has_html` 可能是 true 而 `html_content` 是空的,
+    别拿它当主字段。"""
+    last_msg = ""
+    for _ in range(tries):
+        try:
+            data = await _temp_mail_get(session, cfg, TEMP_MAIL_EMAILS,
+                                        {"email": address}, proxy)
+        except Exception as e:
+            last_msg = repr(e)
+            await asyncio.sleep(interval)
+            continue
+        for mail in data.get("emails") or []:
+            stamp = mail.get("timestamp")
+            if isinstance(stamp, (int, float)) and stamp < since_ts - 180:
+                continue
+            code = _extract_code(mail.get("content") or mail.get("html_content") or "")
+            if code:
+                return code
+        await asyncio.sleep(interval)
+    raise TimeoutError(
+        f"轮询 {tries} 次未取到验证码 (最后: {last_msg or '收件箱里一直是空的'})")
+
+
 # ============================ 生成 ============================
 def gen_password(n: int = 12) -> str:
     """纯字母数字 (雀魂登录框前端会拒特殊字符); 保证含大小写+数字。"""
@@ -814,20 +886,44 @@ async def over_websocket(session, email: str, password_hash: str, code: str, gat
     return {"ok": False, "stage": "websocket", "error": last_err or "没有可用的网关"}
 
 
+async def open_mailbox(session, params: dict, p: dict, proxy: str | None,
+                       tries: int, interval: float):
+    """挑一条邮箱来源, 返回 (地址, 取码函数)。
+
+    三条路的差别就这两件事: 地址从哪来, 码从哪取。剩下的 (发码、建连、注册) 一模一样,
+    所以分叉只在这里发生一次 —— 散在流程里的话, 加第四条就要再找齐每一处。
+
+    优先级 cloud_mail > temp_mail > mailbox。给了不止一个通常是上一次的配置没删干净,
+    而"都跑一遍"是没人想要的那个解释。"""
+    cloud = params.get("cloud_mail") or None
+    if cloud:
+        # 邮箱也走这个号的出口: 一个账号的邮箱和它的注册请求来自同一个 IP, 比分两路
+        # 更像真人 —— 而且容器不一定能直连外网。
+        address = await cloud_mail_open(session, cloud, proxy)
+        return address, lambda since: fetch_code_cloud_mail(
+            session, cloud, address, since, tries, interval, proxy)
+
+    temp = params.get("temp_mail") or None
+    if temp:
+        address = await temp_mail_open(session, temp, proxy)
+        return address, lambda since: fetch_code_temp_mail(
+            session, temp, address, since, tries, interval, proxy)
+
+    credential = (params.get("mailbox") or "").strip()
+    if not credential:
+        raise RuntimeError("没有任何邮箱来源: mailbox / cloud_mail / temp_mail 给一个")
+    address = address_of(credential)
+    if not address:
+        raise RuntimeError("凭据串里找不到邮箱地址")
+    return address, lambda since: fetch_code(
+        session, credential, p, since, tries, interval)
+
+
 async def register(params: dict) -> dict:
     """注册一个账号。
 
-    邮箱二选一: 凭据串 (`mailbox`, 既是地址来源也是取码的钥匙), 或者
-    `cloud_mail` (自建实例, 地址现开、码也从它读)。两个都给时以 cloud_mail 为准。"""
-    cloud = params.get("cloud_mail") or None
-    credential = (params.get("mailbox") or "").strip()
-    if not cloud and not credential:
-        raise RuntimeError("既没有 mailbox (取码凭据串), 也没有 cloud_mail 配置")
-    # cloud_mail 模式下地址要建出来才知道, 所以这里先空着。
-    address = "" if cloud else (address_of(credential) or "")
-    if not cloud and not address:
-        raise RuntimeError("凭据串里找不到邮箱地址")
-
+    邮箱三选一, 见 `open_mailbox`: 人肉备好的凭据串, Cloud Mail 现开, 或临时邮箱
+    API 现开。"""
     password = params.get("password") or gen_password()
     nickname = params.get("nickname") or None
     proxy = params.get("proxy") or None
@@ -840,13 +936,10 @@ async def register(params: dict) -> dict:
     since = time.time()
     # trust_env=False: 代理只认显式传入的。继承环境变量会让本该直连的悄悄走上代理。
     async with AsyncSession(impersonate=IMPERSONATE, trust_env=False, timeout=30) as session:
-        if cloud:
-            # Cloud Mail 也走这个号的出口: 一个账号的邮箱和它的注册请求来自同一个
-            # IP, 比分两路更像真人 —— 而且容器不一定能直连外网。
-            try:
-                address = await cloud_mail_open(session, cloud, proxy)
-            except Exception as e:
-                return {"ok": False, "email": "", "stage": "cloud_mail", "error": repr(e)}
+        try:
+            address, fetch = await open_mailbox(session, params, p, proxy, tries, interval)
+        except Exception as e:
+            return {"ok": False, "email": "", "stage": "mailbox", "error": repr(e)}
 
         status, text = await send_signup_code(session, address, p, proxy)
         # 发码失败也是 HTTP 200, 错误在 body 里 (已注册 = ERR_ACC_DUPLICATE_SIGN_UP)。
@@ -860,11 +953,7 @@ async def register(params: dict) -> dict:
                     "error": f"HTTP {status} {text[:200]}"}
 
         try:
-            if cloud:
-                code = await fetch_code_cloud_mail(session, cloud, address, since,
-                                                   tries, interval, proxy)
-            else:
-                code = await fetch_code(session, credential, p, since, tries, interval)
+            code = await fetch(since)
         except Exception as e:
             return {"ok": False, "email": address, "stage": "fetch_code", "error": repr(e)}
         if not re.fullmatch(r"\d{4,8}", code or ""):

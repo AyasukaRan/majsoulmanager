@@ -31,7 +31,7 @@ Alpine/musl 要先确认有对应轮子。
 控制台的「模块」里上传,或直接放到数据目录下:
 
 ```
-<data_dir>/watch/modules/register/curl-chrome/1.1.1/
+<data_dir>/watch/modules/register/curl-chrome/1.2.0/
     manifest.json
     module.py
 ```
@@ -53,7 +53,9 @@ pathlib.Path('manifest.json').write_text(json.dumps(m,indent=2)+'\n')"
 
 ## 邮箱从哪来
 
-两条路,控制台上二选一。给了 `cloud_mail` 就不看 `mailbox`。
+三条路,控制台上三选一。给了不止一个时按 `cloud_mail` > `temp_mail` > `mailbox` 取,
+只跑一条。分叉只在 `open_mailbox` 里发生一次 —— 三条路的差别就是「地址从哪来」和
+「码从哪取」,剩下的完全一样。
 
 ### 一、凭据列表(自己备好的邮箱)
 
@@ -68,7 +70,35 @@ abcd1234@outlook.com----密码----clientId----refreshToken
 
 邮箱是消耗品,这条路的上限就是买了多少个。
 
-### 二、Cloud Mail(现开)
+### 二、临时邮箱 API(现开,最省事)
+
+给一个 key 就行:
+
+```
+GET /api/generate-email      -> {"success":true,"data":{"email":"hperry371@monity.top"}}
+GET /api/emails?email=<地址>  -> {"success":true,"data":{"emails":[...],"count":1}}
+```
+
+没有"建邮箱"那一步,也不用问域名 —— **它每次给的地址就换一个域名**,本地名是
+「首字母+姓氏+3 位数」的样子。这两件事(域名分散、本地名像真人)自己做都做不好,
+而它们正是一批号最容易被捞出来的地方。
+
+实测:开地址 1.2 秒,发码到收到码 **5.3 秒**(paopaodw 那条要 0~2 分钟)。
+
+坑:
+
+- **`X-API-Key` 少了不是 401,是 Cloudflare 一页 403 HTML** —— WAF 挡在应用前面。
+  同理这个服务只认像浏览器的客户端:`urllib` 直接打会被 403,我们走 curl_cffi 才过得去。
+  所以拿到非 JSON 响应时要报出状态码和内容片段,不然 `json.loads` 抛的错跟真实原因无关。
+- 成功判据是 **`success` 字段**,不是 `code`。这一头倒是有真实 HTTP 状态码(401/400)。
+- `timestamp` 是 **Unix 秒**,三条路里唯一不用解析时间字符串的 —— 也就没有时区可抄错。
+- 正文取 **`content`**:`has_html` 可能是 `true` 而 `html_content` 是空的。
+- 额度是**全站共享**的(`usage.remaining_today`),不是你一个人的配额。
+
+**代价是信任**:这些邮箱在服务方眼皮底下,验证码信他们看得见 —— 也就意味着这批号的
+找回邮箱不是你独占的。采集号无所谓,别拿它注册你在乎的东西。
+
+### 三、Cloud Mail(现开,自己的实例)
 
 [Cloud Mail](https://github.com/maillab/cloud-mail) 跑在 Cloudflare Workers 上,一个域名
 就能开无数个地址。给模块一个实例,它**一个号现开一个邮箱**,再从同一个实例把验证码读回来
@@ -161,15 +191,18 @@ echo '{"id":1,"protocol_version":1,"method":"register","params":{"mailbox":"nope
 # -> {"id": 1, "ok": false, "error": "RuntimeError: 凭据串里找不到邮箱地址"}
 
 echo '{"id":1,"protocol_version":1,"method":"register","params":{}}' | python3 module.py
-# -> {"id": 1, "ok": false, "error": "RuntimeError: 既没有 mailbox (取码凭据串), 也没有 cloud_mail 配置"}
+# -> stage=mailbox "没有任何邮箱来源: mailbox / cloud_mail / temp_mail 给一个"
 ```
 
-Cloud Mail 那条路整条有假服务端的自检(不联网、不碰雀魂):
+两条现开邮箱的路整条有假服务端的自检(不联网、不碰雀魂):
 
 ```bash
 python3 reg_majsoul/test_cloud_mail.py \
   mjai_management/modules/register/curl-chrome/module.py
-# -> cloud mail 自检通过: module.py
+#   Cloud Mail，域名公开: ok
+#   Cloud Mail，域名藏在登录之后: ok
+#   临时邮箱 API: ok
+# 邮箱来源自检通过: module.py
 ```
 
 同一个脚本也跑 `reg_majsoul/register.py`。两份是同一条协议的两个拷贝,分化了那里会红。

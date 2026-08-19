@@ -31,11 +31,12 @@ const PURPOSES: Array<{ value: StoredAccount["purpose"]; label: string }> = [
  * Where the addresses come from.
  *
  * `list` is prepared third-party mailboxes — a consumable, and the last batch
- * ran out. `cloud` is a self-hosted Cloud Mail instance: one fresh address per
- * account, opened at registration time, with the code read back out of the same
- * instance. Nothing to buy and no naming pattern carried over between batches.
+ * ran out. The other two open an address per account at registration time:
+ * `cloud` on a Cloud Mail instance you administer, `temp` on a temp-mail service
+ * that needs nothing but a key. Nothing to buy either way, and no naming pattern
+ * carried over between batches.
  */
-type MailSource = "list" | "cloud";
+type MailSource = "list" | "cloud" | "temp";
 
 /**
  * Where the non-secret half of the Cloud Mail settings is remembered.
@@ -47,6 +48,9 @@ type MailSource = "list" | "cloud";
  * retype.
  */
 const CLOUD_MAIL_KEY = "mjai.cloud-mail";
+
+/** Same rule for the temp-mail service: the address, never the key. */
+const TEMP_MAIL_KEY = "mjai.temp-mail";
 
 /**
  * How often the progress is polled while a run is going.
@@ -88,6 +92,8 @@ export function AccountRegisterCard() {
   const [cloudUrl, setCloudUrl] = useState("");
   const [cloudAdmin, setCloudAdmin] = useState("");
   const [cloudPassword, setCloudPassword] = useState("");
+  const [tempUrl, setTempUrl] = useState("");
+  const [tempKey, setTempKey] = useState("");
   const [count, setCount] = useState(5);
   const [purpose, setPurpose] = useState<StoredAccount["purpose"]>("refetch");
   const [note, setNote] = useState("");
@@ -120,15 +126,16 @@ export function AccountRegisterCard() {
   // renders on the server.
   useEffect(() => {
     const restore = window.setTimeout(() => {
-      const saved = window.localStorage.getItem(CLOUD_MAIL_KEY);
-      if (!saved) return;
       try {
-        const remembered = JSON.parse(saved) as {
-          base_url?: string;
-          admin_email?: string;
-        };
-        setCloudUrl(remembered.base_url ?? "");
-        setCloudAdmin(remembered.admin_email ?? "");
+        const cloud = JSON.parse(
+          window.localStorage.getItem(CLOUD_MAIL_KEY) ?? "{}",
+        ) as { base_url?: string; admin_email?: string };
+        setCloudUrl(cloud.base_url ?? "");
+        setCloudAdmin(cloud.admin_email ?? "");
+        const temp = JSON.parse(
+          window.localStorage.getItem(TEMP_MAIL_KEY) ?? "{}",
+        ) as { base_url?: string };
+        setTempUrl(temp.base_url ?? "");
       } catch {
         // Somebody else's key, or a half-written one. Typing them again is a
         // smaller problem than a card that refuses to render.
@@ -145,16 +152,20 @@ export function AccountRegisterCard() {
     return () => window.clearInterval(timer);
   }, [progress?.running, poll]);
 
-  const cloudReady =
-    cloudUrl.trim().length > 0 &&
-    cloudAdmin.trim().length > 0 &&
-    cloudPassword.length > 0;
-  const pending =
+  const ready =
     source === "cloud"
-      ? cloudReady
+      ? cloudUrl.trim().length > 0 &&
+        cloudAdmin.trim().length > 0 &&
+        cloudPassword.length > 0
+      : source === "temp"
+        ? tempKey.trim().length > 0
+        : true;
+  const pending =
+    source === "list"
+      ? countMailboxes(mailboxes)
+      : ready
         ? count
-        : 0
-      : countMailboxes(mailboxes);
+        : 0;
   const running = progress?.running ?? false;
 
   async function start() {
@@ -172,16 +183,17 @@ export function AccountRegisterCard() {
         admin_email: cloudAdmin.trim(),
         admin_password: cloudPassword,
       };
+      // Empty base_url means the module's own default, so a key is enough.
+      const temp = { base_url: tempUrl.trim(), api_key: tempKey.trim() };
+      const body =
+        source === "cloud"
+          ? { ...common, cloud_mail: cloud, count }
+          : source === "temp"
+            ? { ...common, temp_mail: temp, count }
+            : { ...common, mailboxes: mailboxes.split("\n") };
       const started = await jsonRequest<AccountRegisterProgress>(
         "/api/accounts/register",
-        {
-          method: "POST",
-          body: JSON.stringify(
-            source === "cloud"
-              ? { ...common, cloud_mail: cloud, count }
-              : { ...common, mailboxes: mailboxes.split("\n") },
-          ),
-        },
+        { method: "POST", body: JSON.stringify(body) },
       );
       setProgress(started);
       // Remembered on success only, so a rejected address is not the one that
@@ -193,6 +205,12 @@ export function AccountRegisterCard() {
             base_url: cloud.base_url,
             admin_email: cloud.admin_email,
           }),
+        );
+      } else if (source === "temp") {
+        // Only the address. The key reads every mailbox the service hands out.
+        window.localStorage.setItem(
+          TEMP_MAIL_KEY,
+          JSON.stringify({ base_url: temp.base_url }),
         );
       } else {
         // Cleared on success only: a batch that was refused for a bad line has
@@ -221,7 +239,7 @@ export function AccountRegisterCard() {
         <CardDescription>
           用装好的 register 模块直接注册，成功的号会立刻以「停用」状态写进上面的账号池，
           确认后自己启用。拟真开着时一个号 3~5 分钟，中途关掉页面不影响已经建好的。
-          邮箱可以自己备，也可以给一个 Cloud Mail 实例，让它一个号现开一个。
+          邮箱可以自己备，也可以一个号现开一个 —— 给个临时邮箱 API 的 key 最省事。
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -234,7 +252,8 @@ export function AccountRegisterCard() {
             onChange={(event) => setSource(event.target.value as MailSource)}
           >
             <option value="list">凭据列表（自己备好的邮箱）</option>
-            <option value="cloud">Cloud Mail（现开邮箱）</option>
+            <option value="temp">临时邮箱 API（现开，最省事）</option>
+            <option value="cloud">Cloud Mail（现开，自己的实例）</option>
           </select>
         </label>
 
@@ -253,6 +272,52 @@ export function AccountRegisterCard() {
               那两处只有邮箱地址。
             </span>
           </label>
+        ) : source === "temp" ? (
+          <div className="space-y-3">
+            <div className="grid gap-3 sm:grid-cols-4">
+              <label className="space-y-1.5 text-xs font-medium sm:col-span-2">
+                API key
+                <Input
+                  type="password"
+                  value={tempKey}
+                  disabled={running}
+                  placeholder="sk-..."
+                  onChange={(event) => setTempKey(event.target.value)}
+                />
+              </label>
+              <label className="space-y-1.5 text-xs font-medium">
+                注册数量
+                <Input
+                  type="number"
+                  min={1}
+                  max={200}
+                  value={count}
+                  disabled={running}
+                  onChange={(event) =>
+                    setCount(Math.max(0, Number(event.target.value) || 0))
+                  }
+                />
+              </label>
+              <label className="space-y-1.5 text-xs font-medium">
+                接口地址（可选）
+                <Input
+                  value={tempUrl}
+                  disabled={running}
+                  placeholder="留空用默认"
+                  onChange={(event) => setTempUrl(event.target.value)}
+                />
+              </label>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              最省事的一条：一个 key 就够，不用建邮箱也不用填域名。地址由服务端给，
+              每个号换一个域名，本地名也像真人 —— 这两件事自己做都做不好。
+            </p>
+            <p className="text-xs text-muted-foreground">
+              代价是这些邮箱在服务方眼皮底下：验证码信他们看得见，也就意味着这批号的
+              找回邮箱不是你独占的。采集号无所谓，别拿它注册你在乎的东西。key 不记在
+              本机，接口地址记。
+            </p>
+          </div>
         ) : (
           <div className="space-y-3">
             <div className="grid gap-3 sm:grid-cols-4">
