@@ -99,6 +99,41 @@ impl CloudMailConfig {
     }
 }
 
+/// A temp-mail service that hands out an address per request.
+///
+/// The least setup of the three sources: no instance to run, no mailbox to
+/// create, no domain to discover. It returns a fresh address on every call, on a
+/// different domain each time, with a local part that reads like a person's —
+/// all three of which are things this codebase does worse by hand.
+///
+/// The cost is trust. Those mailboxes sit with whoever runs the service: they
+/// can read the verification mail, which means the recovery address of every
+/// account made this way is not exclusively yours. Fine for collectors that only
+/// ever log in from here; not where you would put anything you need to keep.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct TempMailConfig {
+    /// Left empty the module uses its own default, so a run needs only the key.
+    #[serde(default)]
+    pub base_url: String,
+    pub api_key: String,
+}
+
+impl TempMailConfig {
+    fn validate(&self) -> Result<(), WatchServiceError> {
+        if self.api_key.trim().is_empty() {
+            return Err(WatchServiceError::InvalidConfig(
+                "临时邮箱的 API key 是空的".to_owned(),
+            ));
+        }
+        if !self.base_url.trim().is_empty() && !self.base_url.trim().starts_with("http") {
+            return Err(WatchServiceError::InvalidConfig(
+                "临时邮箱地址要带 http:// 或 https://".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// What one run was asked to do.
 #[derive(Clone, Debug, Deserialize)]
 pub struct AccountRegisterRequest {
@@ -109,12 +144,15 @@ pub struct AccountRegisterRequest {
     /// Empty when `cloud_mail` is supplying the addresses instead.
     #[serde(default)]
     pub mailboxes: Vec<String>,
-    /// Open the addresses on a self-hosted instance instead of consuming a
-    /// prepared list. Takes precedence over `mailboxes` when both are given.
+    /// Open the addresses on a Cloud Mail instance instead of consuming a
+    /// prepared list. Takes precedence over the other two when several are given.
     #[serde(default)]
     pub cloud_mail: Option<CloudMailConfig>,
-    /// How many accounts to make. Only read in the `cloud_mail` case — with a
-    /// list, the list length is the count.
+    /// Or get them from a temp-mail service, which needs only a key.
+    #[serde(default)]
+    pub temp_mail: Option<TempMailConfig>,
+    /// How many accounts to make. Only read when the addresses are opened on
+    /// demand — with a list, the list length is the count.
     #[serde(default)]
     pub count: usize,
     /// What the accounts are for once an operator enables them.
@@ -363,6 +401,10 @@ impl RegisterService {
                     serde_json::json!({
                         "mailbox": mailbox,
                         "cloud_mail": cloud,
+                        // No resolve step for this one: there is no token to
+                        // mint and no domain to discover, so the config the
+                        // operator typed is already everything the module needs.
+                        "temp_mail": request.temp_mail,
                         "proxy": request.proxy,
                         "mimic": request.mimic,
                         "poll_tries": request.poll_tries,
@@ -540,8 +582,15 @@ fn address_of(credential: &str) -> Option<String> {
 /// address itself on Cloud Mail. Nothing downstream needs to know which it was —
 /// the real address comes back in the module's answer either way.
 fn jobs_for(request: &AccountRegisterRequest) -> Result<Vec<Option<String>>, WatchServiceError> {
-    if let Some(cloud) = &request.cloud_mail {
-        cloud.validate()?;
+    // Both on-demand sources look the same from here: the module opens the
+    // address, so a job carries no credential and the count is all there is.
+    let on_demand = match (&request.cloud_mail, &request.temp_mail) {
+        (Some(cloud), _) => Some(cloud.validate()),
+        (None, Some(temp)) => Some(temp.validate()),
+        (None, None) => None,
+    };
+    if let Some(validated) = on_demand {
+        validated?;
         if request.count == 0 {
             return Err(WatchServiceError::InvalidConfig(
                 "要注册几个？填个数量".to_owned(),
@@ -561,7 +610,7 @@ fn jobs_for(request: &AccountRegisterRequest) -> Result<Vec<Option<String>>, Wat
         .collect();
     if mailboxes.is_empty() {
         return Err(WatchServiceError::InvalidConfig(
-            "一个邮箱凭据都没有；每行一个，行首 # 会被跳过。或者填 Cloud Mail，让它现开".to_owned(),
+            "一个邮箱凭据都没有；每行一个，行首 # 会被跳过。或者换个来源，让它现开".to_owned(),
         ));
     }
     if mailboxes.len() > MAX_BATCH {
@@ -596,6 +645,7 @@ mod tests {
         AccountRegisterRequest {
             mailboxes: mailboxes.iter().map(|line| (*line).to_owned()).collect(),
             cloud_mail,
+            temp_mail: None,
             count,
             purpose: default_purpose(),
             note: String::new(),
@@ -668,6 +718,45 @@ mod tests {
         ] {
             assert!(jobs_for(&request(&[], Some(broken), 1)).is_err());
         }
+    }
+
+    /// The temp-mail source needs a key and nothing else — no instance, no
+    /// domain — and it takes its count the same way Cloud Mail does.
+    #[test]
+    fn a_temp_mail_key_is_a_complete_source_on_its_own() {
+        let with_key = |key: &str, count: usize| AccountRegisterRequest {
+            temp_mail: Some(TempMailConfig {
+                base_url: String::new(),
+                api_key: key.to_owned(),
+            }),
+            ..request(&[], None, count)
+        };
+        assert!(jobs_for(&with_key("sk-abc", 3)).is_ok());
+        assert_eq!(jobs_for(&with_key("sk-abc", 3)).unwrap().len(), 3);
+        // Same two guards as the other on-demand source.
+        assert!(jobs_for(&with_key("sk-abc", 0)).is_err());
+        assert!(jobs_for(&with_key("  ", 3)).is_err());
+        assert!(jobs_for(&with_key("sk-abc", MAX_BATCH + 1)).is_err());
+    }
+
+    /// Cloud Mail wins when both on-demand sources are filled. Same reasoning as
+    /// the pasted list: two sources both running is nobody's intent.
+    #[test]
+    fn cloud_mail_wins_over_temp_mail() {
+        let both = AccountRegisterRequest {
+            temp_mail: Some(TempMailConfig {
+                base_url: String::new(),
+                api_key: "sk-abc".to_owned(),
+            }),
+            // Incomplete on purpose: if this one is the one being read, it fails,
+            // which is how the test can tell which branch ran.
+            cloud_mail: Some(CloudMailConfig {
+                base_url: "mail.example.com".to_owned(),
+                ..cloud()
+            }),
+            ..request(&[], None, 2)
+        };
+        assert!(jobs_for(&both).is_err());
     }
 
     /// The domain is optional — the module reads it off the instance. An address
