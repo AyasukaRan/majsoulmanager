@@ -95,6 +95,8 @@ export function AccountRegisterCard() {
   const [tempUrl, setTempUrl] = useState("");
   const [tempKey, setTempKey] = useState("");
   const [count, setCount] = useState(5);
+  const [concurrency, setConcurrency] = useState(1);
+  const [randomNode, setRandomNode] = useState(false);
   const [purpose, setPurpose] = useState<StoredAccount["purpose"]>("refetch");
   const [note, setNote] = useState("");
   const [proxy, setProxy] = useState("");
@@ -175,6 +177,8 @@ export function AccountRegisterCard() {
         note,
         proxy: proxy.trim() || null,
         mimic,
+        concurrency,
+        random_node: randomNode,
       };
       // No domain: the module asks the instance which ones it receives and
       // spreads the batch over them.
@@ -410,6 +414,47 @@ export function AccountRegisterCard() {
             />
           </label>
         </div>
+
+        <div className="grid gap-3 sm:grid-cols-3">
+          <label className="space-y-1.5 text-xs font-medium">
+            同时注册几个
+            <Input
+              type="number"
+              min={1}
+              max={16}
+              value={concurrency}
+              disabled={running}
+              onChange={(event) =>
+                setConcurrency(
+                  Math.min(16, Math.max(1, Number(event.target.value) || 1)),
+                )
+              }
+            />
+            <span className="block font-normal text-muted-foreground">
+              一个号的时间九成是拟真停顿，压不下去，只能并着跑。
+              {concurrency > 1
+                ? ` ${count} 个约 ${Math.ceil((count / concurrency) * 3)} 分钟。`
+                : " 一个一个来的话，一个号 3~5 分钟。"}
+            </span>
+          </label>
+        </div>
+
+        <label className="flex items-start gap-2 text-xs">
+          <Checkbox
+            checked={randomNode}
+            disabled={running}
+            onCheckedChange={(value) => setRandomNode(value === true)}
+          />
+          <span>
+            每个号换一个出口节点
+            <span className="block font-normal text-muted-foreground">
+              轮着用 mihomo 上已经建好出站的节点，注册成功后把节点记进账号 ——
+              以后补抓登录它，走的是它注册时那个出口。可用的节点跟着账号池里
+              「已启用的补抓账号绑了哪些节点」走；一个都没有的话这里会直接拒绝开跑，
+              而不是偷偷全从一个地址出去。
+            </span>
+          </span>
+        </label>
 
         <label className="flex items-start gap-2 text-xs">
           <Checkbox

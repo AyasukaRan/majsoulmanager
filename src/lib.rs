@@ -155,6 +155,7 @@ impl AppState {
         let register = Arc::new(RegisterService::new(
             watch_service.module_store(),
             Arc::clone(&accounts),
+            Arc::clone(&mihomo),
             Arc::clone(&watch_logs),
         ));
         // Its own service, sharing only the log buffer: it never touches

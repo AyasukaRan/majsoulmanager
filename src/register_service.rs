@@ -47,6 +47,16 @@ const MAX_BATCH: usize = 200;
 /// Three rather than one, so a single flaky account does not end a batch.
 const GIVE_UP_AFTER: usize = 3;
 
+/// How many accounts may be registered at once.
+///
+/// Each one is its own module process and its own TLS session, so this is
+/// bounded by what a deployment can sanely have talking to Mahjong Soul from
+/// one place at one time — not by anything in this file. Sixteen because past
+/// that the exits stop being distinguishable: a run wider than the node list
+/// puts several accounts on the same address at the same moment, which is the
+/// thing spreading them out was for.
+const MAX_CONCURRENCY: usize = 16;
+
 /// A Cloud Mail instance, used as the mailbox supply.
 ///
 /// With one of these a run needs no mailbox list at all: the module opens a
@@ -182,6 +192,18 @@ pub struct AccountRegisterRequest {
     pub poll_tries: u32,
     #[serde(default = "default_poll_interval")]
     pub poll_interval: f64,
+    /// How many accounts to register at once. Clamped to
+    /// [`MAX_CONCURRENCY`]; one is the old behaviour.
+    #[serde(default = "default_concurrency")]
+    pub concurrency: usize,
+    /// Give each account its own mihomo exit instead of sending the whole batch
+    /// out of one address.
+    ///
+    /// Only nodes that already have a listener are used — see
+    /// `exits_for`. Registering does not create listeners: that
+    /// would rewrite the outbound assignment the re-fetch pool is running on.
+    #[serde(default)]
+    pub random_node: bool,
 }
 
 fn default_purpose() -> AccountPurpose {
@@ -195,6 +217,9 @@ fn default_poll_tries() -> u32 {
 }
 fn default_poll_interval() -> f64 {
     3.0
+}
+fn default_concurrency() -> usize {
+    1
 }
 
 /// One account's result, as the console reads it.
@@ -233,6 +258,11 @@ pub struct AccountRegisterProgress {
 pub struct RegisterService {
     modules: Arc<ModuleStore>,
     accounts: Arc<AccountPool>,
+    /// Only read to find the per-node listeners a run may go out of. Never
+    /// written: the outbound assignment belongs to the account pool, and
+    /// rewriting it here would move the exits of the re-fetch sessions that are
+    /// running at the time.
+    mihomo: Arc<crate::mihomo::MihomoManager>,
     logs: Arc<WatchLogBuffer>,
     progress: RwLock<AccountRegisterProgress>,
     /// Bumped by `stop`. The loop checks it between accounts, which is the only
@@ -245,11 +275,13 @@ impl RegisterService {
     pub fn new(
         modules: Arc<ModuleStore>,
         accounts: Arc<AccountPool>,
+        mihomo: Arc<crate::mihomo::MihomoManager>,
         logs: Arc<WatchLogBuffer>,
     ) -> Self {
         Self {
             modules,
             accounts,
+            mihomo,
             logs,
             progress: RwLock::new(AccountRegisterProgress::default()),
             generation: AtomicU64::new(0),
@@ -298,7 +330,9 @@ impl RegisterService {
         let generation = self.generation.load(Ordering::SeqCst);
         let service = Arc::clone(self);
         tokio::spawn(async move {
-            let outcome = service.run(generation, module, jobs, request).await;
+            let outcome = Arc::clone(&service)
+                .run(generation, module, jobs, request)
+                .await;
             let mut progress = service.progress.write();
             progress.running = false;
             progress.current = None;
@@ -315,18 +349,27 @@ impl RegisterService {
     }
 
     async fn run(
-        &self,
+        self: Arc<Self>,
         generation: u64,
         module: crate::watch_service::ModuleRef,
         jobs: Vec<Option<String>>,
         request: AccountRegisterRequest,
     ) -> Result<String, WatchServiceError> {
         let total = jobs.len();
+        let concurrency = request
+            .concurrency
+            .clamp(1, MAX_CONCURRENCY)
+            .min(total.max(1));
         self.report(
             WatchLogLevel::Info,
             format!(
-                "开始注册 {} 个账号，用模块 {}@{}{}",
+                "开始注册 {} 个账号，{}，用模块 {}@{}{}",
                 total,
+                if concurrency > 1 {
+                    format!("{concurrency} 个一起跑")
+                } else {
+                    "一个一个来".to_owned()
+                },
                 module.name,
                 module.version,
                 if request.mimic {
@@ -336,6 +379,27 @@ impl RegisterService {
                 }
             ),
         );
+
+        // Which exits the accounts leave from, decided once. Empty means every
+        // account uses whatever `proxy` says, which is the old behaviour.
+        let exits = if request.random_node {
+            let found = self.exits().await;
+            if found.is_empty() {
+                return Err(WatchServiceError::InvalidConfig(
+                    "没有可用的出口节点：mihomo 的按节点出站是跟着账号池里\
+                     「已启用的补抓账号绑了哪些节点」走的，先去账号池给几个补抓账号选上节点并保存"
+                        .to_owned(),
+                ));
+            }
+            self.report(
+                WatchLogLevel::Info,
+                format!("出口节点 {} 个：{}", found.len(), found.join("、")),
+            );
+            found
+        } else {
+            Vec::new()
+        };
+
         let worker = self
             .modules
             .worker(ModuleKind::Register, &module)
@@ -387,12 +451,39 @@ impl RegisterService {
             None => None,
         };
 
-        let mut streak = 0usize;
+        // The resolve worker has done its one job. Each account gets its own
+        // process below: `PluginWorker` is one request at a time — the input
+        // lock is dropped before the response is read — so sharing one across
+        // concurrent registrations would have them read each other's answers.
+        worker.shutdown().await;
+
+        let request = Arc::new(request);
+        let cloud = Arc::new(cloud);
+        // A permit is one account in flight. Taking it before spawning is what
+        // makes the loop itself the queue: it blocks here until somebody
+        // finishes, so `jobs` is never all resident at once.
+        let gate = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let streak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut launched = 0usize;
+        let mut stopped = false;
+
         for (index, mailbox) in jobs.into_iter().enumerate() {
+            let permit = Arc::clone(&gate)
+                .acquire_owned()
+                .await
+                .expect("semaphore is never closed");
             if self.generation.load(Ordering::SeqCst) != generation {
-                worker.shutdown().await;
-                return Ok("已停止".to_owned());
+                stopped = true;
+                break;
             }
+            // Checked here rather than inside the task so the ones already in
+            // flight are allowed to finish — an account abandoned mid-flight
+            // exists on Mahjong Soul's side with a password nobody kept.
+            if streak.load(Ordering::SeqCst) >= GIVE_UP_AFTER {
+                break;
+            }
+
             // The address is derived here only to have something to show and log
             // while the module works. The credential itself never leaves this
             // function. With Cloud Mail there is nothing to derive it from yet —
@@ -404,51 +495,133 @@ impl RegisterService {
                 }
                 None => format!("第 {}/{total} 个（正在开邮箱）", index + 1),
             };
-            self.progress.write().current = Some(address.clone());
-            self.report(WatchLogLevel::Info, format!("{address} 注册中"));
+            // Round robin rather than random: with N exits and N accounts in
+            // flight, this is the only assignment where no two of them share an
+            // address at the same moment.
+            let node = (!exits.is_empty()).then(|| exits[index % exits.len()].clone());
 
-            let answer = worker
-                .request(
-                    "register",
-                    serde_json::json!({
-                        "mailbox": mailbox,
-                        "cloud_mail": cloud,
-                        // No resolve step for this one: there is no token to
-                        // mint and no domain to discover, so the config the
-                        // operator typed is already everything the module needs.
-                        "temp_mail": request.temp_mail,
-                        "proxy": request.proxy,
-                        "mimic": request.mimic,
-                        "poll_tries": request.poll_tries,
-                        "poll_interval": request.poll_interval,
-                    }),
-                )
-                .await;
-            let outcome = self.settle(&address, answer, &request);
-            let failure = (!outcome.ok).then(|| format!("[{}] {}", outcome.stage, outcome.detail));
-            self.progress.write().outcomes.push(outcome);
-
-            match failure {
-                Some(detail) => {
-                    streak = failures_in_a_row(streak, false);
-                    if streak >= GIVE_UP_AFTER {
-                        worker.shutdown().await;
-                        let skipped = total - index - 1;
-                        return Ok(format!(
-                            "连着 {GIVE_UP_AFTER} 个都失败了，剩下 {skipped} 个没有再试。\
-                             最后一个的原因：{detail}"
-                        ));
-                    }
-                }
-                None => streak = failures_in_a_row(streak, true),
-            }
+            let service = Arc::clone(&self);
+            let module = module.clone();
+            let request = Arc::clone(&request);
+            let cloud = Arc::clone(&cloud);
+            let streak = Arc::clone(&streak);
+            launched += 1;
+            tasks.spawn(async move {
+                let _permit = permit;
+                service
+                    .one_account(module, address, mailbox, cloud, node, request, streak)
+                    .await;
+            });
         }
-        worker.shutdown().await;
+        while tasks.join_next().await.is_some() {}
+
+        if stopped {
+            return Ok("已停止".to_owned());
+        }
+        if streak.load(Ordering::SeqCst) >= GIVE_UP_AFTER {
+            let skipped = total - launched;
+            return Ok(format!(
+                "连着 {GIVE_UP_AFTER} 个都失败了，剩下 {skipped} 个没有再试。\
+                 最后一个的原因：{}",
+                self.last_failure()
+            ));
+        }
         let progress = self.progress.read();
         Ok(format!(
             "注册结束：成功 {}，失败 {}",
             progress.succeeded, progress.failed
         ))
+    }
+
+    /// The nodes a run may go out of: those mihomo already has a listener on.
+    ///
+    /// Deliberately read-only. The outbound assignment is derived from the
+    /// account pool — which nodes the *enabled re-fetch* accounts name — and
+    /// registering into it would be a write with two problems: `set_outbound_nodes`
+    /// is set-replacement, so adding one node drops the slots of every node the
+    /// pool is using, and the new assignment is not live until mihomo has
+    /// reloaded, which takes up to a minute. An account made here is disabled,
+    /// so it would be dropped from that list again at the next save anyway.
+    ///
+    /// So: use the exits that exist. To have more of them, bind more nodes in
+    /// the account pool.
+    async fn exits(&self) -> Vec<String> {
+        usable_exits(self.mihomo.status().await.outbounds)
+    }
+
+    /// The most recent failure, for the message that ends a given-up run.
+    fn last_failure(&self) -> String {
+        self.progress
+            .read()
+            .outcomes
+            .iter()
+            .rev()
+            .find(|outcome| !outcome.ok)
+            .map(|outcome| format!("[{}] {}", outcome.stage, outcome.detail))
+            .unwrap_or_else(|| "（没记下原因）".to_owned())
+    }
+
+    /// One account, start to finish, in its own module process.
+    #[allow(clippy::too_many_arguments)]
+    async fn one_account(
+        self: Arc<Self>,
+        module: crate::watch_service::ModuleRef,
+        address: String,
+        mailbox: Option<String>,
+        cloud: Arc<Option<serde_json::Value>>,
+        node: Option<String>,
+        request: Arc<AccountRegisterRequest>,
+        streak: Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        // A node with no listener falls back to whatever `proxy` says rather
+        // than to no proxy at all: dialling nothing is not a quieter exit, it is
+        // this host's own address.
+        let proxy = node
+            .as_deref()
+            .and_then(|node| self.mihomo.proxy_url_for_node(node))
+            .or_else(|| request.proxy.clone());
+
+        self.progress.write().current = Some(address.clone());
+        self.report(
+            WatchLogLevel::Info,
+            match &node {
+                Some(node) => format!("{address} 注册中（出口 {node}）"),
+                None => format!("{address} 注册中"),
+            },
+        );
+
+        let answer = match self.modules.worker(ModuleKind::Register, &module).await {
+            Ok(Some(worker)) => {
+                let answer = worker
+                    .request(
+                        "register",
+                        serde_json::json!({
+                            "mailbox": mailbox,
+                            "cloud_mail": *cloud,
+                            // No resolve step for this one: there is no token to
+                            // mint and no domain to discover, so the config the
+                            // operator typed is already everything the module needs.
+                            "temp_mail": request.temp_mail,
+                            "proxy": proxy,
+                            "mimic": request.mimic,
+                            "poll_tries": request.poll_tries,
+                            "poll_interval": request.poll_interval,
+                        }),
+                    )
+                    .await;
+                worker.shutdown().await;
+                answer
+            }
+            Ok(None) => Err(WatchServiceError::InvalidConfig(
+                "注册没有内建实现，必须装模块".to_owned(),
+            )),
+            Err(error) => Err(error),
+        };
+
+        let outcome = self.settle(&address, answer, &request, node);
+        let ok = outcome.ok;
+        self.progress.write().outcomes.push(outcome);
+        note_result(&streak, ok);
     }
 
     /// Turns one module answer into an outcome, storing the account first.
@@ -461,6 +634,7 @@ impl RegisterService {
         address: &str,
         answer: Result<serde_json::Value, WatchServiceError>,
         request: &AccountRegisterRequest,
+        node: Option<String>,
     ) -> AccountRegisterOutcome {
         let mut outcome = AccountRegisterOutcome {
             email: address.to_owned(),
@@ -521,6 +695,11 @@ impl RegisterService {
         // Disabled: an account nobody has looked at must not start logging in on
         // its own. `note` carries whatever the operator typed for the batch, so
         // a run can be told apart from the next one in the list.
+        //
+        // `node` is where this account was made from. Recording it means that
+        // once somebody enables it, the re-fetch pool logs in from the same
+        // address it registered from — the alternative is an account born on one
+        // exit and used from another, which is a thing to be noticed.
         let stored = StoredAccount {
             id: String::new(),
             username: email.clone(),
@@ -528,7 +707,7 @@ impl RegisterService {
             purpose: request.purpose,
             note: request.note.clone(),
             enabled: false,
-            node: String::new(),
+            node: node.unwrap_or_default(),
         };
         match self.accounts.append(vec![stored]) {
             Ok(1) => {
@@ -647,12 +826,40 @@ fn jobs_for(request: &AccountRegisterRequest) -> Result<Vec<Option<String>>, Wat
     Ok(mailboxes)
 }
 
-/// Failures in a row, cleared by any success.
+/// The outbounds a batch may actually leave from.
+///
+/// `available` alone is not enough. A group exists from the moment it is
+/// written, but until mihomo has applied the selection it is still on the
+/// shared exit — `selected_node` says `MAJSOUL` rather than the node. Taking
+/// those would put the whole batch back on one address while the log claimed it
+/// was spread over several, which is worse than not spreading it at all.
+fn usable_exits(outbounds: Vec<crate::mihomo::MihomoOutboundStatus>) -> Vec<String> {
+    outbounds
+        .into_iter()
+        .filter(|outbound| {
+            outbound.available && outbound.selected_node.as_deref() == Some(&outbound.node)
+        })
+        .map(|outbound| outbound.node)
+        .collect()
+}
+
+/// Records one result in the shared failure streak, returning the new value.
 ///
 /// In a row, not in total: a batch where every third account fails is annoying
 /// but working, and a running total would stop it at the third failure.
-fn failures_in_a_row(current: usize, ok: bool) -> usize {
-    if ok { 0 } else { current + 1 }
+///
+/// Shared, because accounts run concurrently. Under concurrency "in a row"
+/// means "since the last success", which is the property that matters — a run
+/// where nothing has succeeded for three finishes is a run to stop, whatever
+/// order they landed in. Both branches are single atomic operations, so a
+/// success can never be lost to a failure racing it.
+fn note_result(streak: &std::sync::atomic::AtomicUsize, ok: bool) -> usize {
+    if ok {
+        streak.store(0, Ordering::SeqCst);
+        0
+    } else {
+        streak.fetch_add(1, Ordering::SeqCst) + 1
+    }
 }
 
 fn too_many(count: usize) -> WatchServiceError {
@@ -689,6 +896,8 @@ mod tests {
             mimic: true,
             poll_tries: default_poll_tries(),
             poll_interval: default_poll_interval(),
+            concurrency: default_concurrency(),
+            random_node: false,
         }
     }
 
@@ -815,18 +1024,74 @@ mod tests {
     /// row is a batch where something is wrong with every account.
     #[test]
     fn a_success_clears_the_failure_streak() {
-        let mut streak = 0;
+        let streak = std::sync::atomic::AtomicUsize::new(0);
         for ok in [false, false, true, false, false] {
-            streak = failures_in_a_row(streak, ok);
+            note_result(&streak, ok);
         }
-        assert_eq!(streak, 2, "中间那次成功该把连败清零");
-        assert!(streak < GIVE_UP_AFTER, "这样的一批不该被中止");
+        assert_eq!(streak.load(Ordering::SeqCst), 2, "中间那次成功该把连败清零");
+        assert!(
+            streak.load(Ordering::SeqCst) < GIVE_UP_AFTER,
+            "这样的一批不该被中止"
+        );
 
-        let mut streak = 0;
+        let streak = std::sync::atomic::AtomicUsize::new(0);
         for ok in [false, false, false] {
-            streak = failures_in_a_row(streak, ok);
+            note_result(&streak, ok);
         }
-        assert!(streak >= GIVE_UP_AFTER, "连着三个失败就该停");
+        assert!(
+            streak.load(Ordering::SeqCst) >= GIVE_UP_AFTER,
+            "连着三个失败就该停"
+        );
+
+        // A success landing between concurrent failures still clears it — that
+        // is the whole reason this is one atomic op rather than load-then-store.
+        assert_eq!(note_result(&streak, true), 0);
+    }
+
+    /// A node that mihomo has not actually switched to is not an exit.
+    ///
+    /// The group is written before it is applied, so between those two moments
+    /// it exists, reports `available`, and still points at the shared exit.
+    /// Counting it would put the batch back on one address while the log said
+    /// otherwise — the failure would look like success.
+    #[test]
+    fn only_the_outbounds_mihomo_has_switched_over_count() {
+        use crate::mihomo::MihomoOutboundStatus;
+        let outbound = |node: &str, selected: Option<&str>, available: bool| MihomoOutboundStatus {
+            node: node.to_owned(),
+            group: format!("MAJSOUL-OUT-{node}"),
+            proxy_url: "http://mihomo:7901/".to_owned(),
+            selected_node: selected.map(str::to_owned),
+            available,
+        };
+        let exits = usable_exits(vec![
+            outbound("日本 07", Some("日本 07"), true),
+            // Written but not applied yet — still on the shared exit.
+            outbound("新加坡 02", Some("MAJSOUL"), true),
+            // The group is gone from mihomo entirely.
+            outbound("香港 11", Some("香港 11"), false),
+            // Never selected at all.
+            outbound("美国 03", None, true),
+        ]);
+        assert_eq!(exits, vec!["日本 07".to_owned()]);
+    }
+
+    /// Concurrency is clamped, not trusted.
+    ///
+    /// It arrives from a request body, and both ends of the range are real: 0
+    /// would spawn nothing and hang on a semaphore that never issues, and a
+    /// large number would have more sessions talking to Mahjong Soul from this
+    /// deployment at once than it has exits to spread them over.
+    #[test]
+    fn concurrency_is_clamped_to_the_range_the_form_offers() {
+        let clamp = |asked: usize, jobs: usize| asked.clamp(1, MAX_CONCURRENCY).min(jobs.max(1));
+        assert_eq!(clamp(0, 10), 1, "0 会挂在永远发不出的名额上");
+        assert_eq!(clamp(1, 10), 1);
+        assert_eq!(clamp(16, 100), 16);
+        assert_eq!(clamp(999, 100), MAX_CONCURRENCY);
+        // Never wider than the work: eight permits for three accounts just
+        // leaves five idle.
+        assert_eq!(clamp(8, 3), 3);
     }
 
     /// Only the address, never the credential.
