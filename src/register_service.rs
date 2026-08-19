@@ -36,13 +36,87 @@ const LOG_SOURCE: &str = "register";
 /// still going tomorrow.
 const MAX_BATCH: usize = 200;
 
+/// A Cloud Mail instance, used as the mailbox supply.
+///
+/// With one of these a run needs no mailbox list at all: the module opens a
+/// fresh address per account through the open API and reads the code back out
+/// of the same instance. That is the whole point — third-party mailboxes are a
+/// consumable somebody has to keep buying, and the last batch ran out.
+///
+/// Only `base_url` is really required. The token can be minted from the
+/// administrator's own credentials, and the domains are read off the instance,
+/// so the usual case is an address and a password.
+///
+/// It has to be an instance you administer. The open API authenticates with a
+/// token and never sees Turnstile; the other way in — registering an ordinary
+/// user per account — does have to pass Turnstile, and public instances
+/// generally also close 一个账号多个邮箱, which caps you at one address.
+///
+/// Both `token` and `admin_password` are secrets: they go to the module and
+/// nowhere else, never into a log line or a status response.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct CloudMailConfig {
+    /// Where the instance lives, e.g. `https://mail.example.com`. Paths are
+    /// appended by the module.
+    pub base_url: String,
+    /// An open API token that already exists. Skips minting one — which
+    /// matters, because minting invalidates whatever token was there before.
+    #[serde(default)]
+    pub token: String,
+    #[serde(default)]
+    pub admin_email: String,
+    #[serde(default)]
+    pub admin_password: String,
+    /// Pin the new addresses to one domain. Empty spreads them over every
+    /// domain the instance says it receives — which is the better default, since
+    /// a batch that all shares one suffix is itself something to be caught by.
+    #[serde(default)]
+    pub domain: String,
+}
+
+impl CloudMailConfig {
+    fn validate(&self) -> Result<(), WatchServiceError> {
+        if self.base_url.trim().is_empty() {
+            return Err(WatchServiceError::InvalidConfig(
+                "Cloud Mail 的地址是空的".to_owned(),
+            ));
+        }
+        if !self.base_url.trim().starts_with("http") {
+            return Err(WatchServiceError::InvalidConfig(
+                "Cloud Mail 地址要带 http:// 或 https://".to_owned(),
+            ));
+        }
+        // One of the two ways in has to be there. Neither means the run would
+        // get as far as the first account before finding out.
+        if self.token.trim().is_empty()
+            && !(!self.admin_email.trim().is_empty() && !self.admin_password.is_empty())
+        {
+            return Err(WatchServiceError::InvalidConfig(
+                "Cloud Mail 要么给开放 API 令牌，要么给管理员邮箱和密码".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// What one run was asked to do.
 #[derive(Clone, Debug, Deserialize)]
 pub struct AccountRegisterRequest {
     /// One mailbox credential per entry. The e-mail address is read out of the
     /// string and the whole string is the key that reads its inbox, so this is
     /// a secret — it never appears in a log line or in a status response.
+    ///
+    /// Empty when `cloud_mail` is supplying the addresses instead.
+    #[serde(default)]
     pub mailboxes: Vec<String>,
+    /// Open the addresses on a self-hosted instance instead of consuming a
+    /// prepared list. Takes precedence over `mailboxes` when both are given.
+    #[serde(default)]
+    pub cloud_mail: Option<CloudMailConfig>,
+    /// How many accounts to make. Only read in the `cloud_mail` case — with a
+    /// list, the list length is the count.
+    #[serde(default)]
+    pub count: usize,
     /// What the accounts are for once an operator enables them.
     #[serde(default = "default_purpose")]
     pub purpose: AccountPurpose,
@@ -151,23 +225,7 @@ impl RegisterService {
         self: &Arc<Self>,
         request: AccountRegisterRequest,
     ) -> Result<(), WatchServiceError> {
-        let mailboxes: Vec<String> = request
-            .mailboxes
-            .iter()
-            .map(|line| line.trim().to_owned())
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .collect();
-        if mailboxes.is_empty() {
-            return Err(WatchServiceError::InvalidConfig(
-                "一个邮箱凭据都没有；每行一个，行首 # 会被跳过".to_owned(),
-            ));
-        }
-        if mailboxes.len() > MAX_BATCH {
-            return Err(WatchServiceError::InvalidConfig(format!(
-                "一次最多 {MAX_BATCH} 个，这次给了 {}；一个号要几分钟，分批跑",
-                mailboxes.len()
-            )));
-        }
+        let jobs = jobs_for(&request)?;
         // Checked before the task starts so "没装注册模块" is the answer to the
         // button press rather than a log line somebody finds later.
         let module = self.modules.sole(ModuleKind::Register)?;
@@ -183,7 +241,7 @@ impl RegisterService {
             // failures beside this batch's counters is unreadable.
             *progress = AccountRegisterProgress {
                 running: true,
-                total: mailboxes.len(),
+                total: jobs.len(),
                 started_at: Some(Utc::now()),
                 ..Default::default()
             };
@@ -191,7 +249,7 @@ impl RegisterService {
         let generation = self.generation.load(Ordering::SeqCst);
         let service = Arc::clone(self);
         tokio::spawn(async move {
-            let outcome = service.run(generation, module, mailboxes, request).await;
+            let outcome = service.run(generation, module, jobs, request).await;
             let mut progress = service.progress.write();
             progress.running = false;
             progress.current = None;
@@ -211,14 +269,15 @@ impl RegisterService {
         &self,
         generation: u64,
         module: crate::watch_service::ModuleRef,
-        mailboxes: Vec<String>,
+        jobs: Vec<Option<String>>,
         request: AccountRegisterRequest,
     ) -> Result<String, WatchServiceError> {
+        let total = jobs.len();
         self.report(
             WatchLogLevel::Info,
             format!(
                 "开始注册 {} 个账号，用模块 {}@{}{}",
-                mailboxes.len(),
+                total,
                 module.name,
                 module.version,
                 if request.mimic {
@@ -236,15 +295,65 @@ impl RegisterService {
                 WatchServiceError::InvalidConfig("注册没有内建实现，必须装模块".to_owned())
             })?;
 
-        for mailbox in mailboxes {
+        // Once for the whole run, not once per account: the token Cloud Mail
+        // mints is the only one it has, so minting per account would have each
+        // one invalidate the token the previous account is still polling with.
+        // Also the point where a wrong password or a domain the instance does
+        // not receive is reported — before any mailbox or code is spent.
+        let cloud = match &request.cloud_mail {
+            Some(config) => {
+                let resolved = worker
+                    .request(
+                        "cloud_mail_resolve",
+                        serde_json::json!({ "cloud_mail": config, "proxy": request.proxy }),
+                    )
+                    .await
+                    .inspect_err(|error| {
+                        self.report(WatchLogLevel::Warn, format!("Cloud Mail 连不上：{error}"))
+                    })?;
+                self.report(
+                    WatchLogLevel::Info,
+                    format!(
+                        "Cloud Mail 可用域名 {}",
+                        resolved
+                            .get("domains")
+                            .and_then(|domains| domains.as_array())
+                            .map(|domains| domains
+                                .iter()
+                                .filter_map(|domain| domain.as_str())
+                                .collect::<Vec<_>>()
+                                .join("、"))
+                            .unwrap_or_default()
+                    ),
+                );
+                // The instance address is not in the resolved answer, and the
+                // token in it replaces whatever was configured.
+                Some(serde_json::json!({
+                    "base_url": config.base_url,
+                    "token": resolved.get("token"),
+                    "domains": resolved.get("domains"),
+                    "min_prefix": resolved.get("min_prefix"),
+                }))
+            }
+            None => None,
+        };
+
+        for (index, mailbox) in jobs.into_iter().enumerate() {
             if self.generation.load(Ordering::SeqCst) != generation {
                 worker.shutdown().await;
                 return Ok("已停止".to_owned());
             }
             // The address is derived here only to have something to show and log
             // while the module works. The credential itself never leaves this
-            // function.
-            let address = address_of(&mailbox).unwrap_or_else(|| "（读不出邮箱）".to_owned());
+            // function. With Cloud Mail there is nothing to derive it from yet —
+            // the module opens the address — so the counter stands in until the
+            // answer comes back with the real one.
+            let address = match &mailbox {
+                Some(credential) => {
+                    address_of(credential).unwrap_or_else(|| "（读不出邮箱）".to_owned())
+                }
+                None => format!("第 {}/{total} 个（正在开邮箱）", index + 1),
+            };
             self.progress.write().current = Some(address.clone());
             self.report(WatchLogLevel::Info, format!("{address} 注册中"));
 
@@ -253,6 +362,7 @@ impl RegisterService {
                     "register",
                     serde_json::json!({
                         "mailbox": mailbox,
+                        "cloud_mail": cloud,
                         "proxy": request.proxy,
                         "mimic": request.mimic,
                         "poll_tries": request.poll_tries,
@@ -424,9 +534,154 @@ fn address_of(credential: &str) -> Option<String> {
     Some(candidate)
 }
 
+/// The work list for one run: one entry per account.
+///
+/// `Some(credential)` is a prepared mailbox; `None` means the module opens the
+/// address itself on Cloud Mail. Nothing downstream needs to know which it was —
+/// the real address comes back in the module's answer either way.
+fn jobs_for(request: &AccountRegisterRequest) -> Result<Vec<Option<String>>, WatchServiceError> {
+    if let Some(cloud) = &request.cloud_mail {
+        cloud.validate()?;
+        if request.count == 0 {
+            return Err(WatchServiceError::InvalidConfig(
+                "要注册几个？填个数量".to_owned(),
+            ));
+        }
+        if request.count > MAX_BATCH {
+            return Err(too_many(request.count));
+        }
+        return Ok(vec![None; request.count]);
+    }
+    let mailboxes: Vec<Option<String>> = request
+        .mailboxes
+        .iter()
+        .map(|line| line.trim().to_owned())
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(Some)
+        .collect();
+    if mailboxes.is_empty() {
+        return Err(WatchServiceError::InvalidConfig(
+            "一个邮箱凭据都没有；每行一个，行首 # 会被跳过。或者填 Cloud Mail，让它现开".to_owned(),
+        ));
+    }
+    if mailboxes.len() > MAX_BATCH {
+        return Err(too_many(mailboxes.len()));
+    }
+    Ok(mailboxes)
+}
+
+fn too_many(count: usize) -> WatchServiceError {
+    WatchServiceError::InvalidConfig(format!(
+        "一次最多 {MAX_BATCH} 个，这次是 {count}；一个号要几分钟，分批跑"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cloud() -> CloudMailConfig {
+        CloudMailConfig {
+            base_url: "https://mail.example.com".to_owned(),
+            token: "9f4e298e-7431-4c76-bc15-4931c3a73984".to_owned(),
+            ..Default::default()
+        }
+    }
+
+    fn request(
+        mailboxes: &[&str],
+        cloud_mail: Option<CloudMailConfig>,
+        count: usize,
+    ) -> AccountRegisterRequest {
+        AccountRegisterRequest {
+            mailboxes: mailboxes.iter().map(|line| (*line).to_owned()).collect(),
+            cloud_mail,
+            count,
+            purpose: default_purpose(),
+            note: String::new(),
+            proxy: None,
+            mimic: true,
+            poll_tries: default_poll_tries(),
+            poll_interval: default_poll_interval(),
+        }
+    }
+
+    /// Cloud Mail replaces the list rather than supplementing it.
+    ///
+    /// Both filled is what a console left on the other tab produces. Registering
+    /// the pasted list *and* `count` fresh ones would quietly do twice the work
+    /// the operator asked for, on mailboxes they thought they had switched away
+    /// from.
+    #[test]
+    fn cloud_mail_wins_over_a_pasted_list() {
+        let jobs = jobs_for(&request(&["a@b.com----pw"], Some(cloud()), 3)).unwrap();
+        assert_eq!(jobs, vec![None, None, None]);
+    }
+
+    #[test]
+    fn a_list_run_keeps_its_credentials_and_drops_blanks_and_comments() {
+        let jobs = jobs_for(&request(
+            &[" a@b.com----pw ", "", "# 注释", "c@d.com"],
+            None,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(
+            jobs,
+            vec![Some("a@b.com----pw".to_owned()), Some("c@d.com".to_owned())]
+        );
+    }
+
+    /// A count of zero is the state the form starts in, not a request to do
+    /// nothing: it has to be refused at the button rather than start a run that
+    /// finishes instantly having made nothing.
+    #[test]
+    fn cloud_mail_needs_a_count_and_respects_the_batch_cap() {
+        assert!(jobs_for(&request(&[], Some(cloud()), 0)).is_err());
+        assert!(jobs_for(&request(&[], Some(cloud()), MAX_BATCH + 1)).is_err());
+        assert!(jobs_for(&request(&[], Some(cloud()), MAX_BATCH)).is_ok());
+    }
+
+    #[test]
+    fn an_incomplete_cloud_mail_is_refused_at_the_button() {
+        for broken in [
+            CloudMailConfig {
+                base_url: String::new(),
+                ..cloud()
+            },
+            // Neither way in: no token, and half-filled administrator credentials.
+            CloudMailConfig {
+                token: "  ".to_owned(),
+                ..cloud()
+            },
+            CloudMailConfig {
+                token: String::new(),
+                admin_email: "admin@example.com".to_owned(),
+                ..cloud()
+            },
+            // A bare hostname would be pasted onto the path and requested as a
+            // relative URL; better to say so than to fail per account.
+            CloudMailConfig {
+                base_url: "mail.example.com".to_owned(),
+                ..cloud()
+            },
+        ] {
+            assert!(jobs_for(&request(&[], Some(broken), 1)).is_err());
+        }
+    }
+
+    /// The domain is optional — the module reads it off the instance. An address
+    /// and a way in is the whole of it, which is the point of "给个地址就行".
+    #[test]
+    fn an_address_and_administrator_credentials_are_enough() {
+        let config = CloudMailConfig {
+            base_url: "https://mail.example.com".to_owned(),
+            admin_email: "admin@example.com".to_owned(),
+            admin_password: "hunter2".to_owned(),
+            ..Default::default()
+        };
+        assert!(jobs_for(&request(&[], Some(config), 2)).is_ok());
+    }
 
     /// Only the address, never the credential.
     ///

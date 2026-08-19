@@ -13,6 +13,7 @@
 
 流程 (还原自真实网页客户端抓包)
 ------------------------------
+  0. 邮箱: 人肉准备的凭据串, 或在自建 Cloud Mail 上现开一个 (见下)
   1. POST common-202411.maj-soul.com/api/user/sign_up_code   发验证码
   2. 轮询邮箱取 6 位验证码
   3. GET  route-2.maj-soul.com/api/clientgate/routes         发现 WS 网关
@@ -21,12 +22,26 @@
 
 密码算法 HMAC-SHA256(key="lailai", 明文) -> 64 hex。发码时间窗内无图形验证码。
 
+邮箱从哪来
+----------
+凭据串 (`mailbox`) 是原来的路子: 一行一个第三方邮箱, 用完就没了。
+`cloud_mail` 是另一条: 给一个 Cloud Mail 实例, 每个号在上面现开一个地址, 再从同一个
+实例把码读回来 —— 邮箱不再是要人肉备货的消耗品。两者二选一, 给了 `cloud_mail` 就不
+看 `mailbox`。
+
+要能全自动, 这个实例得是你有管理员账号的 (自建的, 或者别人给了你管理员权限)。开放
+API 走令牌, 不过 Turnstile; 而公共实例那条"注册个普通用户"的路要过人机验证, 而且
+多半还关了"一个账号多个邮箱", 一个地址只能注册一个雀魂号, 自动不起来。
+
+调用方先调一次 `cloud_mail_resolve` 把地址补全成 {令牌, 域名列表, 前缀下限}, 再把结果
+逐个传给 `register`。
+
 协议
 ----
 stdin/stdout 上的 JSON 行, `watch_service.rs` 里 `PluginWorker` 那套:
     <- {"id":N,"protocol_version":1,"method":"...","params":{...}}
     -> {"id":N,"ok":true,"result":{...}}   或   {"id":N,"ok":false,"error":"..."}
-方法: health / register
+方法: health / cloud_mail_resolve / register
 
 一次调用注册一个账号, 由管理台循环 —— 进度是逐个报出来的, 而一次注册连取码带
 拟真要几分钟, 攒成一批只会让人盯着一个不动的进度条。
@@ -65,6 +80,13 @@ ROUTES_URL = (
     f"?platform=Web&version={CLIENT_VERSION}&lang=chs_t"
 )
 CODE_API = "https://query.paopaodw.com/api/GetLastEmails"
+# 自建 Cloud Mail 的开放 API (https://doc.skymail.ink/api/api-doc)。base_url 由调用
+# 方给, 这里只有路径。websiteConfig 不在开放 API 里, 但它不需要鉴权, 而且是唯一能问
+# 出"这个实例在收哪些域名"的地方 —— 有它才能只填一个地址就开跑。
+CLOUD_MAIL_GEN_TOKEN = "/api/public/genToken"
+CLOUD_MAIL_ADD_USER = "/api/public/addUser"
+CLOUD_MAIL_EMAIL_LIST = "/api/public/emailList"
+CLOUD_MAIL_WEBSITE_CONFIG = "/api/setting/websiteConfig"
 # 客户端遥测 (阿里云 SLS)。参数里直接带 account_id, 所以服务端不需要任何指纹关联:
 # 拿账号表 join 一下日志表就知道这个号从没跑过客户端。
 TELEMETRY_URL = "https://majsoul-hk-client.cn-hongkong.log.aliyuncs.com/logstores/client/track"
@@ -401,10 +423,13 @@ async def send_telemetry(session, p: dict, account_id: int, device_id: str,
 
 
 # ============================ 取验证码 ============================
-def _mail_is_new(date_str: str, since_ts: float) -> bool:
-    """邮件时间 (北京时间字符串) 是否在发码之后 (容差 180s); 解析失败则不卡。"""
+def _mail_is_new(date_str: str, since_ts: float, tz: timezone = CN_TZ) -> bool:
+    """邮件时间是否在发码之后 (容差 180s); 解析失败则不卡。
+
+    时区随来源, 没有默认可言: paopaodw 给北京时间, Cloud Mail 给 UTC。差 8 小时,
+    错一边的表现是每封邮件都被当成旧的, 一直轮询到超时。"""
     try:
-        dt = datetime.strptime(date_str.strip(), "%Y-%m-%d %H:%M:%S").replace(tzinfo=CN_TZ)
+        dt = datetime.strptime(date_str.strip(), "%Y-%m-%d %H:%M:%S").replace(tzinfo=tz)
         return dt.timestamp() >= since_ts - 180
     except Exception:
         return True
@@ -450,6 +475,132 @@ async def fetch_code(session, credential: str, p: dict, since_ts: float,
                 return code
         await asyncio.sleep(interval)
     raise TimeoutError(f"轮询 {tries} 次未取到验证码 (最后: {last_msg})")
+
+
+# ============================ Cloud Mail (自建邮箱) ============================
+async def _cloud_mail_call(session, cfg: dict, path: str, body: dict | None,
+                           proxy: str | None):
+    """打一次 Cloud Mail 的接口, 返回 data。body 为 None 时发 GET。
+
+    业务失败也是 HTTP 200 —— worker 的 onError 把 code/message 塞进 body 再返回,
+    所以只看 status_code 会把"令牌不对"当成成功, 然后在下一步莫名其妙地失败。"""
+    base = (cfg.get("base_url") or "").strip().rstrip("/")
+    if not base:
+        raise RuntimeError("cloud_mail.base_url 是空的")
+    # 裸令牌, 不是 Bearer: worker 拿这个头的值直接和 KV 里存的比对。
+    headers = {"Authorization": (cfg.get("token") or "").strip()}
+    if body is None:
+        r = await session.get(base + path, headers=headers, **_no_proxy({"proxy": proxy}))
+    else:
+        r = await session.post(
+            base + path,
+            data=json.dumps(body, separators=(",", ":")),
+            headers={**headers, "Content-Type": "application/json"},
+            **_no_proxy({"proxy": proxy}),
+        )
+    try:
+        j = json.loads(r.text)
+    except Exception:
+        raise RuntimeError(f"HTTP {r.status_code}, 返回的不是 JSON: {r.text[:200]}")
+    if j.get("code") != 200:
+        raise RuntimeError(f"{path} code={j.get('code')} {j.get('message')}")
+    return j.get("data")
+
+
+async def cloud_mail_resolve(session, cfg: dict, proxy: str | None) -> dict:
+    """把"一个实例地址"补全成能开号的配置: 令牌 + 可用域名 + 前缀长度下限。
+
+    单开一步, 而不是每个号各做一次: `genToken` 生成的是全站唯一的令牌, 重新生成会
+    让上一个立刻失效 —— 每个号各生成一次, 并发起来就是后一个把前一个正在轮询的令牌
+    顶掉, 表现成"码取到一半开始 401"。
+
+    域名不用人填: `/api/setting/websiteConfig` 不需要鉴权, 给的正是这个实例真的在
+    收信的那几个。填错域名的失败是"邮件永远不来", 没有任何一头会报错。"""
+    cfg = dict(cfg)
+    token = (cfg.get("token") or "").strip()
+    if not token:
+        email = (cfg.get("admin_email") or "").strip()
+        password = cfg.get("admin_password") or ""
+        if not (email and password):
+            raise RuntimeError("要么给开放 API 令牌, 要么给管理员邮箱和密码")
+        data = await _cloud_mail_call(session, cfg, CLOUD_MAIL_GEN_TOKEN,
+                                      {"email": email, "password": password}, proxy)
+        token = ((data or {}).get("token") or "").strip()
+        if not token:
+            raise RuntimeError("genToken 没有返回令牌")
+        cfg["token"] = token
+
+    site = await _cloud_mail_call(session, cfg, CLOUD_MAIL_WEBSITE_CONFIG, None, proxy) or {}
+    # domainList 里的域名带 @ 前缀 ("@example.com")
+    domains = [d.strip().lstrip("@") for d in (site.get("domainList") or []) if d.strip()]
+    wanted = (cfg.get("domain") or "").strip().lstrip("@")
+    if wanted:
+        if domains and wanted not in domains:
+            raise RuntimeError(f"{wanted} 不在这个实例收信的域名里: {'、'.join(domains)}")
+        domains = [wanted]
+    if not domains:
+        raise RuntimeError("实例没报出可用域名, 手填一个 domain")
+    return {"token": token, "domains": domains,
+            "min_prefix": int(site.get("minEmailPrefix") or 0)}
+
+
+def gen_local_part(min_len: int = 0) -> str:
+    """新邮箱的本地名。
+
+    不留批次痕迹: 上一批号是按可辨认的规律取的地址, 全灭之后没法排除"就是按名字
+    捞的"这一条。纯随机小写字母 + 数字尾, 长度也随机。
+
+    实例可以要求更长的前缀 (`minEmailPrefix`), 不够就把字母段拉长 —— 短了会被整批
+    拒掉, 而那是发码之前就能避免的失败。"""
+    digits = secrets.choice((2, 3, 4))
+    letters = max(secrets.choice((5, 6, 7, 8)), min_len - digits)
+    return ("".join(secrets.choice(string.ascii_lowercase) for _ in range(letters))
+            + "".join(secrets.choice(string.digits) for _ in range(digits)))
+
+
+async def cloud_mail_open(session, cfg: dict, proxy: str | None) -> str:
+    """在 Cloud Mail 上现开一个邮箱, 返回地址。cfg 是 `cloud_mail_resolve` 的结果。
+
+    必须在发码之前建好: 收件 worker 对没有对应用户的地址默认 setReject, 邮件连库
+    都进不去 —— 那个失败长得就像"码一直不来", 哪一头都不报错。"""
+    domains = cfg.get("domains") or []
+    if not domains and cfg.get("domain"):
+        domains = [cfg["domain"].strip().lstrip("@")]
+    if not domains:
+        raise RuntimeError("没有可用域名, 先调 cloud_mail_resolve")
+    # 多个域名就随机分: 一批号全落在同一个后缀下, 本身就是个可以拿来捞的特征。
+    address = f"{gen_local_part(cfg.get('min_prefix') or 0)}@{secrets.choice(domains)}"
+    # 不传 password, 让 Cloud Mail 自己生成: 这个邮箱只用来收码, 我们从不登录它,
+    # 存一个谁都不会用的密码只是多一处泄露面。
+    await _cloud_mail_call(session, cfg, CLOUD_MAIL_ADD_USER,
+                           {"list": [{"email": address}]}, proxy)
+    return address
+
+
+async def fetch_code_cloud_mail(session, cfg: dict, address: str, since_ts: float,
+                                tries: int, interval: float, proxy: str | None) -> str:
+    """轮询 Cloud Mail 收件箱取验证码。
+
+    toEmail 走 LIKE, 不带 % 就是等值匹配。不按发件人过滤: 这个地址是本次现开的,
+    收件箱里只可能有这一封, 而按发件人过滤会在雀魂换发信域名的那天变成静默空等。"""
+    body = {"toEmail": address, "type": 0, "timeSort": "desc", "num": 1, "size": 5}
+    last_msg = ""
+    for _ in range(tries):
+        try:
+            mails = await _cloud_mail_call(session, cfg, CLOUD_MAIL_EMAIL_LIST, body, proxy)
+        except Exception as e:
+            last_msg = repr(e)
+            await asyncio.sleep(interval)
+            continue
+        for mail in mails or []:
+            if not _mail_is_new(mail.get("createTime", ""), since_ts, timezone.utc):
+                continue
+            code = _extract_code(mail.get("text") or mail.get("content") or "")
+            if code:
+                return code
+        await asyncio.sleep(interval)
+    raise TimeoutError(
+        f"轮询 {tries} 次未取到验证码 (最后: {last_msg or '收件箱里一直是空的'})")
 
 
 # ============================ 生成 ============================
@@ -638,12 +789,17 @@ async def over_websocket(session, email: str, password_hash: str, code: str, gat
 
 
 async def register(params: dict) -> dict:
-    """注册一个账号。凭据串既是邮箱地址的来源, 也是取码用的钥匙。"""
+    """注册一个账号。
+
+    邮箱二选一: 凭据串 (`mailbox`, 既是地址来源也是取码的钥匙), 或者
+    `cloud_mail` (自建实例, 地址现开、码也从它读)。两个都给时以 cloud_mail 为准。"""
+    cloud = params.get("cloud_mail") or None
     credential = (params.get("mailbox") or "").strip()
-    if not credential:
-        raise RuntimeError("缺少 mailbox (取码凭据串, 里面含邮箱地址)")
-    address = address_of(credential)
-    if not address:
+    if not cloud and not credential:
+        raise RuntimeError("既没有 mailbox (取码凭据串), 也没有 cloud_mail 配置")
+    # cloud_mail 模式下地址要建出来才知道, 所以这里先空着。
+    address = "" if cloud else (address_of(credential) or "")
+    if not cloud and not address:
         raise RuntimeError("凭据串里找不到邮箱地址")
 
     password = params.get("password") or gen_password()
@@ -658,6 +814,14 @@ async def register(params: dict) -> dict:
     since = time.time()
     # trust_env=False: 代理只认显式传入的。继承环境变量会让本该直连的悄悄走上代理。
     async with AsyncSession(impersonate=IMPERSONATE, trust_env=False, timeout=30) as session:
+        if cloud:
+            # Cloud Mail 也走这个号的出口: 一个账号的邮箱和它的注册请求来自同一个
+            # IP, 比分两路更像真人 —— 而且容器不一定能直连外网。
+            try:
+                address = await cloud_mail_open(session, cloud, proxy)
+            except Exception as e:
+                return {"ok": False, "email": "", "stage": "cloud_mail", "error": repr(e)}
+
         status, text = await send_signup_code(session, address, p, proxy)
         # 发码失败也是 HTTP 200, 错误在 body 里 (已注册 = ERR_ACC_DUPLICATE_SIGN_UP)。
         # 不看 body 就会白等一整轮取码轮询。
@@ -670,7 +834,11 @@ async def register(params: dict) -> dict:
                     "error": f"HTTP {status} {text[:200]}"}
 
         try:
-            code = await fetch_code(session, credential, p, since, tries, interval)
+            if cloud:
+                code = await fetch_code_cloud_mail(session, cloud, address, since,
+                                                   tries, interval, proxy)
+            else:
+                code = await fetch_code(session, credential, p, since, tries, interval)
         except Exception as e:
             return {"ok": False, "email": address, "stage": "fetch_code", "error": repr(e)}
         if not re.fullmatch(r"\d{4,8}", code or ""):
@@ -690,6 +858,10 @@ async def register(params: dict) -> dict:
 async def handle(method: str, params: dict) -> dict:
     if method == "health":
         return {}
+    if method == "cloud_mail_resolve":
+        cfg = params.get("cloud_mail") or params
+        async with AsyncSession(impersonate=IMPERSONATE, trust_env=False, timeout=30) as session:
+            return await cloud_mail_resolve(session, cfg, params.get("proxy") or None)
     if method == "register":
         return await register(params)
     raise RuntimeError(f"不认识的方法 {method}")
