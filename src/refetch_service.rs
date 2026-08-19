@@ -802,11 +802,17 @@ impl RefetchSupervisor {
         if config.proxy_mode != WatchProxyMode::Mihomo {
             return lane.map(str::to_owned);
         }
-        let node = self.dependencies.accounts.node_for(username)?;
-        self.dependencies
-            .mihomo
-            .proxy_url_for_node(&node)
-            .or_else(|| lane.map(str::to_owned))
+        // Both "no node named" and "no listener for that node" mean the same
+        // thing here — go out the lane. Returning None instead would dial
+        // nothing at all, which is not a fallback but a bypass: the session
+        // would leave from the host's own address with the proxy setting above
+        // it still saying mihomo.
+        let node_exit = self
+            .dependencies
+            .accounts
+            .node_for(username)
+            .and_then(|node| self.dependencies.mihomo.proxy_url_for_node(&node));
+        exit_or_lane(node_exit, lane)
     }
 
     fn proxy_url(&self, config: &RefetchServiceConfig) -> Option<String> {
@@ -1776,6 +1782,17 @@ enum Outcome {
 /// whole arrangement exists to make, and it is one an integration test could not
 /// pin: `held` is what PostgreSQL answered, and getting the filter backwards
 /// would look exactly like a corpus that is missing everything.
+/// Where a session goes out: its own node's listener, or the pool's lane.
+///
+/// Split out from `account_proxy` so the one thing that matters here can be
+/// asserted without a live account pool and mihomo behind it — that `None` for
+/// the node never becomes `None` for the whole answer. It did once, and the
+/// symptom was invisible: sessions dialling nothing, going out from the host's
+/// own address, while the console still showed the lane's URL.
+fn exit_or_lane(node_exit: Option<String>, lane: Option<&str>) -> Option<String> {
+    node_exit.or_else(|| lane.map(str::to_owned))
+}
+
 fn unclaimed(uuids: Vec<String>, held: &HashSet<Vec<u8>>) -> Vec<String> {
     uuids
         .into_iter()
@@ -2017,6 +2034,31 @@ mod tests {
             account_secret_ref: "env:MJAI_TEST_REFETCH_ACCOUNTS".into(),
             ..RefetchServiceConfig::default()
         }
+    }
+
+    /// An account with no node still goes out through the pool's lane.
+    ///
+    /// This is the default state of every account — the console leaves the node
+    /// blank, and the registrar writes it blank — so getting it wrong takes the
+    /// whole pool off mihomo and out of the host's own address. It did: the
+    /// lookup used `?`, and `None` for the node returned `None` for the exit,
+    /// which the session reads as "dial directly" rather than "use the lane".
+    #[test]
+    fn an_account_without_a_node_still_goes_out_the_lane() {
+        let lane = Some("http://mihomo:7892");
+        assert_eq!(
+            exit_or_lane(None, lane),
+            Some("http://mihomo:7892".to_owned()),
+            "没绑节点的账号必须回落到 lane，返回 None 是直连"
+        );
+        assert_eq!(
+            exit_or_lane(Some("http://mihomo:7901/".to_owned()), lane),
+            Some("http://mihomo:7901/".to_owned()),
+            "绑了节点且有监听口时走那个口"
+        );
+        // Only with the proxy turned off entirely is nothing the right answer,
+        // and that is decided before this function is reached.
+        assert_eq!(exit_or_lane(None, None), None);
     }
 
     /// The pool logs in with real accounts and asks Mahjong Soul for hundreds of
