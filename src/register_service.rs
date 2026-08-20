@@ -356,6 +356,12 @@ impl RegisterService {
         Ok(())
     }
 
+    /// Leases the exits, runs the batch, gives them back.
+    ///
+    /// A wrapper rather than something inside the loop because the run has half
+    /// a dozen return paths — an early error, a stop, a give-up, a normal end —
+    /// and slots left behind would sit in the generated configuration until the
+    /// next restart.
     async fn run(
         self: Arc<Self>,
         generation: u64,
@@ -363,11 +369,39 @@ impl RegisterService {
         jobs: Vec<Option<String>>,
         request: AccountRegisterRequest,
     ) -> Result<String, WatchServiceError> {
-        let total = jobs.len();
-        let concurrency = request
+        if !request.random_node {
+            return self
+                .registered(generation, module, jobs, request, Vec::new())
+                .await;
+        }
+        let asked = request
             .concurrency
             .clamp(1, MAX_CONCURRENCY)
-            .min(total.max(1));
+            .min(jobs.len().max(1));
+        let exits = self.lease_exits(asked).await?;
+        let outcome = Arc::clone(&self)
+            .registered(generation, module, jobs, request, exits)
+            .await;
+        self.release_exits().await;
+        outcome
+    }
+
+    async fn registered(
+        self: Arc<Self>,
+        generation: u64,
+        module: crate::watch_service::ModuleRef,
+        jobs: Vec<Option<String>>,
+        request: AccountRegisterRequest,
+        exits: Vec<String>,
+    ) -> Result<String, WatchServiceError> {
+        let total = jobs.len();
+        let concurrency = concurrency_for(request.concurrency, total, exits.len());
+        if !exits.is_empty() {
+            self.report(
+                WatchLogLevel::Info,
+                format!("出口节点 {} 个：{}", exits.len(), exits.join("、")),
+            );
+        }
         self.report(
             WatchLogLevel::Info,
             format!(
@@ -401,26 +435,6 @@ impl RegisterService {
             WatchLogLevel::Info,
             format!("客户端版本 {}（包 {}）", versions.0, versions.1),
         );
-
-        // Which exits the accounts leave from, decided once. Empty means every
-        // account uses whatever `proxy` says, which is the old behaviour.
-        let exits = if request.random_node {
-            let found = self.exits().await;
-            if found.is_empty() {
-                return Err(WatchServiceError::InvalidConfig(
-                    "没有可用的出口节点：mihomo 的按节点出站是跟着账号池里\
-                     「已启用的补抓账号绑了哪些节点」走的，先去账号池给几个补抓账号选上节点并保存"
-                        .to_owned(),
-                ));
-            }
-            self.report(
-                WatchLogLevel::Info,
-                format!("出口节点 {} 个：{}", found.len(), found.join("、")),
-            );
-            found
-        } else {
-            Vec::new()
-        };
 
         let worker = self
             .modules
@@ -517,9 +531,12 @@ impl RegisterService {
                 }
                 None => format!("第 {}/{total} 个（正在开邮箱）", index + 1),
             };
-            // Round robin rather than random: with N exits and N accounts in
-            // flight, this is the only assignment where no two of them share an
-            // address at the same moment.
+            // Round robin over a list that was shuffled when it was leased.
+            // Round robin because with N exits and N accounts in flight it is
+            // the only assignment where no two share an address at the same
+            // moment; shuffled because the order is otherwise the same every
+            // run, and a batch narrower than the list would use the first few
+            // nodes every time and the rest never.
             let node = (!exits.is_empty()).then(|| exits[index % exits.len()].clone());
 
             let service = Arc::clone(&self);
@@ -559,20 +576,89 @@ impl RegisterService {
         ))
     }
 
-    /// The nodes a run may go out of: those mihomo already has a listener on.
+    /// Take out enough exits for one run, and say which ones they are.
     ///
-    /// Deliberately read-only. The outbound assignment is derived from the
-    /// account pool — which nodes the *enabled re-fetch* accounts name — and
-    /// registering into it would be a write with two problems: `set_outbound_nodes`
-    /// is set-replacement, so adding one node drops the slots of every node the
-    /// pool is using, and the new assignment is not live until mihomo has
-    /// reloaded, which takes up to a minute. An account made here is disabled,
-    /// so it would be dropped from that list again at the next save anyway.
+    /// This used to read the outbound list and use whatever was there. The list
+    /// is derived from the account pool — which nodes the *enabled re-fetch*
+    /// accounts name — so a deployment that never bound one had no exits at
+    /// all, and the switch refused to start on exactly the deployments that
+    /// most needed spreading out. The subscription's nodes were never the
+    /// problem: `status().nodes` is all of them. A node without a listener is.
     ///
-    /// So: use the exits that exist. To have more of them, bind more nodes in
-    /// the account pool.
-    async fn exits(&self) -> Vec<String> {
-        usable_exits(self.mihomo.status().await.outbounds)
+    /// So take some listeners, and give them back in `release_exits`.
+    ///
+    /// The union is not optional. `set_outbound_nodes` replaces the set rather
+    /// than adding to it, so passing only these would drop the slot of every
+    /// node the re-fetch pool is on and move the exits of the sessions running
+    /// right now.
+    async fn lease_exits(&self, want: usize) -> Result<Vec<String>, WatchServiceError> {
+        let mut alive: Vec<String> = self
+            .mihomo
+            .status()
+            .await
+            .nodes
+            .into_iter()
+            // Only what mihomo says is up. A node that cannot be dialled never
+            // gets selected, and `slots_ready` is one global flag — one dead
+            // entry takes the per-node exits of the whole re-fetch pool down
+            // with it.
+            .filter(|node| node.alive.unwrap_or(false))
+            .map(|node| node.name)
+            .collect();
+        if alive.is_empty() {
+            return Err(WatchServiceError::InvalidConfig(
+                "mihomo 里一个活着的节点都没有：订阅可能还没拉到，或者节点全都测不通".to_owned(),
+            ));
+        }
+        shuffle(&mut alive);
+
+        let held = self.accounts.refetch_nodes();
+        let wanted = nodes_to_register(&held, alive, want);
+        let taken = wanted.len() - held.len();
+
+        self.mihomo
+            .set_outbound_nodes(&wanted)
+            .map_err(|error| WatchServiceError::InvalidConfig(format!("登记出口失败：{error}")))?;
+        self.report(
+            WatchLogLevel::Info,
+            format!("向 mihomo 要 {taken} 个出口，等它把监听建起来（最多一分钟）"),
+        );
+        self.mihomo.apply_runtime_config().await;
+
+        // Read back rather than assume. Between writing the configuration and
+        // mihomo applying the selection a group exists but is still on the
+        // shared `MAJSOUL`, and taking that at face value would put the whole
+        // batch back on one address while the log said they were spread out.
+        let ready = usable_exits(self.mihomo.status().await.outbounds);
+        if ready.is_empty() {
+            self.release_exits().await;
+            return Err(WatchServiceError::InvalidConfig(
+                "出口登记了但 mihomo 没把监听建起来，这批没跑；\
+                 看一眼代理页，多半是订阅或者 mihomo 本身有问题"
+                    .to_owned(),
+            ));
+        }
+        Ok(ready)
+    }
+
+    /// Give the slots back to the account pool.
+    ///
+    /// Re-reads the pool rather than restoring a list captured at the start:
+    /// somebody may have saved it while the run was going, and restoring the
+    /// old one would silently drop whatever they just bound.
+    async fn release_exits(&self) {
+        let held = self.accounts.refetch_nodes();
+        match self.mihomo.set_outbound_nodes(&held) {
+            Ok(true) => {
+                self.mihomo.apply_runtime_config().await;
+                self.report(WatchLogLevel::Info, "出口已经还给账号池");
+            }
+            Ok(false) => {}
+            Err(error) => self.report(
+                WatchLogLevel::Warn,
+                format!("归还出口失败：{error}。下次重启会按账号池重新分配"),
+            ),
+        }
     }
 
     /// The most recent failure, for the message that ends a given-up run.
@@ -600,13 +686,35 @@ impl RegisterService {
         streak: Arc<std::sync::atomic::AtomicUsize>,
         versions: Arc<(String, String)>,
     ) {
-        // A node with no listener falls back to whatever `proxy` says rather
-        // than to no proxy at all: dialling nothing is not a quieter exit, it is
-        // this host's own address.
-        let proxy = node
-            .as_deref()
-            .and_then(|node| self.mihomo.proxy_url_for_node(node))
-            .or_else(|| request.proxy.clone());
+        // An exit that was there when the run started can be gone by the time
+        // this account runs: saving the account pool re-derives the slots, and
+        // that takes every node's listener down until mihomo has reloaded.
+        //
+        // Refuse rather than fall back. Dialling nothing is not a quieter exit,
+        // it is this host's own address — and a run that asked for a node did so
+        // precisely to not have every account leave from the same place. The
+        // account is reported failed and nothing is spent on it.
+        let (proxy, node) = match node {
+            Some(name) => match self.mihomo.proxy_url_for_node(&name) {
+                Some(url) => (Some(url), Some(name)),
+                None => {
+                    let outcome = self.settle(
+                        &address,
+                        Err(WatchServiceError::InvalidConfig(format!(
+                            "出口 {name} 的监听不见了（这期间账号池被保存过就会这样），\
+                             这个号没跑 —— 免得从本机地址出去"
+                        ))),
+                        &request,
+                        None,
+                    );
+                    let ok = outcome.ok;
+                    self.progress.write().outcomes.push(outcome);
+                    note_result(&streak, ok);
+                    return;
+                }
+            },
+            None => (request.proxy.clone(), None),
+        };
 
         self.progress.write().current = Some(address.clone());
         self.report(
@@ -887,6 +995,57 @@ fn note_result(streak: &std::sync::atomic::AtomicUsize, ok: bool) -> usize {
         0
     } else {
         streak.fetch_add(1, Ordering::SeqCst) + 1
+    }
+}
+
+/// How many accounts to run at once: what the form asked for, bounded by the
+/// work there is and by the exits there are.
+///
+/// Round robin only keeps accounts off each other's address while there are at
+/// least as many exits as accounts in flight; past that it puts several on the
+/// same one, which is what spreading them out was for. Zero exits means no node
+/// was asked for at all — then every account uses the same `proxy` anyway and
+/// the exit count has nothing to say about the width.
+fn concurrency_for(asked: usize, jobs: usize, exits: usize) -> usize {
+    let width = asked.clamp(1, MAX_CONCURRENCY).min(jobs.max(1));
+    if exits == 0 { width } else { width.min(exits) }
+}
+
+/// The full set to hand `set_outbound_nodes`: what the pool holds, plus up to
+/// `want` more off the (already shuffled) live list.
+///
+/// `held` comes first and is never dropped, because the call replaces the set
+/// rather than adding to it — leaving one out releases the slot of a node the
+/// re-fetch pool is on right now. A node the pool already holds is also already
+/// a listener, so asking for it again would spend one of the remaining slots on
+/// nothing.
+fn nodes_to_register(held: &[String], alive: Vec<String>, want: usize) -> Vec<String> {
+    let mut wanted = held.to_vec();
+    let mut taken = 0;
+    for node in alive {
+        if taken >= want || wanted.len() >= usize::from(crate::mihomo::MAX_OUTBOUNDS) {
+            break;
+        }
+        if wanted.contains(&node) {
+            continue;
+        }
+        wanted.push(node);
+        taken += 1;
+    }
+    wanted
+}
+
+/// Fisher-Yates, with a v4 UUID per swap as the randomness.
+///
+/// There is no `rand` in this tree and this does not warrant adding one: the
+/// list is at most a few dozen names, drawn once per run. What it has to be is
+/// unbiased — taking `nodes[..want]` off an unshuffled list would pick the same
+/// exits every time, which for a subscription ordered by region means every
+/// batch leaves from the same country.
+fn shuffle(nodes: &mut [String]) {
+    for index in (1..nodes.len()).rev() {
+        let random = u128::from_le_bytes(*uuid::Uuid::new_v4().as_bytes()) as usize;
+        nodes.swap(index, random % (index + 1));
     }
 }
 
@@ -1185,20 +1344,99 @@ mod tests {
 
     /// Concurrency is clamped, not trusted.
     ///
-    /// It arrives from a request body, and both ends of the range are real: 0
-    /// would spawn nothing and hang on a semaphore that never issues, and a
-    /// large number would have more sessions talking to Mahjong Soul from this
-    /// deployment at once than it has exits to spread them over.
+    /// It arrives from a request body, and every bound is real: 0 would spawn
+    /// nothing and hang on a semaphore that never issues, a large number would
+    /// have more sessions talking to Mahjong Soul from this deployment at once
+    /// than it has exits to spread them over, and running wider than the exit
+    /// list puts several accounts on one address — the thing spreading them out
+    /// was for.
     #[test]
     fn concurrency_is_clamped_to_the_range_the_form_offers() {
-        let clamp = |asked: usize, jobs: usize| asked.clamp(1, MAX_CONCURRENCY).min(jobs.max(1));
-        assert_eq!(clamp(0, 10), 1, "0 会挂在永远发不出的名额上");
-        assert_eq!(clamp(1, 10), 1);
-        assert_eq!(clamp(16, 100), 16);
-        assert_eq!(clamp(999, 100), MAX_CONCURRENCY);
+        let clamp = concurrency_for;
+        assert_eq!(clamp(0, 10, 0), 1, "0 会挂在永远发不出的名额上");
+        assert_eq!(clamp(1, 10, 0), 1);
+        assert_eq!(clamp(16, 100, 0), 16, "没要节点时出口数不参与");
+        assert_eq!(clamp(999, 100, 0), MAX_CONCURRENCY);
         // Never wider than the work: eight permits for three accounts just
         // leaves five idle.
-        assert_eq!(clamp(8, 3), 3);
+        assert_eq!(clamp(8, 3, 0), 3);
+        // Never wider than the exits either.
+        assert_eq!(
+            clamp(16, 100, 3),
+            3,
+            "三个出口跑十六并发会有五个号压一个地址"
+        );
+        assert_eq!(clamp(16, 100, 20), 16, "出口比并发多时不受影响");
+    }
+
+    /// The set handed to mihomo has to keep the pool's nodes in it.
+    ///
+    /// `set_outbound_nodes` replaces the set rather than adding to it, so a
+    /// node left out of this list loses its listener — and the re-fetch
+    /// sessions on it move to the shared exit mid-run.
+    #[test]
+    fn leasing_exits_never_releases_the_pools_own() {
+        let held = vec!["日本 07".to_owned(), "香港 11".to_owned()];
+        let alive = vec![
+            "香港 11".to_owned(), // already held — must not spend a slot
+            "美国 03".to_owned(),
+            "新加坡 02".to_owned(),
+            "德国 01".to_owned(),
+        ];
+
+        let wanted = nodes_to_register(&held, alive.clone(), 2);
+        assert_eq!(
+            wanted,
+            vec![
+                "日本 07".to_owned(),
+                "香港 11".to_owned(),
+                "美国 03".to_owned(),
+                "新加坡 02".to_owned(),
+            ],
+            "池子的两个保住，另外要两个新的，已经持有的那个不重复要"
+        );
+
+        // Asking for more than there are leaves the list short rather than
+        // failing: three exits for four accounts still beats one.
+        assert_eq!(nodes_to_register(&held, alive.clone(), 99).len(), 5);
+        assert_eq!(nodes_to_register(&held, Vec::new(), 4), held);
+
+        // The ceiling is on the generated configuration, so it counts the
+        // pool's nodes too.
+        let many: Vec<String> = (0..64).map(|index| format!("节点 {index:02}")).collect();
+        let wanted = nodes_to_register(&held, many, 64);
+        assert_eq!(wanted.len(), usize::from(crate::mihomo::MAX_OUTBOUNDS));
+        assert!(wanted.starts_with(&held), "满了也不能挤掉池子的");
+    }
+
+    /// Shuffled, or a batch narrower than the node list always leaves from the
+    /// same few nodes — and a subscription is usually ordered by region.
+    #[test]
+    fn shuffling_keeps_every_node_and_stops_reusing_the_same_few() {
+        let names: Vec<String> = (0..24).map(|index| format!("节点 {index:02}")).collect();
+
+        let mut shuffled = names.clone();
+        shuffle(&mut shuffled);
+        let mut sorted = shuffled.clone();
+        sorted.sort();
+        assert_eq!(sorted, names, "打乱既不能丢节点也不能重复");
+
+        // What actually matters: the first few, which is all a four-wide run
+        // ever takes.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..20 {
+            let mut batch = names.clone();
+            shuffle(&mut batch);
+            seen.extend(batch[..4].iter().cloned());
+        }
+        assert!(
+            seen.len() > 8,
+            "二十批只用到 {} 个节点，等于没打乱",
+            seen.len()
+        );
+
+        shuffle(&mut []);
+        shuffle(&mut ["独苗".to_owned()]);
     }
 
     /// Only the address, never the credential.

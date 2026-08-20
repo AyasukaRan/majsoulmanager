@@ -72,7 +72,7 @@ impl MihomoLane {
 /// configuration rather than on anything Mahjong Soul cares about. Sized to be
 /// larger than any subscription an operator would actually spread a pool over,
 /// and small enough that the ports stay in one legible block.
-const MAX_OUTBOUNDS: u16 = 32;
+pub(crate) const MAX_OUTBOUNDS: u16 = 32;
 /// The first port an outbound gets. Above the two lanes, and above the shared
 /// 7890, so nothing here can collide with a port a deployment already dials.
 const OUTBOUND_PORT_BASE: u16 = 7900;
