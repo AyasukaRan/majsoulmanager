@@ -3,7 +3,19 @@ name: mjai-management
 # 六份持久化数据都是 MJAI_STORAGE_ROOT 下的目录，而不是命名卷。命名卷藏在
 # /var/lib/docker/volumes 里：想把语料单独放到一块大盘上得去动 daemon 的 data-root，
 # 换一台机器得知道每个卷的内部路径再逐个捞。摊成一棵目录树之后，迁移就是搬这一个
-# 目录，某一份要单独的盘就把盘挂到它对应的子目录上，都不用再改这个文件。
+# 目录。
+#
+# 语料那一份可以单独指到别的盘：MJAI_RUSTFS_ROOT。原来的说法是「把盘挂到它对应的
+# 子目录上」，那要动 /etc/fstab —— 要 root，写错一行影响开机，而且真正的失败模式是
+# 静默的：绑定挂载没生效的话 rustfs 会往 MJAI_STORAGE_ROOT 下那个空目录里写，语料
+# 一半在这块盘一半在那块，而没有任何东西会报错。一个变量看得见，也不会不生效。
+#
+# 为什么单独拎出来的是它：它是唯一一份大小跟着语料长的。ClickHouse 和 Postgres 要
+# 的是随机 I/O，该留在 SSD 上；rustfs 是大对象顺序读写，机械盘完全够。1.9 亿局按实
+# 测每条两万字节压后是 3.75 TB，这个数不该由系统盘来扛。
+#
+# 不设它就是 MJAI_STORAGE_ROOT 下的 rustfs，也就是这个变量存在之前的行为，所以已有
+# 部署什么都不用改。
 #
 # 默认的 ./storage 是给本地开发和 CI 的，相对路径由 Compose 按项目目录解析；部署要在
 # .env 里指向一个自己管理的绝对路径。改这个值不会搬走已有数据，迁移步骤见 README。
@@ -37,7 +49,7 @@ services:
     volumes:
       - ${MJAI_STORAGE_ROOT:-./storage}/api:/fix/api
       - ${MJAI_STORAGE_ROOT:-./storage}/mihomo:/fix/mihomo
-      - ${MJAI_STORAGE_ROOT:-./storage}/rustfs:/fix/rustfs
+      - ${MJAI_RUSTFS_ROOT:-${MJAI_STORAGE_ROOT:-./storage}/rustfs}:/fix/rustfs
     entrypoint: /bin/sh
     command: >-
       -c 'for dir in /fix/api /fix/mihomo /fix/rustfs;
@@ -189,7 +201,7 @@ services:
       RUSTFS_CONSOLE_ENABLE: "true"
     command: /data
     volumes:
-      - ${MJAI_STORAGE_ROOT:-./storage}/rustfs:/data
+      - ${MJAI_RUSTFS_ROOT:-${MJAI_STORAGE_ROOT:-./storage}/rustfs}:/data
     # Readiness rather than liveness: `/health` answers while the store is
     # still initialising, and both the bucket sidecar and every upload need a
     # store that can actually serve. The endpoints are unauthenticated on the

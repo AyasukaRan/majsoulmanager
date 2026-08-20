@@ -172,9 +172,33 @@ Watch 默认关闭。账号在管理台「账号池」页里填，采集实例�
 | `redpanda/` | 已回 `202` 但还没打包的记录 | 丢这一段。停掉采集、等消费追平之后它可以是空的 |
 | `mihomo/` | 代理订阅与配置 | 重新填一次订阅；账号绑的节点名会失效，用账号池页的「重新分配节点」重来一次 |
 
-要把某一份放到单独的盘上不必改 compose，把盘挂到对应子目录即可——通常是最大的
-`rustfs/`。绑定挂载不归 Docker 管，所以 `docker compose down -v` 也不再会连数据
-一起删。
+### 语料单独放一块盘
+
+`rustfs/` 是六份里唯一大小跟着语料长的：1.9 亿局按实测每条约两万字节压后是 **3.75
+TB**。ClickHouse 和 PostgreSQL 要的是随机 I/O，该留在 SSD 上；rustfs 是大对象顺序
+读写，机械盘完全够。所以它有自己的变量：
+
+```bash
+# 先搬，再改，最后起 —— 反过来的话新盘是空的，rustfs 会当成一个新的空对象存储
+docker compose stop -t 120
+docker run --rm -v /data/mjai-storage/rustfs:/from -v /storage:/to alpine:3.21 \
+  sh -c 'mkdir -p /to/mjai-rustfs && cp -a /from/. /to/mjai-rustfs/'
+# 对一下条数再往下走
+echo "MJAI_RUSTFS_ROOT=/storage/mjai-rustfs" >> .env
+docker compose up -d
+```
+
+不设 `MJAI_RUSTFS_ROOT` 就是 `MJAI_STORAGE_ROOT/rustfs`，也就是这个变量存在之前的
+行为，已有部署什么都不用改。
+
+用容器搬而不是 `sudo cp`：语料属于 uid 10001，宿主机上的操作员多半不是它，而 Docker
+守护进程本来就是 root。搬完 `storage-perms` 会核对顶层属主。
+
+一个变量，而不是往 `/etc/fstab` 里加一条绑定挂载。后者要 root、写错一行影响开机，而
+且**失败是静默的**：挂载没生效 rustfs 就往 `MJAI_STORAGE_ROOT/rustfs` 那个空目录里
+写，语料一半在这块盘一半在那块，不报任何错。
+
+绑定挂载不归 Docker 管，所以 `docker compose down -v` 也不会连数据一起删。
 
 ### 从命名卷迁过来
 
