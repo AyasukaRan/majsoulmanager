@@ -2662,6 +2662,7 @@ async fn lists_the_newest_download_jobs() {
     assert_eq!(created_at, newest_first, "the page was not newest first");
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/api/v1/downloads?limit=0")
@@ -2672,6 +2673,39 @@ async fn lists_the_newest_download_jobs() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Wait for the export this test started, the way the archive test does.
+    //
+    // Not politeness — leaving it running hangs the whole suite. `create_download`
+    // hands the export to `spawn_blocking` and drives it with `Handle::block_on`,
+    // which on this test's current-thread runtime drives no IO and no timers of
+    // its own. The moment this function stops awaiting, that thread loses every
+    // way of making progress *and* every timeout that would have rescued it: the
+    // Postgres socket, reqwest's 30s ceiling, sqlx's 5s pool acquire. Dropping the
+    // runtime then waits — `BlockingPool::shutdown(None)`, no deadline — for a
+    // thread that can no longer finish.
+    //
+    // Which is why this cost two twenty-minute CI runs before anyone saw it:
+    // libtest prints "ok" only after the runtime is dropped, so every assertion
+    // above passing still shows up as this test never reporting at all.
+    for _ in 0..100 {
+        let status = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/downloads/{job_id}"))
+                    .header(header::AUTHORIZATION, "Bearer test-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        if json_body(status).await["state"] == "completed" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
     std::fs::remove_dir_all(data_dir).unwrap();
 }
 
