@@ -1141,6 +1141,16 @@ async fn create_download(
     let id = job.id;
     // Compression and pack reads are blocking; the catalogue pages they are
     // interleaved with are not.
+    //
+    // `Handle::block_on` only drives IO and timers on a multi-threaded runtime,
+    // where the driver lives on another thread. That is what serves this
+    // process, but it makes the export dependent on somebody else's runtime
+    // staying alive: on a current-thread runtime this thread has no way to make
+    // progress once the caller stops awaiting, and no timeout fires to say so
+    // either. A test that starts an export and returns without waiting for it
+    // hangs at runtime drop — `BlockingPool::shutdown` has no deadline. Cost two
+    // twenty-minute CI runs before it was recognised, because libtest prints a
+    // test's result only after the runtime is gone.
     let handle = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || handle.block_on(run_export(state, id, request)));
     Ok((StatusCode::ACCEPTED, Json(job)))
