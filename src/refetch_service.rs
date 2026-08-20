@@ -17,7 +17,7 @@
 //! collector with spare time keeps answering them for free.
 
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -30,7 +30,10 @@ use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tokio::{sync::Mutex, task::JoinHandle};
+use tokio::{
+    sync::Mutex,
+    task::{JoinHandle, JoinSet},
+};
 
 use crate::{
     accounts::AccountState,
@@ -1144,7 +1147,7 @@ impl RefetchSupervisor {
     /// The walk itself: `Ok` carries why it stopped, `Err` why it could not go
     /// on. Split from `run_walk` so that ending the sessions is one statement
     /// covering every way out rather than one before each `return`.
-    async fn walk(&self, generation: u64, work: RefetchWork) -> anyhow::Result<String> {
+    async fn walk(self: &Arc<Self>, generation: u64, work: RefetchWork) -> anyhow::Result<String> {
         if let Some(done) = match work {
             RefetchWork::MissingPb => self.announce_missing_pb().await?,
             RefetchWork::KnownGames => self.announce_known_games().await?,
@@ -1437,23 +1440,38 @@ impl RefetchSupervisor {
     /// One walk over the 牌谱屋 catalogue: page it in its own order, drop the
     /// games this corpus already holds, fetch what is left.
     ///
-    /// The cursor is durable and the page is the unit of commitment. It advances
-    /// to the last row of the page — held or fetched or refused alike — only
-    /// after that page's fetches have finished, so a restart re-walks at most one
-    /// page and the claim check makes re-walking it free. Reaching the end of the
-    /// catalogue clears it, which is what makes the next pass retry everything
-    /// Mahjong Soul would not serve this time.
+    /// One continuous stream, not a page at a time. The page is what ClickHouse
+    /// hands over and what the cursor commits, but it is not a unit of work: the
+    /// walk reads the next one while the current one's games are still in the
+    /// air, and a game is handed to a session the moment a slot frees. It used
+    /// to collect each page before reading the next, which drained all
+    /// eighty-odd sessions to zero every thousand games and then held them there
+    /// through three database round trips.
     ///
-    /// A page nobody answered is the exception, and the distinction is the whole
+    /// The cursor is durable and committed by the *finished prefix*, never by
+    /// the newest answer — see [`PendingPages`], which is where that rule lives.
+    /// A restart re-walks from the last committed page and the claim check makes
+    /// re-walking free: every game that did land is claimed, so a second look
+    /// costs one indexed lookup and no request. Reaching the end of the
+    /// catalogue clears the cursor, which is what makes the next pass retry
+    /// everything Mahjong Soul would not serve this time.
+    ///
+    /// A game nobody answered is the exception, and the distinction is the whole
     /// reason `RefetchError` has two arms. Refused means Mahjong Soul answered
     /// and would not give the game: an answer, and the cursor moves on. Unserved
     /// means nothing answered at all, which says nothing about the game — and
     /// unlike the pb repair, whose work is re-derived from `pb_size = 0` on every
     /// pass, nothing here would ever record that those games were skipped. So the
-    /// pass stops where it is and leaves the cursor for the next one.
-    async fn one_known_games_pass(&self, generation: u64) -> anyhow::Result<PassOutcome> {
+    /// walk stops feeding, lets what is in the air land, and leaves the cursor
+    /// short of the page that went unanswered.
+    async fn one_known_games_pass(
+        self: &Arc<Self>,
+        generation: u64,
+    ) -> anyhow::Result<PassOutcome> {
         let catalog = &self.dependencies.catalog;
-        let mut cursor = catalog.refetch_cursor(KNOWN_GAMES_WALK).await?.or_else(|| {
+        // Where the *reads* have got to. The cursor in PostgreSQL trails it by
+        // however much is still in flight.
+        let mut reading_from = catalog.refetch_cursor(KNOWN_GAMES_WALK).await?.or_else(|| {
             // A seed, not a filter: an empty uuid sorts below every real one, so
             // this is the position just before the first game of that second.
             self.config()
@@ -1463,92 +1481,149 @@ impl RefetchSupervisor {
                     uuid: String::new(),
                 })
         });
+        // Read once: `workers` is fixed when the run starts, and re-reading it
+        // per page only ever meant re-reading the same number.
+        let in_flight = self.runtime.read().workers.max(1);
+
+        // Spawned rather than polled by this loop, so that reading the next page
+        // — a ClickHouse query and a PostgreSQL lookup — does not stop the
+        // fetches already in the air.
+        let mut fetching: JoinSet<(usize, anyhow::Result<Outcome>)> = JoinSet::new();
+        let mut pending = PendingPages::default();
+        let mut queued: VecDeque<(usize, String)> = VecDeque::new();
+        let mut listed_everything = false;
+        let mut unserved = 0u64;
         let (mut scanned, mut replaced) = (0u64, 0u64);
         let mut reported = 0u64;
+
         loop {
             if self.generation.load(Ordering::SeqCst) != generation {
                 return Ok(PassOutcome::interrupted(scanned, replaced));
             }
-            let page = catalog
-                .game_uuid_listings(cursor.as_ref(), PAGE_SIZE)
-                .await?;
-            let Some(last) = page.last().cloned() else {
-                // The end of the list. Back to the beginning, so the next pass
-                // asks Mahjong Soul again for whatever it refused. The only exit
-                // this walk has that has actually seen the whole catalogue —
-                // months of sweeping away, and the caller decides what "nothing
-                // moved" means on the strength of reaching it.
-                catalog.clear_refetch_cursor(KNOWN_GAMES_WALK).await?;
-                return Ok(PassOutcome::finished(scanned, replaced));
-            };
-            scanned += page.len() as u64;
 
-            // One indexed lookup for the whole page, before a single Mahjong
-            // Soul request is spent. This is the comparison that matters: the
-            // console's card answers "how big is the gap" by start time and
-            // player names, which is the right question for a human and the
-            // wrong one to bet an account's rate limit on, because a renamed
-            // player or a rounded second reads as missing. A game uuid does not
-            // drift.
-            let uuids: Vec<String> = page.iter().map(|position| position.uuid.clone()).collect();
-            let hashes: Vec<Vec<u8>> = uuids.iter().map(|uuid| game_claim_hash(uuid)).collect();
-            let held = catalog.claimed_games(&hashes).await?;
-            let wanted = unclaimed(uuids, &held);
-            {
-                let mut progress = self.progress.write();
-                progress.scanned += page.len() as u64;
-                progress.present += (page.len() - wanted.len()) as u64;
-                progress.position = Some(last.started_at);
-            }
-
-            let in_flight = self.runtime.read().workers.max(1);
-            let outcomes = futures_util::stream::iter(wanted)
-                .map(|uuid| self.one_game(uuid))
-                .buffer_unordered(in_flight)
-                .collect::<Vec<_>>()
-                .await;
-            let mut unserved = 0u64;
-            {
-                let mut progress = self.progress.write();
-                for outcome in outcomes {
-                    match outcome? {
-                        Outcome::Replaced => {
-                            replaced += 1;
-                            progress.replaced += 1;
-                        }
-                        Outcome::Duplicate => progress.duplicates += 1,
-                        Outcome::Refused => progress.refused += 1,
-                        Outcome::Unserved => {
-                            unserved += 1;
-                            progress.refused += 1;
-                        }
-                        Outcome::Unconvertible(why) => {
-                            progress.unconvertible += 1;
-                            progress.unconvertible_by.bump(why);
-                        }
-                        // No stored bytes are read on this path.
-                        Outcome::Unreadable => progress.unreadable += 1,
+            // Read ahead. The threshold is what keeps a slot from ever waiting
+            // on a database: by the time the queue is down to one round of
+            // requests, the next thousand are already on their way.
+            if !listed_everything && unserved == 0 && queued.len() < in_flight {
+                let page = catalog
+                    .game_uuid_listings(reading_from.as_ref(), PAGE_SIZE)
+                    .await?;
+                match page.last().cloned() {
+                    // The end of the list, but not yet the end of the walk:
+                    // whatever is still in the air has to land and commit before
+                    // the cursor may be cleared.
+                    None => listed_everything = true,
+                    Some(last) => {
+                        // One indexed lookup for the whole page, before a single
+                        // Mahjong Soul request is spent. This is the comparison
+                        // that matters: the console's card answers "how big is
+                        // the gap" by start time and player names, which is the
+                        // right question for a human and the wrong one to bet an
+                        // account's rate limit on, because a renamed player or a
+                        // rounded second reads as missing. A game uuid does not
+                        // drift.
+                        let uuids: Vec<String> =
+                            page.iter().map(|position| position.uuid.clone()).collect();
+                        let hashes: Vec<Vec<u8>> =
+                            uuids.iter().map(|uuid| game_claim_hash(uuid)).collect();
+                        let held = catalog.claimed_games(&hashes).await?;
+                        let wanted = unclaimed(uuids, &held);
+                        let number = pending.push(PageCommit {
+                            position: last.clone(),
+                            rows: page.len() as u64,
+                            present: (page.len() - wanted.len()) as u64,
+                            outstanding: wanted.len(),
+                            unserved: false,
+                        });
+                        queued.extend(wanted.into_iter().map(|uuid| (number, uuid)));
+                        reading_from = Some(last);
                     }
                 }
             }
-            if unserved > 0 {
-                // Left where it was, so the next pass asks these again. Every
-                // game on the page that did land is claimed by now, so walking
-                // it a second time costs one indexed lookup and no request.
-                self.report(
-                    WatchLogLevel::Warn,
-                    format!(
-                        "有 {unserved} 局没有会话接手，本页不推进游标，本轮到此为止；下一轮从同一处再走"
-                    ),
-                );
-                return Ok(PassOutcome::interrupted(scanned, replaced));
-            }
-            // After the page's fetches, never before: a cursor that ran ahead of
-            // them would skip whatever was in flight when the process stopped.
-            catalog.set_refetch_cursor(KNOWN_GAMES_WALK, &last).await?;
-            cursor = Some(last);
 
-            if scanned - reported >= PROGRESS_EVERY {
+            // Commit every page that finished while the last request was in
+            // flight — including whole pages this corpus already held, which
+            // finish the moment they are read and would otherwise pile up
+            // unrecorded through a re-walk.
+            if let Some(done) = pending.committable() {
+                // Reported, not returned. The cursor is a way to avoid reading
+                // rows twice, and nothing else: what has been stored is in the
+                // claim table. A checkpoint that does not land costs a page or
+                // two of re-listing on the next start, and ending a sweep that
+                // has months left to run because PostgreSQL blinked costs the
+                // whole thing — nothing restarts it.
+                if let Err(error) = catalog
+                    .set_refetch_cursor(KNOWN_GAMES_WALK, &done.position)
+                    .await
+                {
+                    self.report(
+                        WatchLogLevel::Warn,
+                        format!("记不下走查位置，重启会从上一个记下的位置再走：{error}"),
+                    );
+                }
+                scanned += done.rows;
+                let mut progress = self.progress.write();
+                progress.scanned += done.rows;
+                progress.present += done.present;
+                // The committed position, not the read one: this is what the
+                // console means by 已走到, and what a restart resumes from.
+                progress.position = Some(done.position.started_at);
+            }
+
+            while fetching.len() < in_flight {
+                let Some((page, uuid)) = queued.pop_front() else {
+                    break;
+                };
+                let walk = Arc::clone(self);
+                fetching.spawn(async move { (page, walk.one_game(uuid).await) });
+            }
+
+            let Some(joined) = fetching.join_next().await else {
+                // Nothing in the air. Either there is no more work, or the next
+                // turn reads the page that refills it.
+                if queued.is_empty() && (listed_everything || unserved > 0) {
+                    break;
+                }
+                continue;
+            };
+            let (page, outcome) = joined?;
+            let outcome = outcome?;
+            let went_unserved = matches!(outcome, Outcome::Unserved);
+            {
+                let mut progress = self.progress.write();
+                match outcome {
+                    Outcome::Replaced => {
+                        replaced += 1;
+                        progress.replaced += 1;
+                    }
+                    Outcome::Duplicate => progress.duplicates += 1,
+                    Outcome::Refused => progress.refused += 1,
+                    Outcome::Unserved => {
+                        unserved += 1;
+                        progress.refused += 1;
+                    }
+                    Outcome::Unconvertible(why) => {
+                        progress.unconvertible += 1;
+                        progress.unconvertible_by.bump(why);
+                    }
+                    // No stored bytes are read on this path.
+                    Outcome::Unreadable => progress.unreadable += 1,
+                }
+            }
+            // The sweep's own heartbeat. Without it the console's 条/秒 reads
+            // zero for the life of a run that is working perfectly, because the
+            // only other place this is stamped is the pb repair.
+            self.rate.write().hit();
+            pending.answered(page, went_unserved);
+            if went_unserved {
+                // Stop feeding. The cursor cannot move past this page, so every
+                // request after it would be spent on games the next round walks
+                // again anyway — and the pool has just said it has nobody to
+                // spend them.
+                queued.clear();
+            }
+
+            if scanned >= reported + PROGRESS_EVERY {
                 reported = scanned;
                 let progress = *self.progress.read();
                 self.report(
@@ -1568,6 +1643,25 @@ impl RefetchSupervisor {
                 );
             }
         }
+
+        if unserved > 0 {
+            // The cursor is short of the page that went unanswered, so the next
+            // round starts there. Every game before it that did land is claimed
+            // by now, so walking to it a second time costs one indexed lookup
+            // and no request.
+            self.report(
+                WatchLogLevel::Warn,
+                format!("有 {unserved} 局没有会话接手，游标停在它们之前，本轮到此为止；下一轮从同一处再走"),
+            );
+            return Ok(PassOutcome::interrupted(scanned, replaced));
+        }
+        // The end of the list, with every page behind it committed. Back to the
+        // beginning, so the next pass asks Mahjong Soul again for whatever it
+        // refused. The only exit this walk has that has actually seen the whole
+        // catalogue — months of sweeping away, and the caller decides what
+        // "nothing moved" means on the strength of reaching it.
+        catalog.clear_refetch_cursor(KNOWN_GAMES_WALK).await?;
+        Ok(PassOutcome::finished(scanned, replaced))
     }
 
     /// One catalogued game this corpus has never stored: fetch it, convert it,
@@ -1614,6 +1708,9 @@ impl RefetchSupervisor {
             return Ok(Outcome::Unconvertible(rejected.why));
         };
 
+        // Behind `Arc` only so the retry below can hand the same bytes to a new
+        // attempt without copying a megabyte each time.
+        let (mjai, pb) = (Arc::new(mjai), Arc::new(pb));
         loop {
             // Behind the same ceiling live ingest answers `503` on. Waiting is
             // free here: the backlog is somebody else's work being done, and the
@@ -1623,17 +1720,47 @@ impl RefetchSupervisor {
                 tracing::info!("打包队列积压，补抓让出写入位置");
                 tokio::time::sleep(BACKLOG_BACKOFF).await;
             }
-            match indexer::ingest_one(
-                &self.dependencies.catalog,
-                &self.dependencies.kafka,
-                PAIPUYA_SOURCE,
-                &uuid,
-                None,
-                &mjai,
-                Some(&pb),
-            )
-            .await
-            {
+            // Spawned and immediately awaited, which reads like nothing at all
+            // and is the one thing standing between this walk and silent data
+            // loss.
+            //
+            // `ingest_one` writes the game's claim to PostgreSQL and only then
+            // produces the record to the topic, and those two are not one
+            // transaction. Cancelled between them — this future dropped at the
+            // produce — the claim stays and nothing produces: no `Err`, so
+            // `abandon_claim` never runs, and a cancellation is not an error
+            // Rust can compensate for, because there is no async drop. A game
+            // claim never expires (`KeyScope::Game`), `prune` only deletes the
+            // ones that do, and `claimed_games` asks whether the row exists and
+            // not what state it is in. So every later pass reads that claim,
+            // drops the uuid from `wanted`, and the game is gone: not in the
+            // topic, not in the index, and never asked for again. `indexer`
+            // calls this the invisible loss.
+            //
+            // Dropping a `JoinHandle` detaches its task rather than aborting it,
+            // so the pair finishes wherever this walk went. And it does get
+            // dropped, on paths that are ordinary rather than exotic: any `?`
+            // in the walk's loop drops the whole `JoinSet` and takes eighty-odd
+            // of these with it, and the console's stop button aborts the walk
+            // outright.
+            let ingest = {
+                let catalog = Arc::clone(&self.dependencies.catalog);
+                let kafka = Arc::clone(&self.dependencies.kafka);
+                let (uuid, mjai, pb) = (uuid.clone(), Arc::clone(&mjai), Arc::clone(&pb));
+                tokio::spawn(async move {
+                    indexer::ingest_one(
+                        &catalog,
+                        &kafka,
+                        PAIPUYA_SOURCE,
+                        &uuid,
+                        None,
+                        &mjai,
+                        Some(&pb),
+                    )
+                    .await
+                })
+            };
+            match ingest.await? {
                 Ok(accepted) if accepted.duplicate => return Ok(Outcome::Duplicate),
                 Ok(_) => return Ok(Outcome::Replaced),
                 // The gate above reads the same sampled lag `claim` does, so
@@ -1920,6 +2047,99 @@ impl PassOutcome {
             replaced,
             finished: true,
         }
+    }
+}
+
+/// A page of the catalogue whose games are still being fetched.
+#[derive(Clone, Debug)]
+struct PageCommit {
+    /// The page's last row: where the cursor goes once it is done.
+    position: crate::catalog::SweepPosition,
+    /// Rows the page held, and how many of them this corpus already had. Both
+    /// only reach the console's counters once the page commits.
+    rows: u64,
+    present: u64,
+    /// Games from this page still in flight.
+    outstanding: usize,
+    /// A game on this page nobody answered. The cursor must never pass it: the
+    /// pb repair re-derives its work from `pb_size = 0` on every pass, but
+    /// nothing here would ever record that a catalogued game was skipped.
+    unserved: bool,
+}
+
+/// The pages a walk has read but not yet finished, oldest first.
+///
+/// The whole of the sweep's durability, and the reason it can run without ever
+/// stopping to let a page finish. Games come back out of order — eighty-odd
+/// sessions answering at their own pace — while the cursor is one position, so
+/// it may only move to the end of the *finished prefix*. Move it to whatever
+/// came back last and every game still in flight behind it is declared walked,
+/// and nothing anywhere would ever say otherwise: a catalogued game leaves no
+/// trace of having been skipped.
+///
+/// Free-standing, because that rule is the one thing here that cannot be tested
+/// against a live pool and is silent when it is wrong — a cursor a few thousand
+/// games too far ahead reads exactly like a cursor that is right.
+#[derive(Debug, Default)]
+struct PendingPages {
+    pages: VecDeque<PageCommit>,
+    /// How many have left the front, so a completion's page number still finds
+    /// its entry after the deque has been drained from under it.
+    done: usize,
+}
+
+/// What one sweep of the finished prefix moved past.
+#[derive(Clone, Debug)]
+struct Committed {
+    position: crate::catalog::SweepPosition,
+    rows: u64,
+    present: u64,
+}
+
+impl PendingPages {
+    /// Takes a page the walk has just read, and returns the number to tag its
+    /// games with.
+    fn push(&mut self, page: PageCommit) -> usize {
+        let number = self.done + self.pages.len();
+        self.pages.push_back(page);
+        number
+    }
+
+    /// Books one game as answered.
+    fn answered(&mut self, page: usize, unserved: bool) {
+        let Some(entry) = page
+            .checked_sub(self.done)
+            .and_then(|slot| self.pages.get_mut(slot))
+        else {
+            // Only reachable if a page committed with games still in flight,
+            // which is the bug this type exists to make impossible.
+            debug_assert!(false, "a game came back for a page that already committed");
+            return;
+        };
+        entry.outstanding = entry.outstanding.saturating_sub(1);
+        entry.unserved |= unserved;
+    }
+
+    /// Pops every finished page at the front and says how far the cursor may
+    /// move. `None` while the oldest page is still waiting on a game.
+    fn committable(&mut self) -> Option<Committed> {
+        let mut committed: Option<Committed> = None;
+        while self
+            .pages
+            .front()
+            .is_some_and(|page| page.outstanding == 0 && !page.unserved)
+        {
+            let page = self.pages.pop_front().expect("just checked");
+            self.done += 1;
+            let rows = committed.as_ref().map_or(0, |done| done.rows) + page.rows;
+            let present = committed.as_ref().map_or(0, |done| done.present) + page.present;
+            committed = Some(Committed {
+                position: page.position,
+                rows,
+                present,
+            });
+        }
+        committed
     }
 }
 
@@ -2588,6 +2808,112 @@ mod tests {
             repeating.after(PassOutcome::finished(500, 5)),
             Some(WalkStop::Exhausted)
         );
+    }
+
+    /// The two halves of the reason `one_game` puts its ingest behind a
+    /// `tokio::spawn` it awaits on the very next line — which reads like it does
+    /// nothing, and would be the first thing a tidying pass deleted.
+    ///
+    /// `ingest_one` writes a game's claim to PostgreSQL and only then produces
+    /// the record. Cancelled between the two, the claim stays and the record
+    /// never exists: a game claim never expires, and `claimed_games` asks
+    /// whether the row is there rather than what state it is in, so every later
+    /// pass skips that uuid forever.
+    #[tokio::test]
+    async fn a_dropped_join_set_cancels_its_tasks_and_a_dropped_handle_does_not() {
+        // Why the walk needs the guard: the loop's `?` drops its `JoinSet`, and
+        // that takes every game still in flight with it.
+        let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
+        let mut set = JoinSet::new();
+        set.spawn(async move {
+            tokio::task::yield_now().await;
+            let _ = sender.send(());
+        });
+        drop(set);
+        assert!(
+            receiver.await.is_err(),
+            "a dropped JoinSet must be assumed to abort what it holds"
+        );
+
+        // Why the guard works: a handle is a way to collect a result, not a
+        // grip on the task, so letting go of it leaves the task running.
+        let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            let _ = sender.send(());
+        });
+        drop(handle);
+        receiver
+            .await
+            .expect("a detached task has to run to completion");
+    }
+
+    fn page(second: i64, rows: u64, present: u64, outstanding: usize) -> PageCommit {
+        PageCommit {
+            position: crate::catalog::SweepPosition {
+                started_at: DateTime::from_timestamp(second, 0).expect("in range"),
+                uuid: format!("{second}-last"),
+            },
+            rows,
+            present,
+            outstanding,
+            unserved: false,
+        }
+    }
+
+    /// The rule the whole sweep rests on. Games come back out of order and the
+    /// cursor is one position, so it may only reach the end of the finished
+    /// prefix. A cursor a few thousand games too far ahead reads exactly like a
+    /// cursor that is right, and a catalogued game leaves no trace of having
+    /// been skipped — nothing downstream would ever notice.
+    #[test]
+    fn the_cursor_stops_at_the_first_page_still_waiting() {
+        let mut pending = PendingPages::default();
+        let first = pending.push(page(100, 1_000, 900, 1));
+        let second = pending.push(page(200, 1_000, 1_000, 0));
+        let third = pending.push(page(300, 1_000, 999, 1));
+        assert_eq!((first, second, third), (0, 1, 2));
+
+        // The second page is finished the moment it is read — every game on it
+        // was already held — but it is behind one that is not.
+        assert!(pending.committable().is_none());
+
+        // The third finishing changes nothing either: it is behind the first.
+        pending.answered(third, false);
+        assert!(pending.committable().is_none());
+
+        // The first landing releases all three at once, and the cursor goes to
+        // the last of them.
+        pending.answered(first, false);
+        let done = pending.committable().expect("the prefix is finished");
+        assert_eq!(done.position.uuid, "300-last");
+        assert_eq!(done.rows, 3_000);
+        assert_eq!(done.present, 2_899);
+        assert!(pending.committable().is_none());
+    }
+
+    /// A game nobody answered says nothing about the game, so the cursor must
+    /// not pass it however long the walk runs — and pages read after it are
+    /// behind it, finished or not.
+    #[test]
+    fn an_unanswered_game_pins_the_cursor_behind_its_page() {
+        let mut pending = PendingPages::default();
+        let first = pending.push(page(100, 1_000, 1_000, 0));
+        let second = pending.push(page(200, 1_000, 998, 2));
+        let third = pending.push(page(300, 1_000, 1_000, 0));
+
+        // The page before it commits and leaves the deque, which is what makes
+        // the offset bookkeeping worth a test of its own.
+        let done = pending.committable().expect("the first page is finished");
+        assert_eq!(done.position.uuid, "100-last");
+
+        pending.answered(second, true);
+        assert!(pending.committable().is_none());
+        // Even fully answered, and even with a finished page behind it.
+        pending.answered(second, false);
+        assert!(pending.committable().is_none());
+        let _ = third;
+        assert_eq!(first, 0);
     }
 
     /// The other half: a walk that gets nowhere at all must not spin forever,
