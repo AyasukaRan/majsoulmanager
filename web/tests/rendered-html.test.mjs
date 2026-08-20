@@ -503,3 +503,71 @@ test("the 牌谱屋 sync exposes both edges of its window, and the backend's clo
     /UPDATE paipuya_cursor SET next_from/,
   );
 });
+
+/**
+ * Every service's log lines have to land on some page.
+ *
+ * The backend keeps one 500-entry ring for all of them, tagged by source, and
+ * each page filters it by prefix. That split is what stops a re-fetch sweep's
+ * eighty-odd sessions from burying the collectors' lines — and it is also how a
+ * service quietly becomes unreadable outside `docker logs`, which matters most
+ * for the ones an error message tells the operator to go and read.
+ */
+test("every service's log lines land on a console page", async () => {
+  const services = await Promise.all(
+    ["backfill.rs", "paipuya.rs", "refetch_service.rs", "register_service.rs"].map(
+      (file) => readFile(new URL(`../../src/${file}`, import.meta.url), "utf8"),
+    ),
+  );
+  const sources = services.map((rust) => {
+    const found = rust.match(/const LOG_SOURCE: &str = "([^"]+)"/);
+    assert.ok(found, "every service tags its lines with a LOG_SOURCE constant");
+    return found[1];
+  });
+  // The collectors' three, which are formatted rather than declared.
+  sources.push("service", "collector:live", "module:curl-chrome");
+
+  const pages = await Promise.all(
+    ["accounts", "refetch", "watch"].map((page) =>
+      readFile(new URL(`../app/(dashboard)/${page}/page.tsx`, import.meta.url), "utf8"),
+    ),
+  );
+  const prefixes = pages.flatMap((page) => {
+    const panels = page.match(/<WatchLogPanel\b[\s\S]*?\/>/g) ?? [];
+    return panels.flatMap((panel) => {
+      const prop = panel.match(/source=(?:\{\[([^\]]*)\]\}|"([^"]*)")/);
+      // An unfiltered panel shows every service, which on a shared ring means
+      // the loudest one. Adding a page must not silently reintroduce that.
+      assert.ok(prop, `a log panel with no source shows every service:\n${panel}`);
+      return prop[1] === undefined
+        ? [prop[2]]
+        : [...prop[1].matchAll(/"([^"]*)"/g)].map((match) => match[1]);
+    });
+  });
+  assert.ok(prefixes.length > 0);
+
+  for (const source of sources) {
+    assert.ok(
+      prefixes.some((prefix) => source.startsWith(prefix)),
+      `no console page shows "${source}" lines; prefixes are ${prefixes.join(", ")}`,
+    );
+  }
+
+  // The bar is drawn for both kinds of work now, and from rows walked rather
+  // than rows fetched: on the 牌谱屋 sweep almost every uuid ahead of the cursor
+  // is already held, so a bar over `replaced` reads 0.0% for months.
+  const panel = await readFile(
+    new URL("../components/refetch-panel.tsx", import.meta.url),
+    "utf8",
+  );
+  assert.match(panel, /const walked = progress\?\.scanned \?\? 0;/);
+  assert.match(panel, /backlog && backlog > 0\s*\?\s*Math\.min\(100, \(walked \/ backlog\) \* 100\)/);
+  assert.doesNotMatch(panel, /!sweeping && backlog/);
+  assert.match(panel, /role="progressbar"/);
+  // And the sweep's denominator is the rows left ahead of its cursor, not the
+  // catalogue's size.
+  assert.match(
+    await readFile(new URL("../../src/refetch_service.rs", import.meta.url), "utf8"),
+    /game_uuids_ahead\(resuming\.as_ref\(\)\)/,
+  );
+});

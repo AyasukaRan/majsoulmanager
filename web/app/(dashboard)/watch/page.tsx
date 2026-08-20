@@ -24,7 +24,14 @@ export default function WatchPage() {
       {/* Status first: whether the service is running is what an operator opens
           this page to learn, and the log below it explains whatever it says. */}
       <WatchStatusPanel />
-      <WatchLogPanel />
+      {/* This page's own services, not every service. The re-fetch pool runs
+          eighty-odd sessions through the same 500-entry ring, so an unfiltered
+          panel here shows the collectors' last few lines and then nothing but
+          补抓 for as long as a sweep lasts. */}
+      <WatchLogPanel
+        source={["service", "collector:", "module"]}
+        description="采集服务、各采集实例与协议模块的最近日志（内存环形缓冲，最多保留 500 条）；补抓的日志在牌谱补抓页"
+      />
     </div>
   );
 }

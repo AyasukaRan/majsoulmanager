@@ -83,14 +83,30 @@ const IDLE_POLL: Duration = Duration::from_secs(5);
 /// fixed and fetch them all again.
 const SETTLE_BETWEEN_PASSES: Duration = Duration::from_secs(120);
 
-/// How many passes one run makes before stopping on its own.
+/// How many *completed* passes one run makes before stopping on its own.
 ///
 /// The walk repeats because a record skipped for a transient reason — the
 /// session that was fetching it dropped — is only retried by another pass, and
 /// each pass is cheap once `missing_pb` prunes the finished ones. The cap is
 /// what stops a deployment whose pack worker is permanently further behind than
 /// `SETTLE_BETWEEN_PASSES` from re-fetching the same records forever.
+///
+/// Completed, because a 牌谱屋 sweep over a hundred and ninety million games
+/// takes months to reach the end of its list even once. Counting rounds instead
+/// would have turned this into "tolerate twelve hiccups", and a sweep that long
+/// meets twelve hiccups in an afternoon.
 const MAX_PASSES: u32 = 12;
+
+/// How many rounds in a row may end with nothing walked and nothing fetched
+/// before the run stops.
+///
+/// The one way the sweep can spin: a round that gives up on a page nobody
+/// served, over and over, while the sessions never come back. It costs a page
+/// listing and a claim lookup per round rather than any Mahjong Soul request, so
+/// the cap is generous — roughly an hour of getting nowhere, counting the claim
+/// timeout each round waits out and the settle after it. Any round that reaches
+/// the end of the list, or that stores a single game, resets it.
+const MAX_STUMBLES: u32 = 10;
 
 /// What the console's log panel attributes this service's lines to. Workers tag
 /// themselves `refetch:0`, `refetch:1` and so on, so the page can show its own
@@ -343,8 +359,10 @@ pub struct RefetchRuntimeStatus {
     pub sessions: usize,
     /// Requests waiting on the counter for any server to take.
     pub waiting: usize,
-    /// Records with no protobuf when this run started. `None` before the first
-    /// run, or when the count could not be read.
+    /// What this run set out to work through, read once when it started so the
+    /// bar measures the run rather than a figure moving under it: records with
+    /// no protobuf for the repair, uuids left ahead of the cursor for the sweep.
+    /// `None` before the first run, or when the count could not be read.
     pub backlog: Option<u64>,
     pub progress: RefetchProgress,
     /// Records per second over the last 30 seconds. The counters say how much
@@ -1103,54 +1121,76 @@ impl RefetchSupervisor {
             return Ok(done);
         }
 
-        for pass in 1..=MAX_PASSES {
-            self.progress.write().pass = pass;
-            let (scanned, replaced) = match work {
+        // Rounds started, which is what the console and the log line count. Not
+        // the same as rounds completed on the 牌谱屋 sweep, where a round is a
+        // best effort at a list too long to finish.
+        let mut round = 0u32;
+        let mut tally = WalkTally::default();
+        loop {
+            round += 1;
+            self.progress.write().pass = round;
+            let outcome = match work {
                 RefetchWork::MissingPb => self.one_pass(generation).await?,
                 RefetchWork::KnownGames => self.one_known_games_pass(generation).await?,
             };
+            let PassOutcome {
+                scanned, replaced, ..
+            } = outcome;
             self.report(
                 WatchLogLevel::Info,
                 match work {
                     RefetchWork::MissingPb => {
-                        format!("第 {pass} 轮补抓结束：扫描 {scanned} 条，替换 {replaced} 条")
+                        format!("第 {round} 轮补抓结束：扫描 {scanned} 条，替换 {replaced} 条")
                     }
                     RefetchWork::KnownGames => {
-                        format!("第 {pass} 轮补抓结束：走查 {scanned} 局，入库 {replaced} 局")
+                        format!("第 {round} 轮补抓结束：走查 {scanned} 局，入库 {replaced} 局")
                     }
                 },
             );
-            // Nothing moved, so another pass would meet the same records and be
-            // refused the same way.
-            if replaced == 0 {
-                return Ok(match (work, scanned) {
-                    (RefetchWork::MissingPb, 0) => {
-                        "补抓完成：索引里已经没有缺少原始牌谱的记录".to_owned()
-                    }
-                    (RefetchWork::MissingPb, _) => {
-                        "补抓结束：剩下的记录雀魂都不再提供，或者重转结果不能替换原记录".to_owned()
-                    }
-                    // Deliberately not "the corpus holds every known game". A
-                    // pass that resumed near the end of the list and ran off it
-                    // looks identical from here, and saying the gap is closed on
-                    // the strength of the last few thousand rows would be a
-                    // claim about a hundred and ninety million games.
-                    (RefetchWork::KnownGames, 0) => {
-                        "本轮没有要抓的对局：走到的这一段本地都有了".to_owned()
-                    }
-                    (RefetchWork::KnownGames, _) => {
-                        "补抓结束：这一轮缺的对局雀魂都不再提供".to_owned()
-                    }
-                });
-            }
             if self.generation.load(Ordering::SeqCst) != generation {
                 return Ok("配置已更换，本轮结束".to_owned());
             }
+            match tally.after(outcome) {
+                None => {}
+                // Nothing moved on a round that saw the whole list, so another
+                // would meet the same records and be refused the same way.
+                Some(WalkStop::Done) => {
+                    return Ok(match (work, scanned) {
+                        (RefetchWork::MissingPb, 0) => {
+                            "补抓完成：索引里已经没有缺少原始牌谱的记录".to_owned()
+                        }
+                        (RefetchWork::MissingPb, _) => {
+                            "补抓结束：剩下的记录雀魂都不再提供，或者重转结果不能替换原记录"
+                                .to_owned()
+                        }
+                        // Deliberately not "the corpus holds every known game".
+                        // A pass that resumed near the end of the list and ran
+                        // off it looks identical from here, and saying the gap
+                        // is closed on the strength of the last few thousand
+                        // rows would be a claim about a hundred and ninety
+                        // million games.
+                        (RefetchWork::KnownGames, 0) => {
+                            "本轮没有要抓的对局：走到的这一段本地都有了".to_owned()
+                        }
+                        (RefetchWork::KnownGames, _) => {
+                            "补抓结束：这一轮缺的对局雀魂都不再提供".to_owned()
+                        }
+                    });
+                }
+                Some(WalkStop::Stalled) => {
+                    return Ok(format!(
+                        "连着 {MAX_STUMBLES} 轮没有会话接手，先停下来；\
+                         账号池恢复后重新启动会从同一处接着走"
+                    ));
+                }
+                Some(WalkStop::Exhausted) => {
+                    return Ok(format!(
+                        "补抓已跑满 {MAX_PASSES} 轮仍有记录在变，先停下来；重新启动会接着跑"
+                    ));
+                }
+            }
             tokio::time::sleep(SETTLE_BETWEEN_PASSES).await;
         }
-        Ok(format!(
-            "补抓已跑满 {MAX_PASSES} 轮仍有记录在变，先停下来；重新启动会接着跑"
-        ))
     }
 
     /// The `MissingPb` walk's opening figure. `Some` means there is nothing to
@@ -1206,11 +1246,6 @@ impl RefetchSupervisor {
                  等这次启动的回填结束后再启动（日志里搜「对局幂等认领」）"
             );
         }
-        // No `backlog`: `start()` already cleared it, and there is no figure to
-        // put there. The list's size is not what this run set out to fetch —
-        // two orders of magnitude of it is already held or never served — so a
-        // bar drawn against it would read zero for the life of the sweep. The
-        // walk reports where it has read to instead.
         let totals = self.dependencies.catalog.game_uuid_totals().await?;
         if totals.games == 0 {
             return Ok(Some(
@@ -1224,6 +1259,28 @@ impl RefetchSupervisor {
             .catalog
             .refetch_cursor(KNOWN_GAMES_WALK)
             .await?;
+        // Uuids left ahead of the cursor, which is what this run set out to walk
+        // — not the catalogue's size, and not the games it expects to fetch.
+        // Nearly all of the list is already held or was never served, so a bar
+        // measuring fetches against it would read 0.0% for the life of the
+        // deployment; measuring rows walked against rows left is a figure that
+        // moves, and it is the one an operator uses to work out whether a
+        // hundred and ninety million rows finish this quarter.
+        //
+        // Not fatal if it fails: the walk finds its own work either way, and the
+        // sweep still reports the position it has read to.
+        match self
+            .dependencies
+            .catalog
+            .game_uuids_ahead(resuming.as_ref())
+            .await
+        {
+            Ok(ahead) => self.runtime.write().backlog = Some(ahead),
+            Err(error) => self.report(
+                WatchLogLevel::Warn,
+                format!("读不到剩余待走查的对局数，进度只报绝对值：{error}"),
+            ),
+        }
         self.report(
             WatchLogLevel::Info,
             match &resuming {
@@ -1249,8 +1306,8 @@ impl RefetchSupervisor {
     }
 
     /// One walk over every record that has no protobuf. Returns how many rows it
-    /// looked at and how many it replaced.
-    async fn one_pass(&self, generation: u64) -> anyhow::Result<(u64, u64)> {
+    /// looked at, how many it replaced, and whether it got through the lot.
+    async fn one_pass(&self, generation: u64) -> anyhow::Result<PassOutcome> {
         let filter = RecordFilter {
             missing_pb: true,
             ..RecordFilter::default()
@@ -1266,7 +1323,7 @@ impl RefetchSupervisor {
             // walk checking only between passes would go on spending the
             // account pool for as long as the deployment lives.
             if self.generation.load(Ordering::SeqCst) != generation {
-                return Ok((scanned, replaced));
+                return Ok(PassOutcome::interrupted(scanned, replaced));
             }
             // Paged newest-first, and safe beside live ingest for the reason
             // every walk here is: a row written while this is in flight either
@@ -1341,7 +1398,7 @@ impl RefetchSupervisor {
             }
             match next {
                 Some(next) => cursor = Some(next),
-                None => return Ok((scanned, replaced)),
+                None => return Ok(PassOutcome::finished(scanned, replaced)),
             }
         }
     }
@@ -1363,7 +1420,7 @@ impl RefetchSupervisor {
     /// unlike the pb repair, whose work is re-derived from `pb_size = 0` on every
     /// pass, nothing here would ever record that those games were skipped. So the
     /// pass stops where it is and leaves the cursor for the next one.
-    async fn one_known_games_pass(&self, generation: u64) -> anyhow::Result<(u64, u64)> {
+    async fn one_known_games_pass(&self, generation: u64) -> anyhow::Result<PassOutcome> {
         let catalog = &self.dependencies.catalog;
         let mut cursor = catalog.refetch_cursor(KNOWN_GAMES_WALK).await?.or_else(|| {
             // A seed, not a filter: an empty uuid sorts below every real one, so
@@ -1379,16 +1436,19 @@ impl RefetchSupervisor {
         let mut reported = 0u64;
         loop {
             if self.generation.load(Ordering::SeqCst) != generation {
-                return Ok((scanned, replaced));
+                return Ok(PassOutcome::interrupted(scanned, replaced));
             }
             let page = catalog
                 .game_uuid_listings(cursor.as_ref(), PAGE_SIZE)
                 .await?;
             let Some(last) = page.last().cloned() else {
                 // The end of the list. Back to the beginning, so the next pass
-                // asks Mahjong Soul again for whatever it refused.
+                // asks Mahjong Soul again for whatever it refused. The only exit
+                // this walk has that has actually seen the whole catalogue —
+                // months of sweeping away, and the caller decides what "nothing
+                // moved" means on the strength of reaching it.
                 catalog.clear_refetch_cursor(KNOWN_GAMES_WALK).await?;
-                return Ok((scanned, replaced));
+                return Ok(PassOutcome::finished(scanned, replaced));
             };
             scanned += page.len() as u64;
 
@@ -1450,7 +1510,7 @@ impl RefetchSupervisor {
                         "有 {unserved} 局没有会话接手，本页不推进游标，本轮到此为止；下一轮从同一处再走"
                     ),
                 );
-                return Ok((scanned, replaced));
+                return Ok(PassOutcome::interrupted(scanned, replaced));
             }
             // After the page's fetches, never before: a cursor that ran ahead of
             // them would skip whatever was in flight when the process stopped.
@@ -1793,6 +1853,98 @@ enum Outcome {
     /// because it is the one outcome that says nothing about the game and so is
     /// the one the 牌谱屋 walk must not move its cursor past.
     Unserved,
+}
+
+/// What one round of a walk did, and whether it got to the end of its list.
+///
+/// `finished` is the distinction. Both walks can return early — the 牌谱屋 sweep
+/// gives up on a page nobody served, either walk gives up when its configuration
+/// is replaced — and from the caller those returns used to look exactly like a
+/// round that read the whole list and found nothing to fetch. One page missing a
+/// session was enough to print 「补抓结束：这一轮缺的对局雀魂都不再提供」 over a
+/// hundred and ninety million games nobody had looked at yet.
+#[derive(Clone, Copy, Debug)]
+struct PassOutcome {
+    scanned: u64,
+    replaced: u64,
+    /// The round read its list to the end. Only then does "nothing moved" mean
+    /// there is nothing left to move.
+    finished: bool,
+}
+
+impl PassOutcome {
+    /// A round that stopped somewhere short of the end of its list.
+    fn interrupted(scanned: u64, replaced: u64) -> Self {
+        Self {
+            scanned,
+            replaced,
+            finished: false,
+        }
+    }
+
+    /// A round that read its list to the end.
+    fn finished(scanned: u64, replaced: u64) -> Self {
+        Self {
+            scanned,
+            replaced,
+            finished: true,
+        }
+    }
+}
+
+/// Why the walk stopped. Every arm ends the run, and nothing restarts it, so
+/// each of them is a decision to leave a backlog where it is until an operator
+/// presses the button again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WalkStop {
+    /// A round read its whole list and moved nothing. The only arm that means
+    /// there is no work left.
+    Done,
+    /// Round after round ended with nobody serving the requests.
+    Stalled,
+    /// `MAX_PASSES` complete rounds and records still changing.
+    Exhausted,
+}
+
+/// What the walk remembers between rounds.
+///
+/// Apart from the loop because this is the whole of the bug it was written for
+/// and none of it is reachable from a test otherwise: a round needs an account
+/// pool, a ClickHouse and Mahjong Soul at the other end. What broke was one
+/// comparison — the walk read `replaced == 0` as "there is nothing left" without
+/// asking whether the round had seen anything, so a single page that no session
+/// picked up ended a sweep over a hundred and ninety million games with
+/// 「补抓结束：这一轮缺的对局雀魂都不再提供」, and `MAX_PASSES` degraded from a
+/// cap on repeats into a budget of twelve hiccups.
+#[derive(Debug, Default)]
+struct WalkTally {
+    /// Rounds that read their list to the end. What `MAX_PASSES` counts, and on
+    /// the 牌谱屋 sweep it may stay at zero for months.
+    passes: u32,
+    /// Rounds in a row that neither reached the end nor stored anything.
+    stumbles: u32,
+}
+
+impl WalkTally {
+    /// Books one round and says whether the walk should stop.
+    fn after(&mut self, outcome: PassOutcome) -> Option<WalkStop> {
+        if outcome.finished || outcome.replaced > 0 {
+            self.stumbles = 0;
+        } else {
+            self.stumbles += 1;
+        }
+        if self.stumbles >= MAX_STUMBLES {
+            return Some(WalkStop::Stalled);
+        }
+        if !outcome.finished {
+            return None;
+        }
+        self.passes += 1;
+        if outcome.replaced == 0 {
+            return Some(WalkStop::Done);
+        }
+        (self.passes >= MAX_PASSES).then_some(WalkStop::Exhausted)
+    }
 }
 
 /// The games in a catalogue page worth spending a Mahjong Soul request on:
@@ -2363,5 +2515,66 @@ mod tests {
 
         assert_ne!(hands(&truncated), hands(&stored));
         assert!(!closed(&unclosed));
+    }
+
+    /// The bug the sweep was running with: a round that gave up on a page
+    /// nobody served returned the same `(scanned, replaced)` as one that had
+    /// read the whole catalogue, so the walk announced 「补抓结束」 over a
+    /// hundred and ninety million games it had not looked at.
+    #[test]
+    fn an_interrupted_round_is_never_the_end_of_the_work() {
+        let mut tally = WalkTally::default();
+        // A round that stopped short, having stored nothing: not done, whatever
+        // it scanned.
+        assert_eq!(tally.after(PassOutcome::interrupted(1_000, 0)), None);
+        assert_eq!(tally.after(PassOutcome::interrupted(1_000, 12)), None);
+        // The same numbers from a round that reached the end of the list are
+        // the end of the work.
+        assert_eq!(
+            WalkTally::default().after(PassOutcome::finished(1_000, 0)),
+            Some(WalkStop::Done)
+        );
+    }
+
+    /// `MAX_PASSES` caps repeats of a backlog, not hiccups. The 牌谱屋 sweep
+    /// takes months to complete one round, so counting rounds started would
+    /// stop it on the first bad afternoon — with nothing anywhere that restarts
+    /// it.
+    #[test]
+    fn the_pass_cap_counts_completed_rounds_only() {
+        let mut tally = WalkTally::default();
+        // Well past the cap in rounds, none of which finished. Something moved
+        // each time, so the stall counter stays down.
+        for _ in 0..(MAX_PASSES * 10) {
+            assert_eq!(tally.after(PassOutcome::interrupted(1_000, 1)), None);
+        }
+        // A repair that keeps finding work does hit it.
+        let mut repeating = WalkTally::default();
+        for _ in 1..MAX_PASSES {
+            assert_eq!(repeating.after(PassOutcome::finished(500, 5)), None);
+        }
+        assert_eq!(
+            repeating.after(PassOutcome::finished(500, 5)),
+            Some(WalkStop::Exhausted)
+        );
+    }
+
+    /// The other half: a walk that gets nowhere at all must not spin forever,
+    /// and one that gets somewhere must not be counted towards stopping.
+    #[test]
+    fn only_consecutive_wasted_rounds_stall_the_walk() {
+        let mut tally = WalkTally::default();
+        for _ in 1..MAX_STUMBLES {
+            assert_eq!(tally.after(PassOutcome::interrupted(1_000, 0)), None);
+        }
+        // One page landing anywhere is enough to say the pool is working.
+        assert_eq!(tally.after(PassOutcome::interrupted(1_000, 1)), None);
+        for _ in 1..MAX_STUMBLES {
+            assert_eq!(tally.after(PassOutcome::interrupted(1_000, 0)), None);
+        }
+        assert_eq!(
+            tally.after(PassOutcome::interrupted(1_000, 0)),
+            Some(WalkStop::Stalled)
+        );
     }
 }
