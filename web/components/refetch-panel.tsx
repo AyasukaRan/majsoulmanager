@@ -508,7 +508,8 @@ function RefetchConfigCard({
               }
             />
             <span className="block font-normal text-muted-foreground">
-              每个会话两次请求之间的等待。调小提速，也更显眼。
+              每个会话每隔这么久发一次请求，从发出那刻算起，包含等雀魂回话的时间。
+              调小提速，也更显眼。
             </span>
           </label>
         </div>
