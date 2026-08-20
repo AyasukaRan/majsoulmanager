@@ -395,11 +395,24 @@ impl RegisterService {
         exits: Vec<String>,
     ) -> Result<String, WatchServiceError> {
         let total = jobs.len();
-        let concurrency = concurrency_for(request.concurrency, total, exits.len());
+        let concurrency = concurrency_for(request.concurrency, total);
         if !exits.is_empty() {
+            // Says how thinly they are spread rather than deciding it: fewer
+            // exits than accounts in flight means some share an address, and
+            // whether that is worth the hours it saves is not this code's call.
+            let share = concurrency.div_ceil(exits.len());
             self.report(
                 WatchLogLevel::Info,
-                format!("出口节点 {} 个：{}", exits.len(), exits.join("、")),
+                format!(
+                    "出口节点 {} 个：{}{}",
+                    exits.len(),
+                    exits.join("、"),
+                    if share > 1 {
+                        format!("（{concurrency} 个一起跑，同时最多 {share} 个号共用一个出口）")
+                    } else {
+                        String::new()
+                    }
+                ),
             );
         }
         self.report(
@@ -1006,16 +1019,16 @@ fn note_result(streak: &std::sync::atomic::AtomicUsize, ok: bool) -> usize {
 }
 
 /// How many accounts to run at once: what the form asked for, bounded by the
-/// work there is and by the exits there are.
+/// work there is.
 ///
-/// Round robin only keeps accounts off each other's address while there are at
-/// least as many exits as accounts in flight; past that it puts several on the
-/// same one, which is what spreading them out was for. Zero exits means no node
-/// was asked for at all — then every account uses the same `proxy` anyway and
-/// the exit count has nothing to say about the width.
-fn concurrency_for(asked: usize, jobs: usize, exits: usize) -> usize {
-    let width = asked.clamp(1, MAX_CONCURRENCY).min(jobs.max(1));
-    if exits == 0 { width } else { width.min(exits) }
+/// Deliberately not bounded by how many exits were found. Running wider than
+/// the exit list does put several accounts on one address — but round robin
+/// spreads them evenly rather than piling them on the first node, and three
+/// live nodes turning a sixteen-wide run into a three-wide one costs hours over
+/// a batch. Which of those matters more is the operator's call, and the opening
+/// log line gives them the numbers to make it.
+fn concurrency_for(asked: usize, jobs: usize) -> usize {
+    asked.clamp(1, MAX_CONCURRENCY).min(jobs.max(1))
 }
 
 /// Which nodes to borrow: up to `want` off the (already shuffled) live list.
@@ -1348,31 +1361,26 @@ mod tests {
         );
     }
 
-    /// Concurrency is clamped, not trusted.
+    /// Concurrency is clamped, not trusted — but not by the exit count.
     ///
-    /// It arrives from a request body, and every bound is real: 0 would spawn
-    /// nothing and hang on a semaphore that never issues, a large number would
-    /// have more sessions talking to Mahjong Soul from this deployment at once
-    /// than it has exits to spread them over, and running wider than the exit
-    /// list puts several accounts on one address — the thing spreading them out
-    /// was for.
+    /// Both remaining bounds are real: 0 would spawn nothing and hang on a
+    /// semaphore that never issues, and a large number would have more sessions
+    /// talking to Mahjong Soul from this deployment at once than is sensible.
+    ///
+    /// The exit count is deliberately absent. It was a bound once, and it turned
+    /// a sixteen-wide run into a three-wide one whenever three nodes happened to
+    /// be alive — hours, to avoid accounts sharing an address that round robin
+    /// was already spreading evenly. That trade is the operator's to make.
     #[test]
     fn concurrency_is_clamped_to_the_range_the_form_offers() {
         let clamp = concurrency_for;
-        assert_eq!(clamp(0, 10, 0), 1, "0 会挂在永远发不出的名额上");
-        assert_eq!(clamp(1, 10, 0), 1);
-        assert_eq!(clamp(16, 100, 0), 16, "没要节点时出口数不参与");
-        assert_eq!(clamp(999, 100, 0), MAX_CONCURRENCY);
+        assert_eq!(clamp(0, 10), 1, "0 会挂在永远发不出的名额上");
+        assert_eq!(clamp(1, 10), 1);
+        assert_eq!(clamp(16, 100), 16);
+        assert_eq!(clamp(999, 100), MAX_CONCURRENCY);
         // Never wider than the work: eight permits for three accounts just
         // leaves five idle.
-        assert_eq!(clamp(8, 3, 0), 3);
-        // Never wider than the exits either.
-        assert_eq!(
-            clamp(16, 100, 3),
-            3,
-            "三个出口跑十六并发会有五个号压一个地址"
-        );
-        assert_eq!(clamp(16, 100, 20), 16, "出口比并发多时不受影响");
+        assert_eq!(clamp(8, 3), 3);
     }
 
     /// What a run borrows, and what it leaves alone.
