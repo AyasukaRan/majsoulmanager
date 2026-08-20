@@ -27,7 +27,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -37,7 +37,7 @@ use tokio::{
 
 use crate::{
     accounts::AccountState,
-    catalog::{Catalog, Record, RecordFilter},
+    catalog::{Catalog, Cursor, Record, RecordFilter},
     indexer::{self, game_claim_hash},
     kafka::Kafka,
     majsoul::convert::GameMetadata,
@@ -63,6 +63,43 @@ const PAGE_SIZE: usize = 1_000;
 /// 500 entries and the collectors write into the same one, so a line per page
 /// would push their lines out of it.
 const PROGRESS_EVERY: u64 = 500;
+
+/// The fewest records a walk keeps in the air, however few sessions there are.
+///
+/// It used to be exactly the session count, on the reasoning that "asking for
+/// more requests than there are servers only means the ones at the back wait
+/// behind requests that have not started". True, and not the whole picture: a
+/// record spends only its *fetch* at a session, and the rest of its life — the
+/// pack read, the conversion, the produce — is time that session stands idle
+/// with nothing queued behind it. One in flight per session therefore pins the
+/// pool at whatever fraction of a record's life the fetch happens to be, and
+/// adding accounts moves both numbers together and changes nothing.
+///
+/// Measured on the deployment before this: 270 sessions logged in, `waiting`
+/// reading 0 on nineteen samples out of twenty, and 33 records a second where
+/// the pacing alone allows 180.
+const MIN_IN_FLIGHT: usize = 1_000;
+
+/// How many records a walk keeps in the air.
+///
+/// [`MIN_IN_FLIGHT`] is one floor and the session count is the other — a pool
+/// with more accounts than that should be using them. The ceiling is the one
+/// thing the old "exactly one per session" rule was right about: a request sits
+/// in the broker's queue until a session claims it, and one that waits longer
+/// than [`CLAIM_TIMEOUT`] comes back as nobody having served it, which for the
+/// 牌谱屋 walk ends the pass.
+///
+/// Queue wait is `(in_flight - sessions) × delay / sessions`, so this is that
+/// inverted at a third of the timeout. At the default 1.5 s pacing with a couple
+/// of hundred accounts it does not bind until five figures; at the maximum
+/// minute-long pacing it is what keeps a deep queue from timing out on a pool
+/// that is merely slow rather than broken.
+fn in_flight_for(workers: usize, request_delay_ms: u64) -> usize {
+    let workers = workers.max(1);
+    let patience = CLAIM_TIMEOUT.as_millis() as u64 / 3;
+    let ceiling = workers.saturating_mul(1 + (patience / request_delay_ms.max(1)) as usize);
+    workers.max(MIN_IN_FLIGHT).min(ceiling)
+}
 
 /// How long a worker waits before logging in again after a session ended.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
@@ -1349,6 +1386,10 @@ impl RefetchSupervisor {
         self.report(WatchLogLevel::Info, message.to_owned());
     }
 
+    fn in_flight(&self) -> usize {
+        in_flight_for(self.runtime.read().workers, self.config().request_delay_ms)
+    }
+
     /// One walk over every record that has no protobuf. Returns how many rows it
     /// looked at, how many it replaced, and whether it got through the lot.
     async fn one_pass(&self, generation: u64) -> anyhow::Result<PassOutcome> {
@@ -1356,95 +1397,122 @@ impl RefetchSupervisor {
             missing_pb: true,
             ..RecordFilter::default()
         };
-        let mut cursor = None;
         let (mut scanned, mut replaced) = (0u64, 0u64);
         let mut reported = 0u64;
-        loop {
-            // Per page rather than per pass. `start()` does not serialise
+        let in_flight = self.in_flight();
+        // One continuous stream over every page, not a page at a time. `scan`
+        // runs inside it, so `buffer_unordered` polls it for the next row while
+        // the ones already in the air keep going: the database round trip
+        // overlaps the work instead of standing in front of it.
+        //
+        // Collecting a page and draining it before reading the next drained the
+        // pool to zero every thousand records and then held it there — visible
+        // on the console as 条/秒 sawtoothing between the running rate and
+        // almost nothing. The 牌谱屋 walk was rewritten for this in v0.39; this
+        // one was not.
+        let catalog = Arc::clone(&self.dependencies.catalog);
+        let rows = futures_util::stream::try_unfold(
+            (Some(None), VecDeque::new()),
+            move |(mut next_cursor, mut buffered): (Option<Option<Cursor>>, VecDeque<Record>)| {
+                let catalog = Arc::clone(&catalog);
+                let filter = filter.clone();
+                async move {
+                    loop {
+                        if let Some(row) = buffered.pop_front() {
+                            return anyhow::Ok(Some((row, (next_cursor, buffered))));
+                        }
+                        // `None` rather than an empty page decides the end:
+                        // `scan` answers with the next cursor, and a page that
+                        // filled exactly to the limit still has one.
+                        let Some(cursor) = next_cursor.take() else {
+                            return Ok(None);
+                        };
+                        // Paged newest-first, and safe beside live ingest for
+                        // the reason every walk here is: a row written while
+                        // this is in flight either sorts above the cursor and is
+                        // never read, or is read like any other — and a row
+                        // written now came from the fixed converter with its
+                        // protobuf attached, so the filter excludes it anyway.
+                        let (page, next) = catalog.scan(&filter, cursor, PAGE_SIZE).await?;
+                        next_cursor = next.map(Some);
+                        buffered.extend(page);
+                    }
+                }
+            },
+        );
+        // Boxed because `try_unfold` holds an async block across its state and
+        // is therefore not `Unpin`, and `next()` wants one. One allocation for
+        // the whole pass.
+        let mut outcomes = Box::pin(
+            rows.map_ok(|row| self.one_record(row))
+                .try_buffer_unordered(in_flight),
+        );
+        // Counted as each record lands, not once the page has. Collecting the
+        // page first meant `PAGE_SIZE` fetches — minutes at a rate-limited
+        // pace — during which the console polled a progress card that still
+        // read zero, which is indistinguishable from a stalled walk.
+        while let Some(outcome) = outcomes.next().await {
+            // Per record rather than per page. `start()` does not serialise
             // against itself, so a second one can leave this walk running
             // detached, and a pass is not a unit of time here — the 牌谱屋 sweep
             // is half a billion games at a rate-limited pace, so a superseded
             // walk checking only between passes would go on spending the
             // account pool for as long as the deployment lives.
+            //
+            // Dropping the stream here abandons whatever was in the air, which
+            // is safe on this path and only on this path: a repair claims
+            // nothing and writes nothing until `reindex_one`, so an abandoned
+            // record keeps its `pb_size = 0` row and the next pass finds it
+            // again. The 牌谱屋 walk cannot do this — see `one_game`.
             if self.generation.load(Ordering::SeqCst) != generation {
                 return Ok(PassOutcome::interrupted(scanned, replaced));
             }
-            // Paged newest-first, and safe beside live ingest for the reason
-            // every walk here is: a row written while this is in flight either
-            // sorts above the cursor and is never read, or is read like any
-            // other — and a row written now came from the fixed converter with
-            // its protobuf attached, so the filter excludes it anyway.
-            let (page, next) = self
-                .dependencies
-                .catalog
-                .scan(&filter, cursor, PAGE_SIZE)
-                .await?;
-            // The number of sessions, not the configured concurrency. They
-            // differ whenever the account pool is smaller than the setting, and
-            // asking for more requests than there are servers only means the
-            // ones at the back wait behind requests that have not started —
-            // which, with a claim timeout of three minutes and a pacing delay
-            // that goes up to a minute, is how a pool that is merely slow starts
-            // reporting that nobody is serving it.
-            let in_flight = self.runtime.read().workers.max(1);
-            // Counted as each record lands, not once the page has. Collecting the
-            // page first meant `PAGE_SIZE` fetches — minutes at a rate-limited
-            // pace — during which the console polled a progress card that still
-            // read zero, which is indistinguishable from a stalled walk.
-            let mut outcomes = futures_util::stream::iter(page)
-                .map(|row| self.one_record(row))
-                .buffer_unordered(in_flight);
-            while let Some(outcome) = outcomes.next().await {
-                let outcome = outcome?;
-                scanned += 1;
-                self.rate.write().hit();
-                {
-                    let mut progress = self.progress.write();
-                    progress.scanned += 1;
-                    match outcome {
-                        Outcome::Replaced => {
-                            replaced += 1;
-                            progress.replaced += 1;
-                        }
-                        // The repair walk treats the two the same: the record
-                        // keeps its `pb_size = 0` row either way, so the next
-                        // pass finds it again without anything being remembered.
-                        Outcome::Refused | Outcome::Unserved => progress.refused += 1,
-                        Outcome::Unreadable => progress.unreadable += 1,
-                        Outcome::Unconvertible(why) => {
-                            progress.unconvertible += 1;
-                            progress.unconvertible_by.bump(why);
-                        }
-                        // The repair walk replaces a row it already found, so
-                        // it never claims and never meets this.
-                        Outcome::Duplicate => progress.duplicates += 1,
+            let outcome = outcome?;
+            scanned += 1;
+            self.rate.write().hit();
+            {
+                let mut progress = self.progress.write();
+                progress.scanned += 1;
+                match outcome {
+                    Outcome::Replaced => {
+                        replaced += 1;
+                        progress.replaced += 1;
                     }
-                }
-                if scanned - reported >= PROGRESS_EVERY {
-                    reported = scanned;
-                    let progress = *self.progress.read();
-                    self.report(
-                        WatchLogLevel::Info,
-                        format!(
-                            "补抓中：扫描 {} 条，替换 {} 条，雀魂拒绝 {} 条，读不到字节 {} 条，无法替换 {} 条{}",
-                            progress.scanned,
-                            progress.replaced,
-                            progress.refused,
-                            progress.unreadable,
-                            progress.unconvertible,
-                            match progress.unconvertible_by.summary() {
-                                s if s.is_empty() => String::new(),
-                                s => format!("（{s}）"),
-                            }
-                        ),
-                    );
+                    // The repair walk treats the two the same: the record
+                    // keeps its `pb_size = 0` row either way, so the next
+                    // pass finds it again without anything being remembered.
+                    Outcome::Refused | Outcome::Unserved => progress.refused += 1,
+                    Outcome::Unreadable => progress.unreadable += 1,
+                    Outcome::Unconvertible(why) => {
+                        progress.unconvertible += 1;
+                        progress.unconvertible_by.bump(why);
+                    }
+                    // The repair walk replaces a row it already found, so
+                    // it never claims and never meets this.
+                    Outcome::Duplicate => progress.duplicates += 1,
                 }
             }
-            match next {
-                Some(next) => cursor = Some(next),
-                None => return Ok(PassOutcome::finished(scanned, replaced)),
+            if scanned - reported >= PROGRESS_EVERY {
+                reported = scanned;
+                let progress = *self.progress.read();
+                self.report(
+                    WatchLogLevel::Info,
+                    format!(
+                        "补抓中：扫描 {} 条，替换 {} 条，雀魂拒绝 {} 条，读不到字节 {} 条，无法替换 {} 条{}",
+                        progress.scanned,
+                        progress.replaced,
+                        progress.refused,
+                        progress.unreadable,
+                        progress.unconvertible,
+                        match progress.unconvertible_by.summary() {
+                            s if s.is_empty() => String::new(),
+                            s => format!("（{s}）"),
+                        }
+                    ),
+                );
             }
         }
+        Ok(PassOutcome::finished(scanned, replaced))
     }
 
     /// One walk over the 牌谱屋 catalogue: page it in its own order, drop the
@@ -1493,7 +1561,7 @@ impl RefetchSupervisor {
         });
         // Read once: `workers` is fixed when the run starts, and re-reading it
         // per page only ever meant re-reading the same number.
-        let in_flight = self.runtime.read().workers.max(1);
+        let in_flight = self.in_flight();
 
         // Spawned rather than polled by this loop, so that reading the next page
         // — a ClickHouse query and a PostgreSQL lookup — does not stop the
@@ -2948,5 +3016,39 @@ mod tests {
             tally.after(PassOutcome::interrupted(1_000, 0)),
             Some(WalkStop::Stalled)
         );
+    }
+
+    /// What the walk keeps in the air: a floor an operator asked for, a second
+    /// floor at the session count, and a ceiling that only the slow pacings
+    /// reach.
+    #[test]
+    fn in_flight_clears_the_sessions_without_queueing_past_the_claim_timeout() {
+        let default = RefetchServiceConfig::default().request_delay_ms;
+
+        // The deployment this was measured on: 278 sessions, default pacing.
+        // One per session is what pinned it at 33 records a second with every
+        // session idle, so the floor has to bite here.
+        assert_eq!(in_flight_for(278, default), MIN_IN_FLIGHT);
+        // More accounts than the floor use them.
+        assert_eq!(in_flight_for(4_000, default), 4_000);
+        // And a pool of one still gets a queue, just not a thousand deep.
+        assert!((1..MIN_IN_FLIGHT).contains(&in_flight_for(1, default)));
+
+        // The slow end, which is what the ceiling is for: at a minute between
+        // requests a thousand-deep queue would sit there for hours and come
+        // back as 「没有会话接手」. Every pacing has to leave the queue draining
+        // inside the claim timeout.
+        for delay in [default, 5_000, 30_000, MAX_REQUEST_DELAY_MS] {
+            for workers in [1usize, 8, 278, 4_000] {
+                let in_flight = in_flight_for(workers, delay);
+                assert!(in_flight >= workers, "{workers} sessions at {delay}ms");
+                let queued = in_flight.saturating_sub(workers) as u64;
+                let wait_ms = queued * delay / workers as u64;
+                assert!(
+                    wait_ms < CLAIM_TIMEOUT.as_millis() as u64,
+                    "{workers} sessions at {delay}ms queue for {wait_ms}ms"
+                );
+            }
+        }
     }
 }
