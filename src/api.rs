@@ -414,11 +414,11 @@ struct AccountNodesSpread {
 /// nodes — the pool wants all of them — and the only ordering that matters is
 /// which accounts get the quick ones.
 ///
-/// `MAX_OUTBOUNDS` is still a ceiling because a node is only an address once
-/// mihomo has a listener for it, and accounts bound past the last slot fall
-/// back to the lane. It sits far enough above any real subscription that it
-/// should never bite; if it ever does, the log line in `refile` says so and the
-/// answer is to raise it, not to pick sixteen favourites.
+/// `MAX_OUTBOUNDS` is applied for form rather than for effect: it is the last
+/// slot the port space has room for, so nothing an operator can subscribe to
+/// reaches it. It stays because binding an account past the last slot is not an
+/// error — the account quietly falls back to the shared lane — and a truncation
+/// here is what makes `usable` and `nodes` differ in the response instead.
 async fn post_account_nodes(
     State(state): State<AppState>,
 ) -> Result<Json<AccountNodesSpread>, ApiError> {

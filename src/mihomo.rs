@@ -97,25 +97,36 @@ impl MihomoLane {
     pub const ALL: [Self; 2] = [Self::Watch, Self::Refetch];
 }
 
-/// How many nodes the pool may go out of at once.
-///
-/// One listener and one select group per node, so this is a bound on generated
-/// configuration and on nothing else — Mahjong Soul has no opinion about it.
-/// What it costs when it is reached is a socket, a few lines of YAML and one
-/// controller call at boot, none of which scales with anything.
-///
-/// It was 32, chosen as "larger than any subscription an operator would spread
-/// a pool over", and that stopped being true the moment several subscriptions
-/// could be pooled. It was the wrong shape of number as well as the wrong
-/// value: what Mahjong Soul acts on is an exit address, so every node the pool
-/// can reach is worth having a listener for, and a ceiling that bites means
-/// accounts quietly sharing an address that a spare port would have separated.
-///
-/// 256 leaves ports 7901–8156, still clear of the controller on 9090.
-pub(crate) const MAX_OUTBOUNDS: u16 = 256;
 /// The first port an outbound gets. Above the two lanes, and above the shared
 /// 7890, so nothing here can collide with a port a deployment already dials.
 const OUTBOUND_PORT_BASE: u16 = 7900;
+
+/// Ports the generated configuration binds for something else, which an
+/// outbound must not land on. Only the controller is above the base; 7890,
+/// 7891 and 7892 are all below the first slot and cannot be reached.
+const RESERVED_PORTS: [u16; 1] = [9090];
+
+/// How many nodes the pool may go out of at once.
+///
+/// Not a policy. Ports are `OUTBOUND_PORT_BASE + slot`, so this is simply the
+/// last slot a `u16` has room for — the pool takes every node it can reach and
+/// stops only where the port space does, five hundred times above any
+/// subscription an operator would actually paste in.
+///
+/// It was a policy twice, and both numbers were wrong for the same reason. 32
+/// meant "larger than any one subscription", which stopped being true the
+/// moment several could be pooled; 256 was the same guess made larger. What
+/// Mahjong Soul acts on is an exit address, so every node the pool can reach is
+/// worth a listener, and a ceiling that bites does not degrade gracefully — it
+/// silently puts the accounts past it back on one shared address, which is the
+/// exact thing the per-node outbounds exist to avoid. A limit whose only
+/// failure mode is the problem it was meant to solve should be the limit the
+/// hardware imposes and not one somebody picked.
+///
+/// What each slot costs is a listening socket in mihomo, two blocks of YAML and
+/// one controller call at boot. mihomo raises its own descriptor limit to the
+/// hard one at startup, so the socket is the cheap part.
+pub(crate) const MAX_OUTBOUNDS: u16 = u16::MAX - OUTBOUND_PORT_BASE;
 
 fn outbound_group(slot: u16) -> String {
     format!("MAJSOUL-OUT-{slot}")
@@ -151,18 +162,24 @@ impl OutboundSlots {
         let before = self.assignments.clone();
         self.assignments
             .retain(|node, _| wanted.contains(node.as_str()));
+        // Carried across the loop rather than rebuilt per node: the ceiling is
+        // the port space now, so "one pass over every assignment for every node"
+        // is a cost that grows with the square of a number an operator controls.
+        let mut taken: HashSet<u16> = self.assignments.values().copied().collect();
         for node in nodes {
             if self.assignments.contains_key(node) {
                 continue;
             }
-            let taken: HashSet<u16> = self.assignments.values().copied().collect();
-            let Some(slot) = (1..=MAX_OUTBOUNDS).find(|slot| !taken.contains(slot)) else {
+            let Some(slot) = (1..=MAX_OUTBOUNDS).find(|slot| {
+                !taken.contains(slot) && !RESERVED_PORTS.contains(&outbound_port(*slot))
+            }) else {
                 tracing::warn!(
                     node,
                     "mihomo 出站已经用满 {MAX_OUTBOUNDS} 个，这个节点上的账号会走补抓那条共用出站"
                 );
                 break;
             };
+            taken.insert(slot);
             self.assignments.insert(node.clone(), slot);
         }
         self.assignments != before
@@ -791,11 +808,15 @@ impl MihomoManager {
         self.slots_ready
             .store(ready, std::sync::atomic::Ordering::Relaxed);
         if ready {
+            // The highest slot rather than the count: slots skip any that would
+            // land on a reserved port, so the two stop being the same number as
+            // soon as one is skipped.
+            let highest = assignments.values().copied().max().unwrap_or(1);
             tracing::info!(
                 outbounds = assignments.len(),
                 "补抓池的独立出站已就绪，端口 {}..{}",
                 outbound_port(1),
-                outbound_port(assignments.len() as u16)
+                outbound_port(highest)
             );
         }
     }
@@ -1468,6 +1489,33 @@ mod tests {
             label: None,
             id: None,
         }
+    }
+
+    /// No node may be given the port mihomo answers this process on.
+    ///
+    /// Only reachable since the ceiling became the port space: at 256 the
+    /// highest slot was 8156 and 9090 was hundreds of ports away, so a
+    /// subscription large enough to reach it could not be configured. A listener
+    /// there would take the controller's port, and the controller is how every
+    /// outbound's node is selected in the first place.
+    #[test]
+    fn no_outbound_slot_lands_on_the_controller_port() {
+        let reserved = RESERVED_PORTS[0] - OUTBOUND_PORT_BASE;
+        // Enough nodes to fill every slot below the reserved one and two past
+        // it, so the allocation has to step over it rather than stop at it.
+        let nodes: Vec<String> = (1..=reserved + 1).map(|n| format!("node-{n}")).collect();
+        let mut slots = OutboundSlots::default();
+        assert!(slots.refile(&nodes));
+
+        let ports: HashSet<u16> = slots
+            .assignments
+            .values()
+            .map(|slot| outbound_port(*slot))
+            .collect();
+        assert_eq!(ports.len(), nodes.len(), "every node got its own port");
+        assert!(!ports.contains(&RESERVED_PORTS[0]));
+        // Stepped over, not stopped at: the nodes after it still got listeners.
+        assert!(ports.contains(&(RESERVED_PORTS[0] + 1)));
     }
 
     #[test]

@@ -1309,6 +1309,7 @@ dependencies = [
  "http",
  "http-body-util",
  "indicatif",
+ "libc",
  "parking_lot",
  "rayon",
  "regex",
