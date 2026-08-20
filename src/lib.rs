@@ -24,7 +24,10 @@ pub mod watch;
 pub mod watch_log;
 pub mod watch_service;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use auth::AuthStore;
 use catalog::Catalog;
@@ -40,6 +43,12 @@ use register_service::RegisterService;
 use watch::WatchRegistry;
 use watch_log::WatchLogBuffer;
 use watch_service::WatchSupervisor;
+
+/// Where the image keeps the modules it ships with, read once at startup.
+///
+/// Absent in a development checkout, which is why a missing directory is not an
+/// error — it just means nothing is bundled and whatever is installed stays.
+const BUNDLED_MODULES: &str = "/usr/local/share/mjai/modules";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -138,6 +147,14 @@ impl AppState {
             dependencies,
             Arc::clone(&watch_logs),
         )?);
+        // Before anything can ask for a module. These ship with the image and
+        // move with it, because the backend and the module it drives are one
+        // thing released in two pieces — and when the halves disagree, the
+        // module quietly ignores the field it has never heard of.
+        watch_service
+            .module_store()
+            .sync_bundled(Path::new(BUNDLED_MODULES))
+            .await;
         // After the collectors, and holding them: the pool asks them which
         // accounts are spoken for and which protocol modules to use. Nothing
         // points back the other way, so the two `Arc`s do not form a cycle.

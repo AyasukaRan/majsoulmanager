@@ -33,6 +33,12 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY --from=builder /app/target/release/mjai-management /usr/local/bin/mjai-management
+# The modules travel with the binary that drives them. They are two halves of
+# one release — the backend sends fields a given module version knows about —
+# and a module left behind on the volume ignores the ones it does not, which
+# surfaces as the feature quietly not working rather than as a version error.
+# Installed into the volume at startup; see `sync_bundled`.
+COPY modules /usr/local/share/mjai/modules
 
 ENV MJAI_LISTEN=0.0.0.0:8000 \
     MJAI_DATA_DIR=/var/lib/mjai \
