@@ -809,6 +809,98 @@ impl ModuleStore {
         })
     }
 
+    /// Install the modules that ship with this image, retiring older copies of
+    /// the same one.
+    ///
+    /// These live behind the plugin interface but they are not third-party
+    /// plugins: `curl-chrome` is maintained in this repository, in lock step
+    /// with the request this process sends it. Leaving it to be installed by
+    /// hand makes an upgrade something that can half-apply — and the half that
+    /// is missing does not announce itself, because a module ignores keys it
+    /// does not know, by design.
+    ///
+    /// That is not hypothetical. The backend started sending the client version
+    /// to register with; the module on the host was a release behind and never
+    /// read the field; two batches of accounts died reporting
+    /// `151 ERR_CLIENT_VERSION` while the log faithfully printed the version
+    /// that had been *sent*. Nothing in that chain was wrong except which two
+    /// pieces were running.
+    ///
+    /// Only names this image carries are touched, so a module somebody wrote
+    /// themselves is left alone. Failure is logged rather than propagated: a
+    /// deployment that cannot install a bundled module still has an API worth
+    /// starting, and the console shows what is installed.
+    pub async fn sync_bundled(&self, bundled: &Path) {
+        let Ok(kinds) = std::fs::read_dir(bundled) else {
+            // No bundle at all is how a development checkout runs.
+            return;
+        };
+        for kind in kinds.flatten() {
+            let Ok(names) = std::fs::read_dir(kind.path()) else {
+                continue;
+            };
+            for name in names.flatten() {
+                if let Err(error) = self.sync_one(&name.path()).await {
+                    self.logs.append(
+                        WatchLogLevel::Warn,
+                        "module",
+                        format!("自带模块 {:?} 装不上：{error}", name.file_name()),
+                    );
+                }
+            }
+        }
+    }
+
+    async fn sync_one(&self, source: &Path) -> Result<(), WatchServiceError> {
+        let manifest: ModuleManifest =
+            serde_json::from_slice(&std::fs::read(source.join("manifest.json"))?)?;
+        validate_manifest(&manifest)?;
+        let directory = self.module_dir(&manifest);
+
+        if !directory.exists() {
+            let artifact = std::fs::read(source.join(&manifest.executable))?;
+            self.install(InstallModuleRequest {
+                artifact_base64: STANDARD.encode(&artifact),
+                manifest: manifest.clone(),
+            })
+            .await?;
+            self.logs.append(
+                WatchLogLevel::Info,
+                "module",
+                format!(
+                    "装上自带的 {} 模块 {}@{}",
+                    manifest.kind.directory(),
+                    manifest.name,
+                    manifest.version
+                ),
+            );
+        }
+
+        // Retire the rest. `sole` refuses to pick when a kind has more than one
+        // installed, so leaving the previous version behind would trade a
+        // silently stale module for a loudly broken one.
+        let Some(family) = directory.parent() else {
+            return Ok(());
+        };
+        for other in std::fs::read_dir(family)?.flatten() {
+            if other.path() == directory {
+                continue;
+            }
+            std::fs::remove_dir_all(other.path())?;
+            self.logs.append(
+                WatchLogLevel::Info,
+                "module",
+                format!(
+                    "卸掉旧的 {} 模块 {}@{:?}",
+                    manifest.kind.directory(),
+                    manifest.name,
+                    other.file_name()
+                ),
+            );
+        }
+        Ok(())
+    }
+
     async fn probe(&self, kind: ModuleKind, module: &ModuleRef) -> Result<(), WatchServiceError> {
         if module == &ModuleRef::builtin() {
             return Ok(());
@@ -1997,5 +2089,77 @@ mod tests {
         assert_eq!(installed.name, "test-login");
         assert!(root.join("login/test-login/1.0.0/manifest.json").exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An upgrade has to move both halves, and leave no second copy behind.
+    ///
+    /// The regression: the backend began sending a field, the module on the
+    /// volume was a release older and ignored it — unknown keys are dropped by
+    /// design — and two batches of account registrations failed reporting the
+    /// error that missing field was there to prevent. Nothing logged a version
+    /// mismatch, because as far as either half knew there wasn't one.
+    #[tokio::test]
+    async fn a_bundled_module_replaces_the_older_copy_on_the_volume() {
+        let temporary = std::env::temp_dir().join(format!("mjai-bundle-{}", uuid::Uuid::new_v4()));
+        let (root, bundled) = (temporary.join("volume"), temporary.join("image"));
+        let store = ModuleStore::new(root.clone(), Arc::new(WatchLogBuffer::default())).unwrap();
+
+        // What the volume is carrying: a version nobody is shipping any more.
+        let stale = root.join("register/curl-chrome/1.2.0");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("manifest.json"), "{}").unwrap();
+
+        let artifact =
+            b"#!/bin/sh\nIFS= read -r request\nprintf '%s\\n' '{\"id\":1,\"ok\":true,\"result\":{}}'\n";
+        let source = bundled.join("register/curl-chrome");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("module"), artifact).unwrap();
+        std::fs::write(
+            source.join("manifest.json"),
+            serde_json::to_vec(&ModuleManifest {
+                protocol_version: MODULE_PROTOCOL_VERSION,
+                kind: ModuleKind::Register,
+                name: "curl-chrome".into(),
+                version: "1.3.0".into(),
+                executable: "module".into(),
+                args: Vec::new(),
+                sha256: hex::encode(Sha256::digest(artifact)),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        store.sync_bundled(&bundled).await;
+        assert!(root.join("register/curl-chrome/1.3.0/module").exists());
+        // Not merely present alongside: `sole` refuses to choose between two, so
+        // keeping the old one would trade a stale module for a dead feature.
+        assert!(!stale.exists(), "1.2.0 还在，注册会直接报「装了 2 个」");
+        assert_eq!(
+            store.sole(ModuleKind::Register).unwrap().version,
+            "1.3.0",
+            "升级之后要能选出唯一的那个"
+        );
+
+        // Idempotent: every restart runs this, and a reinstall would spawn a
+        // health check and rewrite the directory for nothing.
+        let stamp = std::fs::metadata(root.join("register/curl-chrome/1.3.0/module"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        store.sync_bundled(&bundled).await;
+        assert_eq!(
+            std::fs::metadata(root.join("register/curl-chrome/1.3.0/module"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            stamp,
+            "同一个版本被重装了一遍"
+        );
+
+        // A development checkout has no bundle, and that is not a failure.
+        store.sync_bundled(&temporary.join("nothing-here")).await;
+        assert!(root.join("register/curl-chrome/1.3.0/module").exists());
+
+        std::fs::remove_dir_all(temporary).unwrap();
     }
 }
