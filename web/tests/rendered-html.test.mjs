@@ -645,3 +645,52 @@ test("the proxy pool is measured against Mahjong Soul and shared by subscription
     assert.match(source, /getSessionUser/);
   }
 });
+
+/**
+ * The mailbox source is probed before a batch spends anything on it.
+ *
+ * Four layers have to agree for this to work at all, and three of them fail
+ * silently if they do not: the module has to answer `mail_probe`, the backend
+ * has to ask before the first account, the console route has to be willing to
+ * forward the path, and the form has to have something to press. A missing link
+ * looks exactly like a probe that passed.
+ *
+ * It is worth pinning because of what the absence cost: the nodes have had a
+ * probe since v0.40.0 and the mailboxes never did, and a dead mailbox source is
+ * more expensive than a dead node. A node costs a login; a mailbox costs an
+ * account — the signup has already happened by the time the code is polled for,
+ * so the address is spent and Mahjong Soul holds an account this side cannot
+ * confirm.
+ */
+test("the mailbox source is probed before a run spends an account on it", async () => {
+  const [module, register, api, form, route] = await Promise.all(
+    [
+      "../../modules/register/curl-chrome/module.py",
+      "../../src/register_service.rs",
+      "../../src/api.rs",
+      "../components/account-register.tsx",
+      "../app/api/accounts/register/[[...path]]/route.ts",
+    ].map((file) => readFile(new URL(file, import.meta.url), "utf8")),
+  );
+
+  // The module answers it, and reaches the inbox by the same call the code
+  // poll uses — a probe down a different path can pass while fetching cannot.
+  assert.match(module, /if method == "mail_probe"/);
+  assert.match(module, /async def mailbox_inbox\(/);
+
+  // Asked before the batch, not per account.
+  assert.match(register, /self\.probe_mail\(&worker, &request\)\.await\?;/);
+  // And every secret the probe could put in an error is redacted first: the
+  // mailbox credential travels as a query parameter, so a transport error that
+  // quotes its own URL quotes the credential.
+  assert.match(register, /fn register_mail_secrets/);
+  assert.match(register, /self\.logs\.register_secret\(temp\.api_key\.trim\(\)\)/);
+  assert.match(register, /self\.logs\.register_secret\(&cloud\.admin_password\)/);
+
+  // The button, and the route that lets it through. In the session-only group
+  // on both sides: the body carries the same credentials a run does.
+  assert.match(api, /"\/api\/v1\/accounts\/register\/probe"/);
+  assert.match(route, /new Set\(\[.*"probe".*\]\)/);
+  assert.match(form, /\/api\/accounts\/register\/probe/);
+  assert.match(form, /测试邮箱/);
+});

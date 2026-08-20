@@ -118,6 +118,12 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/accounts/register/stop",
             post(post_account_register_stop),
         )
+        // In this group and not among the reads: the body carries the same
+        // mailbox credentials a run does, and it spends a temp-mail address.
+        .route(
+            "/api/v1/accounts/register/probe",
+            post(post_account_register_probe),
+        )
         .route("/api/v1/paipuya/config", put(put_paipuya_config))
         .route("/api/v1/paipuya/actions", post(post_paipuya_action))
         .route(
@@ -488,6 +494,23 @@ async fn post_account_register(
 ) -> Result<Json<AccountRegisterProgress>, ApiError> {
     state.register.start(request)?;
     Ok(Json(state.register.status()))
+}
+
+/// One round trip against the mailbox source, without registering anything.
+///
+/// The same probe a run does before its first account, on a button — because
+/// the thing an operator wants to know before pressing 开始 is whether the key
+/// they just pasted works, and the answer used to be a hundred accounts spent
+/// finding out one at a time.
+///
+/// Takes the whole register request so the console can send the form as it
+/// stands. Nothing is started and nothing is remembered.
+async fn post_account_register_probe(
+    State(state): State<AppState>,
+    Json(request): Json<AccountRegisterRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let detail = state.register.probe(request).await?;
+    Ok(Json(serde_json::json!({ "ok": true, "detail": detail })))
 }
 
 /// Ends the run after the account currently in flight.

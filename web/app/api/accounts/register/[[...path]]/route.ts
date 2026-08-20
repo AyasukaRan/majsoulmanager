@@ -11,7 +11,7 @@ export const dynamic = "force-dynamic";
  * already carries the machine key and an administrator's session, so anything
  * accepted here is reachable with both. `""` is the run itself.
  */
-const PATHS = new Set(["", "status", "stop"]);
+const PATHS = new Set(["", "status", "stop", "probe"]);
 
 /**
  * Forwards a registration request.

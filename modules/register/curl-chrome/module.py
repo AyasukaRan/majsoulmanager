@@ -41,7 +41,7 @@
 stdin/stdout 上的 JSON 行, `watch_service.rs` 里 `PluginWorker` 那套:
     <- {"id":N,"protocol_version":1,"method":"...","params":{...}}
     -> {"id":N,"ok":true,"result":{...}}   或   {"id":N,"ok":false,"error":"..."}
-方法: health / cloud_mail_resolve / register
+方法: health / cloud_mail_resolve / mail_probe / register
 
 一次调用注册一个账号, 由管理台循环 —— 进度是逐个报出来的, 而一次注册连取码带
 拟真要几分钟, 攒成一批只会让人盯着一个不动的进度条。
@@ -456,26 +456,34 @@ def _extract_code(body: str) -> str | None:
     return m.group(1) if m else None
 
 
-async def fetch_code(session, credential: str, p: dict, since_ts: float,
-                     tries: int, interval: float) -> str:
-    """轮询 paopaodw 收件箱, 取本次发码之后的雀魂验证码邮件里的 6 位码。"""
+async def mailbox_inbox(session, credential: str, p: dict) -> list:
+    """读一次 paopaodw 收件箱, 读不到就抛。
+
+    单独一个函数是给探测用的: 一次调用就能回答"这条凭据现在还能读吗", 而不必发一封
+    验证码去等它。`fetch_code` 的轮询也走这里, 所以探测走的是取码的同一条路 ——
+    探测通了而取码不通那种事, 只会发生在两条路不一样的时候。"""
     headers = {"Accept": "application/json, text/plain, */*",
                "Referer": "https://query.paopaodw.com/auth.html", "User-Agent": p["ua"]}
     params = {"email": credential, "clientId": "", "refreshToken": "", "num": "3", "boxType": "3"}
+    r = await session.get(CODE_API, params=params, headers=headers)
+    j = json.loads(r.text)
+    if j.get("code") != 200:
+        raise RuntimeError(str(j.get("message") or f"HTTP {r.status_code}"))
+    return (j.get("data") or {}).get("inbox", []) or []
+
+
+async def fetch_code(session, credential: str, p: dict, since_ts: float,
+                     tries: int, interval: float) -> str:
+    """轮询 paopaodw 收件箱, 取本次发码之后的雀魂验证码邮件里的 6 位码。"""
     last_msg = ""
     for _ in range(tries):
         try:
-            r = await session.get(CODE_API, params=params, headers=headers)
-            j = json.loads(r.text)
+            inbox = await mailbox_inbox(session, credential, p)
         except Exception as e:
             last_msg = repr(e)
             await asyncio.sleep(interval)
             continue
-        if j.get("code") != 200:
-            last_msg = str(j.get("message"))
-            await asyncio.sleep(interval)
-            continue
-        for mail in (j.get("data") or {}).get("inbox", []) or []:
+        for mail in inbox:
             frm, sub = mail.get("From", ""), mail.get("Subject", "")
             if "majsoul" not in frm.lower() and "雀魂" not in frm:
                 continue
@@ -994,6 +1002,44 @@ async def register(params: dict) -> dict:
 
 
 # ============================ 模块协议 ============================
+async def mail_probe(params: dict) -> dict:
+    """开跑之前先确认邮箱这一路是通的。
+
+    节点有探测, 邮箱没有 —— 而一批号里邮箱那一侧坏掉的样子, 是每个账号各自走到取码
+    那一步才失败一次: 号已经在雀魂那边建出来了, 密码留在这边, 验证码永远等不到。
+    一次往返就能把这件事挪到开跑之前。
+
+    三个来源按 cloud_mail > temp_mail > mailbox 取, 和 `register` 一样, 所以探的是
+    那一批真会用的那一条。每一条探的都是它自己那条真路:
+      - cloud_mail: 认证一次, 把实例说自己收哪些域名读回来
+      - temp_mail: 真开一个地址 —— 这是注册每个号都要做的第一件事, 也是配额和 key
+        同时能被验到的唯一方式。**它会消耗一个地址**, 一次运行多花一个。
+      - mailbox: 读一次收件箱。什么都不消耗, 也不发信。
+
+    返回里只有地址, 从来没有凭据本身。
+    """
+    proxy = params.get("proxy") or None
+    async with AsyncSession(impersonate=IMPERSONATE, trust_env=False, timeout=30) as session:
+        cfg = params.get("cloud_mail")
+        if cfg:
+            resolved = await cloud_mail_resolve(session, cfg, proxy)
+            domains = resolved.get("domains") or []
+            return {"source": "cloud_mail",
+                    "detail": "可用域名 " + ("、".join(domains) if domains else "（一个都没有）")}
+        cfg = params.get("temp_mail")
+        if cfg:
+            address = await temp_mail_open(session, cfg, proxy)
+            return {"source": "temp_mail", "address": address,
+                    "detail": f"开出了 {address}"}
+        credential = (params.get("mailbox") or "").strip()
+        if credential:
+            address = address_of(credential) or ""
+            inbox = await mailbox_inbox(session, credential, pick_persona())
+            return {"source": "mailbox", "address": address,
+                    "detail": f"{address} 的收件箱读到 {len(inbox)} 封"}
+    raise RuntimeError("没有给任何一个邮箱来源")
+
+
 async def handle(method: str, params: dict) -> dict:
     if method == "health":
         return {}
@@ -1001,6 +1047,8 @@ async def handle(method: str, params: dict) -> dict:
         cfg = params.get("cloud_mail") or params
         async with AsyncSession(impersonate=IMPERSONATE, trust_env=False, timeout=30) as session:
             return await cloud_mail_resolve(session, cfg, params.get("proxy") or None)
+    if method == "mail_probe":
+        return await mail_probe(params)
     if method == "register":
         return await register(params)
     raise RuntimeError(f"不认识的方法 {method}")

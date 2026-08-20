@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { UserPlus } from "lucide-react";
+import { MailCheck, UserPlus } from "lucide-react";
 
 import {
   jsonRequest,
@@ -170,34 +170,64 @@ export function AccountRegisterCard() {
         : 0;
   const running = progress?.running ?? false;
 
+  /**
+   * The form as the backend reads it.
+   *
+   * Shared with the probe below, deliberately: a probe built from a second
+   * reading of the same fields could differ from what 开始注册 sends, and a
+   * probe that passes for a body nobody registers with is worse than none.
+   */
+  function requestBody() {
+    const common = {
+      purpose,
+      note,
+      proxy: proxy.trim() || null,
+      mimic,
+      concurrency,
+      random_node: randomNode,
+    };
+    // No domain: the module asks the instance which ones it receives and
+    // spreads the batch over them.
+    const cloud = {
+      base_url: cloudUrl.trim(),
+      admin_email: cloudAdmin.trim(),
+      admin_password: cloudPassword,
+    };
+    // Empty base_url means the module's own default, so a key is enough.
+    const temp = { base_url: tempUrl.trim(), api_key: tempKey.trim() };
+    return source === "cloud"
+      ? { ...common, cloud_mail: cloud, count }
+      : source === "temp"
+        ? { ...common, temp_mail: temp, count }
+        : { ...common, mailboxes: mailboxes.split("\n") };
+  }
+
+  /**
+   * One round trip against the mailbox source, registering nothing.
+   *
+   * The nodes have had a probe for a while and the mailboxes never did, which
+   * is the wrong way round: a dead node costs a login, a dead mailbox costs an
+   * account — the signup has already happened by the time the code is polled
+   * for, so the address is spent and Mahjong Soul has an account this side
+   * cannot confirm.
+   *
+   * The temp-mail probe opens a real address, so pressing this spends one.
+   */
+  async function probeMail() {
+    await run("邮箱不通", async () => {
+      const probed = await jsonRequest<{ detail: string }>(
+        "/api/accounts/register/probe",
+        { method: "POST", body: JSON.stringify(requestBody()) },
+      );
+      return `邮箱通了：${probed.detail}`;
+    });
+  }
+
   async function start() {
     await run("注册启动失败", async () => {
-      const common = {
-        purpose,
-        note,
-        proxy: proxy.trim() || null,
-        mimic,
-        concurrency,
-        random_node: randomNode,
-      };
-      // No domain: the module asks the instance which ones it receives and
-      // spreads the batch over them.
-      const cloud = {
-        base_url: cloudUrl.trim(),
-        admin_email: cloudAdmin.trim(),
-        admin_password: cloudPassword,
-      };
-      // Empty base_url means the module's own default, so a key is enough.
-      const temp = { base_url: tempUrl.trim(), api_key: tempKey.trim() };
-      const body =
-        source === "cloud"
-          ? { ...common, cloud_mail: cloud, count }
-          : source === "temp"
-            ? { ...common, temp_mail: temp, count }
-            : { ...common, mailboxes: mailboxes.split("\n") };
       const started = await jsonRequest<AccountRegisterProgress>(
         "/api/accounts/register",
-        { method: "POST", body: JSON.stringify(body) },
+        { method: "POST", body: JSON.stringify(requestBody()) },
       );
       setProgress(started);
       // Remembered on success only, so a rejected address is not the one that
@@ -206,15 +236,15 @@ export function AccountRegisterCard() {
         window.localStorage.setItem(
           CLOUD_MAIL_KEY,
           JSON.stringify({
-            base_url: cloud.base_url,
-            admin_email: cloud.admin_email,
+            base_url: cloudUrl.trim(),
+            admin_email: cloudAdmin.trim(),
           }),
         );
       } else if (source === "temp") {
         // Only the address. The key reads every mailbox the service hands out.
         window.localStorage.setItem(
           TEMP_MAIL_KEY,
-          JSON.stringify({ base_url: temp.base_url }),
+          JSON.stringify({ base_url: tempUrl.trim() }),
         );
       } else {
         // Cleared on success only: a batch that was refused for a bad line has
@@ -476,6 +506,15 @@ export function AccountRegisterCard() {
         <div className="flex flex-wrap items-center gap-2">
           <Button onClick={() => void start()} disabled={busy || running || pending === 0}>
             开始注册{pending > 0 ? ` ${pending} 个` : ""}
+          </Button>
+          <Button
+            variant="outline"
+            onClick={() => void probeMail()}
+            disabled={busy || running || pending === 0}
+            title="打一次邮箱那一路，不注册任何账号。临时邮箱这一路会真开一个地址。"
+          >
+            <MailCheck className="size-4" />
+            测试邮箱
           </Button>
           {running ? (
             <Button variant="outline" onClick={() => void stop()} disabled={busy}>
