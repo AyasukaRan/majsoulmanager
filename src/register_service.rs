@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::accounts::{AccountPool, AccountPurpose, StoredAccount};
 use crate::watch_log::{WatchLogBuffer, WatchLogLevel};
-use crate::watch_service::{ModuleKind, ModuleStore, WatchServiceError};
+use crate::watch_service::{ModuleKind, ModuleStore, PluginWorker, WatchServiceError};
 
 const LOG_SOURCE: &str = "register";
 
@@ -315,6 +315,12 @@ impl RegisterService {
         request: AccountRegisterRequest,
     ) -> Result<(), WatchServiceError> {
         let jobs = jobs_for(&request)?;
+        // Before anything can put one of them in a message. The module is handed
+        // these as plain JSON and its stderr goes into a buffer every console
+        // member reads, and the mailbox credential in particular travels as a
+        // query parameter — so a transport error that quotes its own URL quotes
+        // the credential with it.
+        self.register_mail_secrets(&request);
         // Checked before the task starts so "没装注册模块" is the answer to the
         // button press rather than a log line somebody finds later.
         let module = self.modules.sole(ModuleKind::Register)?;
@@ -499,6 +505,8 @@ impl RegisterService {
             }
             None => None,
         };
+        // The other two sources, which had no equivalent of the resolve above.
+        self.probe_mail(&worker, &request).await?;
 
         // The resolve worker has done its one job. Each account gets its own
         // process below: `PluginWorker` is one request at a time — the input
@@ -918,6 +926,128 @@ impl RegisterService {
     fn report(&self, level: WatchLogLevel, message: impl Into<String>) {
         self.logs.append(level, LOG_SOURCE, message);
     }
+
+    /// Teaches the console's log buffer every secret this run carries.
+    ///
+    /// All of them, not the ones that look dangerous: a mailbox credential is
+    /// the key to an inbox, a temp-mail key is the key to every inbox that
+    /// service will ever open for this deployment, and the Cloud Mail pair is
+    /// the key to every mailbox on that instance. Only the address is ever meant
+    /// to appear anywhere, and this is what makes that true even when the thing
+    /// doing the printing is a module's transport error rather than this file.
+    fn register_mail_secrets(&self, request: &AccountRegisterRequest) {
+        for credential in &request.mailboxes {
+            let credential = credential.trim();
+            if !credential.is_empty() && !credential.starts_with('#') {
+                self.logs.register_secret(credential);
+            }
+        }
+        if let Some(temp) = &request.temp_mail {
+            self.logs.register_secret(temp.api_key.trim());
+        }
+        if let Some(cloud) = &request.cloud_mail {
+            self.logs.register_secret(cloud.token.trim());
+            self.logs.register_secret(&cloud.admin_password);
+        }
+    }
+
+    /// One round trip against the mailbox source, before the batch starts.
+    ///
+    /// The nodes have had a probe since v0.40.0 and the mailboxes never did,
+    /// which is the wrong way round: a dead node costs a login, and a dead
+    /// mailbox source costs an *account* — the signup has already happened by
+    /// the time the code is polled for, so Mahjong Soul has the account, this
+    /// side has a password nobody can confirm, and the address is spent. A batch
+    /// of a hundred found that out a hundred times.
+    ///
+    /// Cloud Mail is probed by the resolve it already needed, so this is the
+    /// other two. What each one costs is in the module's `mail_probe`; the one
+    /// worth knowing here is that temp-mail's probe opens a real address, so a
+    /// run spends one more than it registers.
+    async fn probe_mail(
+        &self,
+        worker: &PluginWorker,
+        request: &AccountRegisterRequest,
+    ) -> Result<(), WatchServiceError> {
+        // Cloud Mail is not probed twice: the resolve above is the same round
+        // trip, and it had to happen anyway for its token.
+        if request.cloud_mail.is_some() {
+            return Ok(());
+        }
+        let Some(params) = probe_params(request) else {
+            return Ok(());
+        };
+        let detail = self
+            .ask_mail_probe(worker, params)
+            .await
+            .inspect_err(|error| {
+                self.report(
+                    WatchLogLevel::Warn,
+                    format!("邮箱这一路不通，一个号都不去开：{error}"),
+                )
+            })?;
+        self.report(WatchLogLevel::Info, format!("邮箱可用（{detail}）"));
+        Ok(())
+    }
+
+    /// The same probe on its own, for the console's button.
+    ///
+    /// Its own process, and thrown away after: this runs while a batch may be
+    /// running, and a `PluginWorker` answers one request at a time.
+    pub async fn probe(
+        &self,
+        request: AccountRegisterRequest,
+    ) -> Result<String, WatchServiceError> {
+        self.register_mail_secrets(&request);
+        let params = probe_params(&request)
+            .ok_or_else(|| WatchServiceError::InvalidConfig("先填一个邮箱来源再测".to_owned()))?;
+        let module = self.modules.sole(ModuleKind::Register)?;
+        let worker = self
+            .modules
+            .worker(ModuleKind::Register, &module)
+            .await?
+            .ok_or_else(|| {
+                WatchServiceError::InvalidConfig("注册没有内建实现，必须装模块".to_owned())
+            })?;
+        let probed = self.ask_mail_probe(&worker, params).await;
+        worker.shutdown().await;
+        let detail = probed?;
+        self.report(WatchLogLevel::Info, format!("邮箱探测：{detail}"));
+        Ok(detail)
+    }
+
+    async fn ask_mail_probe(
+        &self,
+        worker: &PluginWorker,
+        params: serde_json::Value,
+    ) -> Result<String, WatchServiceError> {
+        let answer = worker.request("mail_probe", params).await?;
+        Ok(answer
+            .get("detail")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("探测通过")
+            .to_owned())
+    }
+}
+
+/// Which mailbox source to probe, in the order both `jobs_for` and the module
+/// resolve them. `None` when the request names none.
+///
+/// The order is the point: probing a source this run will not use is worse than
+/// not probing at all, because it answers about something else.
+fn probe_params(request: &AccountRegisterRequest) -> Option<serde_json::Value> {
+    if let Some(cloud) = &request.cloud_mail {
+        return Some(serde_json::json!({ "cloud_mail": cloud, "proxy": request.proxy }));
+    }
+    if let Some(temp) = &request.temp_mail {
+        return Some(serde_json::json!({ "temp_mail": temp, "proxy": request.proxy }));
+    }
+    let credential = request
+        .mailboxes
+        .iter()
+        .map(|line| line.trim())
+        .find(|line| !line.is_empty() && !line.starts_with('#'))?;
+    Some(serde_json::json!({ "mailbox": credential, "proxy": request.proxy }))
 }
 
 /// The e-mail address inside a mailbox credential string.
@@ -1388,6 +1518,78 @@ mod tests {
         // Never wider than the work: eight permits for three accounts just
         // leaves five idle.
         assert_eq!(clamp(8, 3), 3);
+    }
+
+    /// The probe has to ask about the source the run will actually use.
+    ///
+    /// `jobs_for` resolves cloud > temp > list and the module resolves the same
+    /// order, so this has to as well. A probe of a source the run will not touch
+    /// is worse than no probe: it comes back green about something else.
+    #[test]
+    fn the_probe_asks_about_the_source_the_run_will_use() {
+        let base = AccountRegisterRequest {
+            mailboxes: Vec::new(),
+            cloud_mail: None,
+            temp_mail: None,
+            count: 1,
+            purpose: AccountPurpose::Refetch,
+            note: String::new(),
+            proxy: None,
+            mimic: false,
+            poll_tries: 1,
+            poll_interval: 1.0,
+            concurrency: 1,
+            random_node: false,
+        };
+        let key_of = |request: &AccountRegisterRequest| {
+            probe_params(request).map(|params| {
+                ["cloud_mail", "temp_mail", "mailbox"]
+                    .into_iter()
+                    .find(|field| params.get(*field).is_some_and(|value| !value.is_null()))
+                    .expect("a probe names its source")
+                    .to_owned()
+            })
+        };
+
+        // Nothing configured is nothing to probe, not an error: a run with no
+        // source is refused by `jobs_for` long before this.
+        assert_eq!(key_of(&base), None);
+
+        // Comments and blank lines are not credentials — probing a `#` line
+        // would report on a string the run skips.
+        let listed = AccountRegisterRequest {
+            mailboxes: vec![
+                String::new(),
+                "  # 上一批用完的  ".into(),
+                "  real@example.com|token  ".into(),
+            ],
+            ..base.clone()
+        };
+        assert_eq!(key_of(&listed).as_deref(), Some("mailbox"));
+        assert_eq!(
+            probe_params(&listed).unwrap()["mailbox"],
+            "real@example.com|token",
+            "trimmed, and the first line that is actually one"
+        );
+
+        // Each source in turn wins over the ones below it, the same way the run
+        // picks.
+        let with_temp = AccountRegisterRequest {
+            temp_mail: Some(TempMailConfig {
+                base_url: String::new(),
+                api_key: "k".into(),
+            }),
+            ..listed.clone()
+        };
+        assert_eq!(key_of(&with_temp).as_deref(), Some("temp_mail"));
+        let with_cloud = AccountRegisterRequest {
+            cloud_mail: Some(CloudMailConfig {
+                base_url: "https://mail.example.com".into(),
+                ..CloudMailConfig::default()
+            }),
+            ..with_temp
+        };
+        assert_eq!(key_of(&with_cloud).as_deref(), Some("cloud_mail"));
     }
 
     /// What a run borrows, and what it leaves alone.

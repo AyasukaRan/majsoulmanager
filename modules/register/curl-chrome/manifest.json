@@ -2,8 +2,8 @@
   "protocol_version": 1,
   "kind": "register",
   "name": "curl-chrome",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "executable": "module.py",
   "args": [],
-  "sha256": "7284c4eda6e91bbc63bf882a9b7806fb684a1825054eaa8adcd637d97b6bdba4"
+  "sha256": "d028a3b3f14692193d0ccba3b531e0dd886c92a7756600b67dc295fd73433f74"
 }
