@@ -295,6 +295,15 @@ pub struct Catalog {
     postgres: sqlx::PgPool,
 }
 
+/// How long a caller waits for a free PostgreSQL connection before giving up.
+///
+/// Five seconds, and a pool of four, is how a disk stall became an outage: the
+/// four were held past it and every user of the pool failed within the same
+/// three seconds. Thirty leaves room for a stall to pass, which is the shape
+/// this should fail in — slow, not dead. It is still bounded, because a wait
+/// that never ends is a walk that never reports anything.
+const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl Catalog {
     pub async fn connect(config: &Config) -> anyhow::Result<Self> {
         let deadline = Instant::now() + Duration::from_secs(config.database_wait_secs);
@@ -305,12 +314,13 @@ impl Catalog {
         )?;
         let dsn = config.postgres_dsn.as_str();
         let postgres = wait_ready("PostgreSQL", deadline, || {
-            // PostgreSQL sees one small statement per ingested record and one
-            // more per sealed pack, so a wide pool would buy nothing and the
-            // test suite opens one pool per case.
+            // Sized by `MJAI_POSTGRES_MAX_CONNECTIONS`, which explains what four
+            // cost. Opened lazily, so a pool that never needs thirty-two never
+            // holds thirty-two — which is what keeps the test suite, one pool
+            // per case, from asking PostgreSQL for more than it has.
             PgPoolOptions::new()
-                .max_connections(4)
-                .acquire_timeout(Duration::from_secs(5))
+                .max_connections(config.postgres_max_connections.max(1))
+                .acquire_timeout(ACQUIRE_TIMEOUT)
                 .connect(dsn)
         })
         .await?;

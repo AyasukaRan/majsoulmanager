@@ -53,6 +53,28 @@ pub struct Config {
     )]
     pub postgres_dsn: String,
 
+    /// How many PostgreSQL connections the process may hold.
+    ///
+    /// It was four, on the reasoning that "PostgreSQL sees one small statement
+    /// per ingested record and one more per sealed pack, so a wide pool would
+    /// buy nothing". True when the walks were a couple of hundred wide and the
+    /// repair walk claimed nothing at all; not true of the 牌谱屋 sweep, which
+    /// claims once per game with a thousand games in flight.
+    ///
+    /// What four did on the live deployment was worse than slow. Every user of
+    /// this pool shares it, so when the four were held past `ACQUIRE_TIMEOUT`
+    /// the walk cursor, the 牌谱屋 sync and the Kafka backlog sampler all failed
+    /// inside three seconds of each other, and the sweep — which has months to
+    /// run — aborted. A pool this narrow does not degrade, it takes everything
+    /// down together.
+    ///
+    /// Thirty-two against PostgreSQL's own default of a hundred, for one client
+    /// process. At the measured 0.6 ms per claim that is fifty thousand a
+    /// second, which is not a number this will ever need; the point is headroom
+    /// for a stall, not throughput.
+    #[arg(long, env = "MJAI_POSTGRES_MAX_CONNECTIONS", default_value_t = 32)]
+    pub postgres_max_connections: u32,
+
     #[arg(
         long,
         env = "MJAI_CLICKHOUSE_URL",

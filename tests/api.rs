@@ -41,6 +41,12 @@ fn test_config(data_dir: &std::path::Path, email_api_url: Option<String>) -> Con
         max_batch_bytes: 1024 * 1024,
         max_batch_records: 100,
         pack_target_bytes: 1024 * 1024,
+        // Small on purpose, and only here: this suite opens one pool per test
+        // and runs them concurrently, so the production default would let
+        // forty-odd pools between them ask PostgreSQL for more connections than
+        // its own `max_connections` has. Opened lazily either way, but a bound
+        // that cannot be reached is worth more than one that usually is not.
+        postgres_max_connections: 4,
         postgres_dsn: env_or(
             "MJAI_POSTGRES_DSN",
             "postgres://mjai:mjai@127.0.0.1:5432/mjai",

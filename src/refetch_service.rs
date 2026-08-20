@@ -1665,7 +1665,31 @@ impl RefetchSupervisor {
                 continue;
             };
             let (page, outcome) = joined?;
-            let outcome = outcome?;
+            // One game's failure costs that game, not the sweep. The cursor
+            // write above already refuses to end a months-long walk over a
+            // database blink, and this is the same rule applied to the other
+            // thing that touches PostgreSQL per game: a claim that could not be
+            // taken means nothing was written, so the game is simply not done
+            // yet and the next round asks again.
+            //
+            // It used to be `outcome?`. What that did on the live deployment:
+            // the pool held its four connections past the acquire timeout for a
+            // few seconds, one claim came back `pool timed out`, and a sweep
+            // with a hundred and eighty-seven million games left to walk stopped
+            // dead — reported as 补抓中止 with everything else still healthy.
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    // Counted with the refusals, so a run that is quietly
+                    // failing every game still shows it: `MAX_STUMBLES` reads
+                    // passes that replaced nothing and stops the walk.
+                    tracing::warn!(%error, "这一局没能入库，留给下一轮");
+                    let mut progress = self.progress.write();
+                    progress.refused += 1;
+                    pending.answered(page, false);
+                    continue;
+                }
+            };
             let went_unserved = matches!(outcome, Outcome::Unserved);
             {
                 let mut progress = self.progress.write();
