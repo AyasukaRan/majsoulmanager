@@ -408,21 +408,23 @@ struct AccountNodesSpread {
 /// 「跟随补抓出站」 — one address for the whole pool, which is the thing the
 /// per-node outbounds exist to avoid.
 ///
-/// Capped at `MAX_OUTBOUNDS`, and that is not a detail: a node only becomes an
-/// address when mihomo has a listener for it, there are only so many listeners,
-/// and accounts bound to a node without one fall back to the lane. Spreading
-/// over more nodes than there are slots would quietly put the overflow back on
-/// one address.
+/// Every usable node, fastest first, because what Mahjong Soul acts on is an
+/// exit address: two accounts on one node share whatever it does, and two
+/// accounts on different nodes do not. So there is nothing to choose between
+/// nodes — the pool wants all of them — and the only ordering that matters is
+/// which accounts get the quick ones.
+///
+/// `MAX_OUTBOUNDS` is still a ceiling because a node is only an address once
+/// mihomo has a listener for it, and accounts bound past the last slot fall
+/// back to the lane. It sits far enough above any real subscription that it
+/// should never bite; if it ever does, the log line in `refile` says so and the
+/// answer is to raise it, not to pick sixteen favourites.
 async fn post_account_nodes(
     State(state): State<AppState>,
 ) -> Result<Json<AccountNodesSpread>, ApiError> {
     let status = state.mihomo.status().await;
     let mut usable = status.usable_nodes();
     let available = usable.len();
-    // Shuffled before the ceiling, so the pool is not always spread over the
-    // same fastest sixteen — a subscription's fastest nodes are usually one
-    // region, and one region is one place to be blocked from.
-    crate::register_service::shuffle(&mut usable);
     usable.truncate(usize::from(crate::mihomo::MAX_OUTBOUNDS));
 
     let accounts = state.accounts.spread_over(&usable)?;

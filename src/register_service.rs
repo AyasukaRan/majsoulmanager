@@ -1058,10 +1058,15 @@ fn nodes_to_borrow(held: &[String], alive: Vec<String>, want: usize) -> Vec<Stri
 ///
 /// There is no `rand` in this tree and this does not warrant adding one: the
 /// list is at most a few dozen names, drawn once per run. What it has to be is
-/// unbiased — taking `nodes[..want]` off an unshuffled list would pick the same
-/// exits every time, which for a subscription ordered by region means every
-/// batch leaves from the same country.
-pub(crate) fn shuffle(nodes: &mut [String]) {
+/// unbiased, and the reason is what Mahjong Soul acts on — an exit address.
+/// Taking `nodes[..want]` off a list sorted by latency would send every batch
+/// this deployment ever registers out of the same handful of addresses, so what
+/// those addresses accumulate is "this one signed up for a hundred accounts".
+/// Rotating them spreads that over the whole subscription.
+///
+/// Not the same question as spreading the re-fetch pool, which wants every node
+/// it can get and keeps them for months. This is a burst, repeated.
+fn shuffle(nodes: &mut [String]) {
     for index in (1..nodes.len()).rev() {
         let random = u128::from_le_bytes(*uuid::Uuid::new_v4().as_bytes()) as usize;
         nodes.swap(index, random % (index + 1));
@@ -1404,17 +1409,23 @@ mod tests {
         assert_eq!(nodes_to_borrow(&held, alive.clone(), 99).len(), 3);
         assert!(nodes_to_borrow(&held, Vec::new(), 4).is_empty());
 
-        // The ceiling counts the pool's nodes: one listener and one group each,
-        // and the budget is on the generated configuration.
-        let many: Vec<String> = (0..64).map(|index| format!("节点 {index:02}")).collect();
+        // The ceiling counts the pool's nodes as well as the borrowed ones: one
+        // listener and one group each, and the budget is on the generated
+        // configuration. Asked for more candidates than there are slots so the
+        // ceiling is what decides, rather than the size of the list.
+        let ceiling = usize::from(crate::mihomo::MAX_OUTBOUNDS);
+        let many: Vec<String> = (0..ceiling + 50)
+            .map(|index| format!("节点 {index:03}"))
+            .collect();
         assert_eq!(
-            nodes_to_borrow(&held, many, 64).len(),
-            usize::from(crate::mihomo::MAX_OUTBOUNDS) - held.len(),
+            nodes_to_borrow(&held, many, ceiling + 50).len(),
+            ceiling - held.len(),
         );
     }
 
-    /// Shuffled, or a batch narrower than the node list always leaves from the
-    /// same few nodes — and a subscription is usually ordered by region.
+    /// Shuffled, or every batch this deployment registers leaves from the same
+    /// few addresses — and an address is what Mahjong Soul acts on, so what
+    /// those few accumulate is "this one signed up for a hundred accounts".
     #[test]
     fn shuffling_keeps_every_node_and_stops_reusing_the_same_few() {
         let names: Vec<String> = (0..24).map(|index| format!("节点 {index:02}")).collect();
