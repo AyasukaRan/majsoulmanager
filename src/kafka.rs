@@ -23,7 +23,7 @@ use std::{
     future::Future,
     sync::{
         Arc,
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicI64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -286,13 +286,39 @@ impl IngestMessage {
 /// and ingest was pinned at 30 records a second with every downstream component
 /// idle. Splitting the clients costs one socket per partition and takes the
 /// produce path out from behind the poll entirely.
+/// How many connections each partition's producer gets.
+///
+/// One was enough until the re-fetch pool started producing from hundreds of
+/// tasks at once, and then the note above applied to the produce path against
+/// itself: every one of those produces went down one socket, the broker read
+/// them one at a time, and the rest sat unread in the receive queue. Measured on
+/// the deployment at 278 concurrent tasks — 51.3 produce requests a second,
+/// exactly one record each, the broker reporting 0.115 ms of handling per
+/// request. 0.6% busy, and it was the ceiling on the whole pool: the accounts
+/// went from 96 to 278 and the rate did not move.
+///
+/// Eight, because the thing that should decide the rate is `request_delay_ms` —
+/// it is the only number that bounds what Mahjong Soul sees. Eight lanes at the
+/// measured round trip is about 400 records a second, which is comfortably past
+/// what a few hundred accounts at the default 1.5 s pacing can ask for.
+///
+/// Ordering within a partition is no longer guaranteed across lanes. Nothing
+/// here reads it: the pack worker packs what arrives, the index is keyed by
+/// record id, retention is by size, and a replay is settled by the claim table.
+const PRODUCER_LANES: usize = 8;
+
 pub struct Kafka {
     topic: String,
-    producers: Vec<Arc<PartitionClient>>,
+    /// Per partition, one pool of connections. See [`PRODUCER_LANES`].
+    producers: Vec<Vec<Arc<PartitionClient>>>,
     /// Used by the pack workers, and by `sample_lag` — its `get_offset` is a
     /// request like any other, and putting it on the producer's connection
     /// would reintroduce a smaller version of what the split is for.
     consumers: Vec<Arc<PartitionClient>>,
+    /// Round robin over the lanes. Relaxed and shared across partitions: it
+    /// only has to spread, and two produces landing on one lane costs a wait,
+    /// not a correctness problem.
+    next_lane: AtomicUsize,
     /// The backlog per partition as of the last sample. See `lag`.
     lag: Vec<AtomicI64>,
     max_lag: i64,
@@ -364,35 +390,44 @@ impl Kafka {
             Err(error) => return Err(error),
         }
 
+        // `Error` rather than `Retry`: the topic was just ensured, so a
+        // partition that is still unknown means the configuration and the
+        // cluster disagree, and retrying that only hides it.
+        let connect_partition = async |partition| {
+            Ok::<_, KafkaError>(Arc::new(
+                bounded(
+                    CONTROL_TIMEOUT,
+                    client.partition_client(
+                        config.kafka_topic.clone(),
+                        partition,
+                        UnknownTopicHandling::Error,
+                    ),
+                )
+                .await?,
+            ))
+        };
         let mut producers = Vec::with_capacity(config.kafka_partitions as usize);
         let mut consumers = Vec::with_capacity(config.kafka_partitions as usize);
         for partition in 0..config.kafka_partitions {
-            // Twice per partition, and the two must stay separate objects: one
-            // `PartitionClient` is one connection, so cloning the handle here
-            // instead would put both ends back on one socket. See the note on
-            // `Kafka`.
-            for clients in [&mut producers, &mut consumers] {
-                // `Error` rather than `Retry`: the topic was just ensured, so a
-                // partition that is still unknown means the configuration and
-                // the cluster disagree, and retrying that only hides it.
-                clients.push(Arc::new(
-                    bounded(
-                        CONTROL_TIMEOUT,
-                        client.partition_client(
-                            config.kafka_topic.clone(),
-                            partition,
-                            UnknownTopicHandling::Error,
-                        ),
-                    )
-                    .await?,
-                ));
+            // Every one of these is its own connection, and that is the whole
+            // point of counting them out rather than cloning a handle: one
+            // `PartitionClient` is one socket, and a broker will not read a
+            // second request off a socket until it has answered the first. The
+            // consumer is separate from the producers for that reason, and the
+            // producers are separate from each other for the same one.
+            consumers.push(connect_partition(partition).await?);
+            let mut lanes = Vec::with_capacity(PRODUCER_LANES);
+            for _ in 0..PRODUCER_LANES {
+                lanes.push(connect_partition(partition).await?);
             }
+            producers.push(lanes);
         }
         Ok(Self {
             topic: config.kafka_topic.clone(),
             lag: (0..producers.len()).map(|_| AtomicI64::new(0)).collect(),
             producers,
             consumers,
+            next_lane: AtomicUsize::new(0),
             max_lag: config.kafka_max_lag,
         })
     }
@@ -420,6 +455,16 @@ impl Kafka {
         (record_id.as_u128() % self.producers.len() as u128) as usize
     }
 
+    /// The next connection to produce this partition's records down.
+    ///
+    /// Which lane a record takes carries no meaning — see [`PRODUCER_LANES`]
+    /// for why nothing downstream reads the order — so this is a plain counter
+    /// rather than anything derived from the record.
+    fn producer(&self, partition: usize) -> &PartitionClient {
+        let lanes = &self.producers[partition];
+        &lanes[self.next_lane.fetch_add(1, Ordering::Relaxed) % lanes.len()]
+    }
+
     /// Produces one record and returns once the broker has acknowledged it,
     /// which is what makes the API's `202` a durability claim.
     pub async fn produce(&self, message: IngestMessage) -> Result<(), KafkaError> {
@@ -444,7 +489,7 @@ impl Kafka {
             for chunk in produce_chunks(records) {
                 bounded(
                     PRODUCE_TIMEOUT,
-                    self.producers[partition].produce(chunk, Compression::Zstd),
+                    self.producer(partition).produce(chunk, Compression::Zstd),
                 )
                 .await?;
             }
