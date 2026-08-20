@@ -666,10 +666,7 @@ impl Catalog {
             }
         }
         if let Some(cursor) = cursor {
-            sql.push_str(
-                " AND (received_at, record_id) < \
-                 (fromUnixTimestamp64Milli({cursor_at:Int64}), {cursor_id:UUID})",
-            );
+            sql.push_str(RECORDS_BEFORE);
             params.push((
                 "cursor_at",
                 cursor.received_at.timestamp_millis().to_string(),
@@ -1709,6 +1706,29 @@ mod tests {
         assert!(!game_uuid_listings_sql(false).contains("WHERE"));
     }
 
+    /// The same rule the catalogue page above is held to, on the query that
+    /// predates it. Both halves have to be there and neither announces itself
+    /// when it is missing: without the scalar every page is only slower, and
+    /// without the tuple every page is only wrong about the records sharing the
+    /// cursor's millisecond.
+    #[test]
+    fn the_record_page_keyset_prunes_the_partition_as_well_as_the_row() {
+        assert!(
+            RECORDS_BEFORE.contains("received_at <= fromUnixTimestamp64Milli({cursor_at:Int64})"),
+            "the keyset tuple alone does not prune the primary key: {RECORDS_BEFORE}"
+        );
+        assert!(
+            RECORDS_BEFORE.contains("(received_at, record_id) <"),
+            "the scalar alone would skip or repeat records sharing one millisecond"
+        );
+        // Descending page, so the bound is an upper one. The other direction
+        // would return an empty page for every cursor and read as "the end".
+        assert!(!RECORDS_BEFORE.contains(">="), "{RECORDS_BEFORE}");
+        // One binding, so the two halves cannot disagree about where the cursor
+        // is.
+        assert_eq!(RECORDS_BEFORE.matches("{cursor_at:Int64}").count(), 2);
+    }
+
     #[test]
     fn an_unconstrained_mode_filter_adds_no_clause() {
         // Not "every token I know about": a record whose converter wrote a mode
@@ -2619,6 +2639,27 @@ fn game_uuid_listings_sql(with_cursor: bool) -> String {
     sql.push_str(" ORDER BY started_at, uuid LIMIT {limit:UInt32}");
     sql
 }
+
+/// Everything in `mjai.records` that sorts before a keyset position.
+///
+/// The scalar beside the tuple is redundant to the meaning and required for the
+/// cost — the same rule `game_uuid_listings` states at length, which this query
+/// predates and never got. ClickHouse expands a tuple comparison only for
+/// equality and its primary-key condition has no atom for `less(tuple, const)`,
+/// so the tuple alone leaves the index unused: every page reads the whole table
+/// from the beginning, under a `FINAL`, to hand back a thousand rows. Four
+/// million rows and climbing, once per page, on the re-fetch walk and on the
+/// claims backfill that runs at every boot and on the console's own search.
+///
+/// `<=` and not `>=`: this page is ordered descending and the cursor is an
+/// upper bound. `toYYYYMM(received_at)` is the partition key and
+/// `toDate(received_at)` leads the sorting key, both monotonic in the column, so
+/// the bound prunes partitions and then granules. Records sharing the cursor's
+/// millisecond are kept or dropped by the tuple beside it, which is what the
+/// tuple is for.
+const RECORDS_BEFORE: &str = " AND received_at <= fromUnixTimestamp64Milli({cursor_at:Int64}) \
+     AND (received_at, record_id) < \
+     (fromUnixTimestamp64Milli({cursor_at:Int64}), {cursor_id:UUID})";
 
 /// Everything in `mjai.game_uuids` that sorts after a keyset position.
 ///
