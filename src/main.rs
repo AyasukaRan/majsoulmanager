@@ -13,6 +13,56 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 /// with.
 const LAG_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Take the open files the OS is already willing to give.
+///
+/// Docker starts a container at soft 1024 / hard 524288 and leaves raising the
+/// soft limit to the process. Go runtimes do it themselves at startup — which
+/// is why mihomo in this same stack runs at 524287 while this process sat on
+/// 1024 — and Rust's does not.
+///
+/// A thousand descriptors is not a lot here. The re-fetch pool holds a
+/// websocket per session and builds an HTTP client per login on top of that,
+/// and a deployment runs a couple of hundred sessions; add the Postgres and
+/// ClickHouse pools, the broker, the object store and the listener and the
+/// ceiling is reached in normal operation. What that looks like is the worst
+/// part: `EMFILE` surfaces wherever the next descriptor happened to be asked
+/// for, so one exhausted limit is reported as a proxy that will not connect,
+/// a DNS resolver that will not resolve, and an account file that has gone
+/// missing — three unrelated-looking faults with one cause.
+///
+/// Best effort by design. A limit that cannot be raised is worth a line in the
+/// log, not a process that refuses to start.
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: the pointer is to a live local of exactly the type the call
+    // expects, and the call does not retain it.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        tracing::warn!("读不到本进程的文件描述符上限，跳过抬升");
+        return;
+    }
+    let previous = limit.rlim_cur;
+    // Clamped as well as raised: macOS reports an infinite hard limit but
+    // refuses anything above `kern.maxfilesperproc`, and nothing here wants a
+    // million descriptors — it wants more than a thousand.
+    limit.rlim_cur = limit.rlim_max.min(1_048_576);
+    if previous >= limit.rlim_cur {
+        return;
+    }
+    // SAFETY: as above.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        tracing::warn!(
+            "文件描述符上限还是 {previous}，抬不上去；补抓会话多了会开始报 \
+             Too many open files"
+        );
+        return;
+    }
+    tracing::info!("文件描述符上限 {previous} -> {}", limit.rlim_cur);
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
@@ -23,6 +73,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
+    #[cfg(unix)]
+    raise_open_file_limit();
 
     let config = Config::parse();
     if let Some(warning) = config.record_limit_warning() {

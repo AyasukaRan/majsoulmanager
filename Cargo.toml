@@ -49,6 +49,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 zstd = "0.13"
 
+# One call at startup, to raise `RLIMIT_NOFILE` to what the OS already allows.
+# Every Go binary in this stack does that for itself, which is why mihomo sits
+# at the hard limit and this process was still on Docker's soft 1024. Already in
+# the tree under tokio, so it costs nothing to build.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 

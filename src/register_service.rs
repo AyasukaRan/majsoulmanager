@@ -1037,13 +1037,15 @@ fn concurrency_for(asked: usize, jobs: usize) -> usize {
 /// already, so borrowing one would spend a slot on nothing, and the pool's own
 /// are kept by the lease rather than by this list.
 ///
-/// The ceiling is on generated configuration, one listener and one group per
-/// node, so it counts the pool's against the same budget.
+/// There was a ceiling here as well, `MAX_OUTBOUNDS` minus what the pool holds,
+/// back when that constant was a policy number small enough to reach. It is the
+/// port space now and `want` is capped at [`MAX_CONCURRENCY`], so the two are
+/// four orders of magnitude apart and the clause could only ever be dead code —
+/// dead code whose test had to build fifty-seven thousand node names to say so.
 fn nodes_to_borrow(held: &[String], alive: Vec<String>, want: usize) -> Vec<String> {
-    let ceiling = usize::from(crate::mihomo::MAX_OUTBOUNDS).saturating_sub(held.len());
     let mut borrowed: Vec<String> = Vec::new();
     for node in alive {
-        if borrowed.len() >= want.min(ceiling) {
+        if borrowed.len() >= want {
             break;
         }
         if held.contains(&node) || borrowed.contains(&node) {
@@ -1409,18 +1411,14 @@ mod tests {
         assert_eq!(nodes_to_borrow(&held, alive.clone(), 99).len(), 3);
         assert!(nodes_to_borrow(&held, Vec::new(), 4).is_empty());
 
-        // The ceiling counts the pool's nodes as well as the borrowed ones: one
-        // listener and one group each, and the budget is on the generated
-        // configuration. Asked for more candidates than there are slots so the
-        // ceiling is what decides, rather than the size of the list.
-        let ceiling = usize::from(crate::mihomo::MAX_OUTBOUNDS);
-        let many: Vec<String> = (0..ceiling + 50)
-            .map(|index| format!("节点 {index:03}"))
-            .collect();
-        assert_eq!(
-            nodes_to_borrow(&held, many, ceiling + 50).len(),
-            ceiling - held.len(),
-        );
+        // A duplicate in the live list is one node, not two: it would otherwise
+        // read as two addresses and be handed to two accounts as if it were.
+        let doubled = vec![
+            "美国 03".to_owned(),
+            "美国 03".to_owned(),
+            "新加坡 02".to_owned(),
+        ];
+        assert_eq!(nodes_to_borrow(&held, doubled, 3).len(), 2);
     }
 
     /// Shuffled, or every batch this deployment registers leaves from the same

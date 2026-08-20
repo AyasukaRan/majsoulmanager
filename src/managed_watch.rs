@@ -163,11 +163,9 @@ pub(crate) async fn run(
     // the Majsoul deployment, not of the account, so instances benefit from
     // each other's lookups.
     let cache_dir = dependencies.data_dir.join("watch/cache");
-    // A previously discovered floor, so a restart does not pay for the search
-    // again.
-    if instance.client_version.is_none() {
-        instance.client_version = adopted_client_version(&cache_dir);
-    }
+    // A previously discovered floor was adopted here once, at start-up, and
+    // only by this caller. Resolved per login attempt now, by the same rule
+    // every login in the process follows — see `effective_code_version`.
     let (tracked_state, pending_state) = load_state(&state_path)?;
     let mut tracked = tracked_state
         .into_iter()
@@ -192,9 +190,15 @@ pub(crate) async fn run(
                 masked_account(&username)
             ),
         );
+        // Resolved here and not left to `connect`, even though `connect` would
+        // resolve the same value: a 151 has to report the version the login
+        // actually carried, and an error is the one thing `connect` cannot
+        // carry it back on. Re-read every attempt, so a floor another session
+        // published since the last one is picked up without a failed login.
+        let attempted = effective_code_version(&cache_dir, instance.client_version.as_deref());
         match connect(
             &config.server,
-            instance.client_version.as_deref(),
+            Some(&attempted),
             &username,
             &password,
             proxy.as_deref(),
@@ -277,7 +281,7 @@ pub(crate) async fn run(
                     &dependencies.logs,
                     &source,
                     &cache_dir,
-                    instance.client_version.as_deref(),
+                    Some(&attempted),
                     &detail,
                 )
                 .await
@@ -525,6 +529,29 @@ pub(crate) fn current_client_versions(cache_dir: &Path) -> (String, String) {
     )
 }
 
+/// The code version a login carries when its caller has not pinned one.
+///
+/// A pin wins, then whatever floor the last search published, then the
+/// compiled-in default. One function rather than a rule each caller writes for
+/// itself, because the floor is a property of the Majsoul deployment and not of
+/// the account: every login in this process meets the same one.
+///
+/// Each caller having its own rule is how the re-fetch pool ended up opening
+/// every session on a version the server had been refusing since the last time
+/// Mahjong Soul raised its floor. Its configuration pins nothing, so `None` fell
+/// through to the constant — the collectors' discovered floor was sitting in the
+/// shared cache the whole time, and the pool read it only after spending a
+/// failed login per session to be told 151.
+///
+/// Callers resolve rather than leaving it to [`connect`], and the reason is
+/// [`refreshed_client_version`]: reporting a 151 needs the version the login
+/// carried, and a failed `connect` returns an error, which cannot carry it.
+pub(crate) fn effective_code_version(cache_dir: &Path, pinned: Option<&str>) -> String {
+    pinned
+        .map(str::to_owned)
+        .unwrap_or_else(|| current_client_versions(cache_dir).0)
+}
+
 fn store_client_version(cache_dir: &Path, version: &str) {
     // Written via a temporary file because instances share this path: a reader
     // must never see a half-written version.
@@ -585,7 +612,10 @@ pub(crate) async fn refreshed_client_version(
     if !failure.contains("151") {
         return None;
     }
-    let rejected = current.unwrap_or(CN_CODE_VERSION).to_owned();
+    // The same resolution the login used, or this reports a rejection of a
+    // version nothing tried and compares the shared floor against the wrong
+    // number.
+    let rejected = effective_code_version(cache_dir, current);
     if let Some(shared) = load_client_version(cache_dir)
         .filter(|shared| parse_version(shared) > parse_version(&rejected))
     {
@@ -713,12 +743,27 @@ pub(crate) async fn discover_version_floor(
 }
 
 /// Lowest value for which `probe` returns true, given that the accepted set is
-/// upward-closed and `rejected` is known to be below it.
+/// upward-closed.
+///
+/// `rejected` is a hint about where to start and not a proven bound. It used to
+/// be treated as one, and the search never probed it — so a `rejected` the
+/// server actually accepts came back as `rejected + 1`, which
+/// [`discover_version_floor`] then wrote to the cache every login in the process
+/// reads. Once is a version one patch too high; a session at a time, it climbs.
+///
+/// The caller cannot guarantee the bound, which is the reason this checks it
+/// rather than documenting it harder. What decides a 151 is
+/// `failure.contains("151")` — a claim about a message, and one that a proxy
+/// refusing a connection on port 8151 satisfies just as well.
 async fn search_version_floor<F, Fut>(rejected: u32, mut probe: F) -> Result<u32>
 where
     F: FnMut(u32) -> Fut,
     Fut: Future<Output = Result<bool>>,
 {
+    // One login, and it is the one that keeps a wrong answer off the disk.
+    if probe(rejected).await? {
+        return Ok(rejected);
+    }
     // Escalate until something is accepted, remembering the highest rejection
     // so the binary search starts from a known-bad bound.
     let (mut too_low, mut accepted) = (rejected, None);
@@ -781,6 +826,12 @@ pub(crate) async fn connect(
             }
         }
     }
+    // Resolved once, before the two transports diverge, so the external module
+    // gets the same answer the builtin does. It carries a pinned default of its
+    // own, which a `null` here would fall through to — a second copy of the
+    // constant, in a file that ships separately from the one that discovers the
+    // floor.
+    let code_version = effective_code_version(cache_dir, client_version);
     if let Some(worker) = worker {
         let result = worker
             .request(
@@ -790,7 +841,7 @@ pub(crate) async fn connect(
                     "username": username,
                     "password": password,
                     "proxy_url": proxy,
-                    "client_version": client_version,
+                    "client_version": code_version,
                 }),
             )
             .await
@@ -846,7 +897,6 @@ pub(crate) async fn connect(
     // Login sends client_version_string = WebGL_2022-<code_version>; the code
     // version differs from the resource version and is pinned, overridable per
     // instance — which is also how a discovered floor is applied.
-    let code_version = client_version.unwrap_or(CN_CODE_VERSION).to_owned();
     logs.append(
         WatchLogLevel::Info,
         source,
@@ -1541,6 +1591,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The floor one session paid for is what the next login carries, whoever
+    /// it belongs to.
+    ///
+    /// This is the whole of what stopped the re-fetch pool opening on a version
+    /// Mahjong Soul had been refusing for weeks: its configuration pins nothing,
+    /// so `None` used to mean the constant, and the collectors' answer sat in
+    /// this cache unread until a failed login went looking for it.
+    #[test]
+    fn a_login_that_pins_nothing_takes_the_floor_another_session_found() {
+        let dir = std::env::temp_dir().join(format!("mjai-eff-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert_eq!(effective_code_version(&dir, None), CN_CODE_VERSION);
+
+        let raised = format_version(parse_version(CN_CODE_VERSION).unwrap() + 12);
+        store_client_version(&dir, &raised);
+        assert_eq!(effective_code_version(&dir, None), raised);
+
+        // A pin still wins, because an instance that names a version is naming
+        // it on purpose — that is how one collector is held back for a test.
+        assert_eq!(effective_code_version(&dir, Some("0.9.9")), "0.9.9");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn version_round_trips_and_carries_patch_overflow() {
         assert_eq!(parse_version("0.16.257"), Some(16257));
@@ -1592,14 +1667,35 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(found, floor, "floor {floor}");
-            // 6 escalation probes plus a binary search over the last bracket.
-            // A floor a few patches away — the normal case — costs about 6.
+            // 6 escalation probes plus a binary search over the last bracket,
+            // plus the one that checks the starting point. A floor a few patches
+            // away — the normal case — costs about 7.
             assert!(
-                probed.get() <= 18,
+                probed.get() <= 19,
                 "floor {floor} took {} probes",
                 probed.get()
             );
         }
+    }
+
+    /// A starting point the server accepts is the answer, not a bound to search
+    /// above.
+    ///
+    /// It reaches here whenever a failure that is not a version rejection
+    /// carries "151" in its text — a proxy that would not connect on port 8151
+    /// does — and what it used to return was the starting point plus one, which
+    /// [`discover_version_floor`] writes to the cache every login reads.
+    #[tokio::test]
+    async fn a_starting_point_the_server_accepts_is_the_answer() {
+        let probed = std::cell::Cell::new(0u32);
+        let found = search_version_floor(16270, |value| {
+            probed.set(probed.get() + 1);
+            async move { Ok(value >= 16270) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(found, 16270, "the floor is where the search started");
+        assert_eq!(probed.get(), 1, "and it took one login to say so");
     }
 
     #[tokio::test]

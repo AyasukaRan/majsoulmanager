@@ -954,9 +954,19 @@ impl RefetchSupervisor {
                 &source,
                 format!("登录中（账号 {}）", masked_account(&username)),
             );
+            // Resolved here and not left to `connect`, even though `connect`
+            // would resolve the same value: a 151 has to report the version this
+            // login actually carried, and an error is the one thing `connect`
+            // cannot carry it back on. Re-read every attempt, so a floor another
+            // session published since the last one is picked up here rather than
+            // one failed login later — with a hundred and eighty sessions all
+            // meeting a raised floor within the same minute, that difference is
+            // the whole of what stops them each running a search of their own.
+            let attempted =
+                crate::managed_watch::effective_code_version(&cache_dir, client_version.as_deref());
             match connect(
                 &config.server,
-                client_version.as_deref(),
+                Some(&attempted),
                 &username,
                 &password,
                 proxy.as_deref(),
@@ -1049,7 +1059,7 @@ impl RefetchSupervisor {
                         &self.dependencies.logs,
                         &source,
                         &cache_dir,
-                        client_version.as_deref(),
+                        Some(&attempted),
                         &detail,
                     )
                     .await
