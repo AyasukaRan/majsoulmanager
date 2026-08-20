@@ -173,7 +173,7 @@ pub struct Config {
     /// append, so a continuous trickle seals every interval whether the pack
     /// holds one record or twenty. At 30 seconds that is at most 2,880 a day
     /// against 288 at the age limit, and both the GC's bucket listing and
-    /// `indexed_counts`' grouping scale with the number of packs. Raise it if
+    /// `indexed_pack_keys` scale with the number of packs. Raise it if
     /// that starts to cost more than the visibility is worth; past that point
     /// the honest fix is compacting small packs, not waiting longer.
     #[arg(long, env = "MJAI_PACK_IDLE_SECS", default_value_t = 30)]

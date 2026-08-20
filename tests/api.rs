@@ -64,7 +64,20 @@ fn test_config(data_dir: &std::path::Path, email_api_url: Option<String>) -> Con
         s3_bucket: env_or("MJAI_S3_BUCKET", "mjai-raw"),
         s3_region: env_or("MJAI_S3_REGION", "us-east-1"),
         kafka_bootstrap_servers: env_or("MJAI_KAFKA_BOOTSTRAP_SERVERS", "127.0.0.1:9092"),
-        kafka_topic: env_or("MJAI_KAFKA_TOPIC", "mjai.records.raw"),
+        // A topic per test, because the drain is the one thing they cannot
+        // share. `index_pending` runs the pack worker until the topic reaches
+        // the end of its log, and with forty-four tests producing into one topic
+        // that end keeps moving: a drain chases records another test is still
+        // writing, while every other drain does the same. Nothing errors and
+        // nothing finishes — which is exactly what the job that timed out after
+        // eighteen minutes with not one of the forty-four results printed looks
+        // like (#115). They also shared the committed offset, keyed by topic and
+        // partition, so they could push each other backwards through it.
+        //
+        // Left as topics on the broker afterwards, which is free on the CI
+        // container and untidy against a long-lived local one. A `MJAI_KAFKA_TOPIC`
+        // in the environment still wins, for pinning one deliberately.
+        kafka_topic: env_or("MJAI_KAFKA_TOPIC", &format!("mjai.test.{}", Uuid::new_v4())),
         kafka_partitions: 1,
         kafka_max_lag: 50_000,
         pack_max_age_secs: 300,
@@ -108,13 +121,11 @@ async fn test_state_with_email(email_api_url: Option<String>) -> (AppState, std:
 /// indexes what it read. Ingest only promises the record is in the topic, so
 /// every test that reads a record back has to put this between the two.
 ///
-/// Partition 0 is the whole topic at the default partition count, and the
-/// offset is shared: a worker started by one test will index records another
-/// test produced, into a pack under its own data directory. That is harmless
-/// and worth knowing — the object lands in the same bucket either way, both
-/// tests read it back through the same index, and a record indexed twice
-/// converges because `received_at` and `record_id` both travel with the
-/// message rather than being re-derived here.
+/// Partition 0 is the whole topic at the default partition count, and the topic
+/// belongs to this test alone — see `test_config`. It used to be shared, so a
+/// worker started by one test indexed records another test produced and the two
+/// read each other's committed offset. The index and the bucket are still
+/// shared, which is what `test_source` is for.
 async fn index_pending(state: &AppState) {
     mjai_management::indexer::PackWorker::start(state.clone(), 0)
         .await
@@ -393,6 +404,16 @@ async fn scores_a_game_into_per_player_counters() {
         .collect();
     assert_eq!(found.len(), 4, "every named seat is searchable: {found:?}");
     assert!(found.contains(&names[1].as_str()));
+
+    // `player_summary` counts without FINAL, deliberately — the doc comment on
+    // it says a replayed insert converges through ReplacingMergeTree and a
+    // counter can read high inside the merge window, because the alternative is
+    // a full merge on every page load. `index_pending` settles the topic, which
+    // is a different question from whether ClickHouse has merged the parts, so
+    // asserting an exact 1 against a live table was betting on the very thing
+    // the query says it does not promise. Merged here instead of loosened
+    // there: `>= 1` would stop catching a game scored as none.
+    merge_player_games(&state.config).await;
 
     let winner = json_body(
         ok(
@@ -1475,8 +1496,8 @@ async fn a_second_boot_is_not_blocked_by_the_first_migration_lock() {
     .expect("the second boot blocked on the migration advisory lock");
     // Both are live at once, which is the replica case: neither may be holding
     // anything that stops the other from working.
-    second.unwrap().indexed_counts().await.unwrap();
-    first.indexed_counts().await.unwrap();
+    second.unwrap().indexed_pack_keys().await.unwrap();
+    first.indexed_pack_keys().await.unwrap();
 }
 
 /// A ClickHouse that accepts the connection and never answers fails no
@@ -1602,6 +1623,24 @@ fn sample_record(source: &str, index: u32) -> mjai_management::catalog::Record {
 }
 
 /// Distinct rows in the index for one source, straight from ClickHouse, so that
+/// Collapses `player_games` so a per-player counter can be asserted exactly.
+///
+/// The product counts these without FINAL on purpose, so a row that landed in
+/// two unmerged parts reads twice until the background merge catches up. A test
+/// that wants an exact number has to ask for the merge; the alternative is an
+/// assertion that passes on a value the query never promised.
+async fn merge_player_games(config: &Config) {
+    mjai_management::clickhouse::ClickHouse::new(
+        &config.clickhouse_url,
+        &config.clickhouse_user,
+        &config.clickhouse_password,
+    )
+    .unwrap()
+    .execute("OPTIMIZE TABLE mjai.player_games FINAL", &[], String::new())
+    .await
+    .unwrap();
+}
+
 /// a test can tell an indexed record from one the API merely accepted.
 async fn indexed_rows(config: &Config, source: &str) -> u64 {
     #[derive(serde::Deserialize)]

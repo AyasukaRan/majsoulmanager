@@ -700,19 +700,30 @@ impl Catalog {
         Ok((records, next_cursor))
     }
 
-    /// Per-pack row counts, used by the startup scan to decide which packs are
-    /// worth reading. `uniqExact` rather than `count()` so a replayed insert
-    /// does not make a pack look complete.
+    /// Row counts for named packs, used by the startup scan to decide which of
+    /// them are worth reading. `uniqExact` rather than `count()` so a replayed
+    /// insert does not make a pack look complete and get skipped.
     ///
-    /// It is a full aggregate over two columns and it runs before the listener
-    /// binds. Measured on 641k rows shaped like the live corpus: 9ms, against
-    /// 12ms for the same query restricted to the pack keys found on disk, which
-    /// is slower because every indexed pack is still on local disk and the
-    /// filter only adds work to the same scan. Reconciliation is what costs at
-    /// scale, not this query — the header walk in `recovery` reads 24 bytes per
-    /// record — and the fix for both is to stop reconciling the whole corpus on
-    /// the boot path, not to narrow the `WHERE`.
-    pub async fn indexed_counts(&self) -> Result<Vec<(String, u64)>, CatalogError> {
+    /// Named, and this is the whole point of the argument: unrestricted, this is
+    /// `GROUP BY pack_key` with an exact hash set per group, so its memory is
+    /// every `record_id` in the corpus at once and it runs *before the listener
+    /// binds*. ClickHouse's default `max_memory_usage` is 10GB, which lands at
+    /// roughly 280 million rows — at which point the API does not get slow, it
+    /// does not start. Scoped to the packs the caller actually holds, the ceiling
+    /// stops following the corpus: measured on the live deployment, the index
+    /// names 44,697 packs and the startup scan walks 7 of them.
+    ///
+    /// An earlier measurement said the filter made it *slower* — 12ms against
+    /// 9ms on 641k rows, "because every indexed pack is still on local disk". It
+    /// was taken when those two sets were the same set. They have not been for a
+    /// long time.
+    pub async fn indexed_counts(
+        &self,
+        pack_keys: &[String],
+    ) -> Result<Vec<(String, u64)>, CatalogError> {
+        if pack_keys.is_empty() {
+            return Ok(Vec::new());
+        }
         #[derive(Deserialize)]
         struct PackCount {
             pack_key: String,
@@ -723,15 +734,38 @@ impl Catalog {
             .query(
                 &format!(
                     "SELECT pack_key, uniqExact(record_id) AS records \
-                     FROM {RECORDS_TABLE} GROUP BY pack_key"
+                     FROM {RECORDS_TABLE} WHERE pack_key IN {{keys:Array(String)}} \
+                     GROUP BY pack_key"
                 ),
-                &[],
+                &[("keys", string_array_param(pack_keys))],
             )
             .await?;
         Ok(rows
             .into_iter()
             .map(|row| (row.pack_key, row.records))
             .collect())
+    }
+
+    /// Every pack the index still points at, for deciding which objects in the
+    /// bucket nothing references any more.
+    ///
+    /// The counts are not wanted here and never were — the caller threw them
+    /// away — and asking for them is what made this the query above with the
+    /// corpus-sized hash sets. `DISTINCT` over one column reads the same column
+    /// and holds one entry per pack.
+    pub async fn indexed_pack_keys(&self) -> Result<Vec<String>, CatalogError> {
+        #[derive(Deserialize)]
+        struct PackKey {
+            pack_key: String,
+        }
+        let rows: Vec<PackKey> = self
+            .index
+            .query(
+                &format!("SELECT DISTINCT pack_key FROM {RECORDS_TABLE}"),
+                &[],
+            )
+            .await?;
+        Ok(rows.into_iter().map(|row| row.pack_key).collect())
     }
 
     pub async fn indexed_ids(&self, pack_key: &str) -> Result<Vec<Uuid>, CatalogError> {
@@ -2657,6 +2691,21 @@ fn game_uuid_listings_sql(with_cursor: bool) -> String {
 /// the bound prunes partitions and then granules. Records sharing the cursor's
 /// millisecond are kept or dropped by the tuple beside it, which is what the
 /// tuple is for.
+/// A list of strings as ClickHouse's array literal, for an `{x:Array(String)}`
+/// parameter.
+///
+/// Escaped rather than interpolated raw because the values are file names read
+/// off a disk, which is not a place this process gets to assume anything about.
+/// Backslash first, then the quote, which is the order that survives one round
+/// through ClickHouse's own unescaping.
+fn string_array_param(values: &[String]) -> String {
+    let quoted: Vec<String> = values
+        .iter()
+        .map(|value| format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'")))
+        .collect();
+    format!("[{}]", quoted.join(","))
+}
+
 const RECORDS_BEFORE: &str = " AND received_at <= fromUnixTimestamp64Milli({cursor_at:Int64}) \
      AND (received_at, record_id) < \
      (fromUnixTimestamp64Milli({cursor_at:Int64}), {cursor_id:UUID})";

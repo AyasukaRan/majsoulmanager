@@ -23,15 +23,13 @@ pub async fn collect(
     objects: &Objects,
     grace: Duration,
 ) -> anyhow::Result<usize> {
-    // The manifest is the per-pack row count the recovery scan already needs,
-    // reused for its keys alone; a dedicated `SELECT DISTINCT pack_key` would
-    // be the same full scan of the same column.
-    let referenced: HashSet<String> = catalog
-        .indexed_counts()
-        .await?
-        .into_iter()
-        .map(|(key, _)| key)
-        .collect();
+    // The keys alone. This used to reuse the recovery scan's per-pack counts and
+    // throw the counts away, on the reasoning that "a dedicated `SELECT DISTINCT
+    // pack_key` would be the same full scan of the same column". The same scan,
+    // yes — and not the same memory: the counts are `uniqExact(record_id)` per
+    // group, which is an exact hash set of every record id in the corpus, held
+    // all at once, for a number nothing here reads.
+    let referenced: HashSet<String> = catalog.indexed_pack_keys().await?.into_iter().collect();
     if referenced.is_empty() {
         tracing::warn!("对象回收已跳过：索引没有报告任何 pack，空索引和查询故障从这里看是一样的");
         return Ok(0);
