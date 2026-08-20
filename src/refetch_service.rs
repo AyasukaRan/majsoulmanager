@@ -1683,11 +1683,16 @@ impl RefetchSupervisor {
                         CLAIM_TIMEOUT.as_secs()
                     );
                 }
-                tracing::info!(%uuid, "补抓请求超时，留给下一轮");
+                tracing::debug!(%uuid, "补抓请求超时，留给下一轮");
                 return Ok(Outcome::Unserved);
             }
+            // `debug`, like the session's own line and for the same reason, now
+            // that there is a walk that runs for months: this is one line per
+            // game, `docker` rotates nothing by default, and the number is on
+            // the console's card either way. `RUST_LOG=debug` for a few minutes
+            // brings the uuids back when somebody actually wants them.
             Err(RefetchError::Refused(why)) => {
-                tracing::info!(%uuid, %why, "雀魂没有提供这局的牌谱");
+                tracing::debug!(%uuid, %why, "雀魂没有提供这局的牌谱");
                 return Ok(Outcome::Refused);
             }
         };
@@ -1820,11 +1825,11 @@ impl RefetchSupervisor {
                         CLAIM_TIMEOUT.as_secs()
                     );
                 }
-                tracing::info!(record = %row.id, "补抓请求超时，留给下一轮");
+                tracing::debug!(record = %row.id, "补抓请求超时，留给下一轮");
                 return Ok(Outcome::Unserved);
             }
             Err(RefetchError::Refused(why)) => {
-                tracing::info!(record = %row.id, %why, "雀魂没有提供这局的牌谱");
+                tracing::debug!(record = %row.id, %why, "雀魂没有提供这局的牌谱");
                 return Ok(Outcome::Refused);
             }
         };
