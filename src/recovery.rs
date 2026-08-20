@@ -26,11 +26,24 @@ const RECOVERED_SOURCE: &str = "recovered";
 /// as well would give each record two rows under two different pack keys. They
 /// are discarded at boot instead, before this runs.
 pub async fn recover(catalog: &Catalog, packs: &PackStore) -> anyhow::Result<usize> {
-    let indexed: HashMap<String, u64> = catalog.indexed_counts().await?.into_iter().collect();
+    // Keyed off the paths, before anything is opened: `pack_key` is derived from
+    // the file name, so naming the packs costs a directory listing rather than a
+    // scan of each one.
+    //
+    // Asking only about these is what keeps the query off the boot path's
+    // critical list. Unrestricted it grouped every pack the index has ever
+    // named — 44,697 of them against the 7 files this walks on the live
+    // deployment — and held an exact hash set of every record id while it did.
+    let paths = packs.packs()?;
+    let keys: Vec<String> = paths
+        .iter()
+        .filter_map(|path| pack::pack_key(path))
+        .collect();
+    let indexed: HashMap<String, u64> = catalog.indexed_counts(&keys).await?.into_iter().collect();
     let mut recovered = 0usize;
     // One pack's entries are resident at a time; the whole corpus at once grows
     // with every record ever collected.
-    for path in packs.packs()? {
+    for path in paths {
         let pack = pack::scan_pack(&path)?;
         let entries = pack.entries.len() as u64;
         if indexed.get(&pack.key).copied().unwrap_or(0) >= entries {

@@ -4,7 +4,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -1036,11 +1036,45 @@ fn set_executable(_path: &Path) -> Result<(), WatchServiceError> {
     Ok(())
 }
 
+/// One module process and the three handles that talk to it.
+///
+/// Under one lock rather than three, because the protocol is one line out and
+/// one line back: a second request must not write while the first is still
+/// waiting for its answer, and it must not be the one that reads it.
+struct Pipes {
+    child: Child,
+    input: ChildStdin,
+    output: BufReader<ChildStdout>,
+}
+
+/// What it takes to start the process again, kept because sometimes that is the
+/// only repair. See [`PluginWorker::desynced`].
+struct Recipe {
+    path: PathBuf,
+    args: Vec<String>,
+    module_name: String,
+    logs: Arc<WatchLogBuffer>,
+}
+
 pub(crate) struct PluginWorker {
-    child: Mutex<Child>,
-    input: Mutex<ChildStdin>,
-    output: Mutex<BufReader<ChildStdout>>,
+    recipe: Recipe,
+    pipes: Mutex<Pipes>,
     sequence: AtomicU64,
+    /// Set when a request left the pipe at an offset nobody knows.
+    ///
+    /// `read_line` is not cancel safe — the tokio docs say so in as many words —
+    /// so a request that times out has already consumed some unknown prefix of
+    /// the answer, and every read after it is reading the wrong bytes. What that
+    /// looked like was permanent: the id check below caught the mismatch and
+    /// returned an error, the caller took the error for a dropped session and
+    /// reconnected, reconnecting reopened the session but not the process, and
+    /// the next request read the same one-behind answer. A collector or a
+    /// re-fetch worker that met one slow record never recovered.
+    ///
+    /// Repaired by a new process, and only by a new process. There is nothing to
+    /// resynchronise to: the lost prefix means even the line boundaries are a
+    /// guess from here on.
+    desynced: AtomicBool,
 }
 
 impl PluginWorker {
@@ -1050,6 +1084,28 @@ impl PluginWorker {
         module_name: &str,
         logs: Arc<WatchLogBuffer>,
     ) -> Result<Self, WatchServiceError> {
+        let recipe = Recipe {
+            path,
+            args: args.to_vec(),
+            module_name: module_name.to_owned(),
+            logs,
+        };
+        let pipes = recipe.start().await?;
+        Ok(Self {
+            recipe,
+            pipes: Mutex::new(pipes),
+            sequence: AtomicU64::new(1),
+            desynced: AtomicBool::new(false),
+        })
+    }
+}
+
+impl Recipe {
+    async fn start(&self) -> Result<Pipes, WatchServiceError> {
+        let path = self.path.clone();
+        let args = &self.args;
+        let module_name = &self.module_name;
+        let logs = Arc::clone(&self.logs);
         let mut child = Command::new(path)
             .args(args)
             .arg("--mjai-module-stdio")
@@ -1101,14 +1157,15 @@ impl PluginWorker {
                 }
             });
         }
-        Ok(Self {
-            child: Mutex::new(child),
-            input: Mutex::new(input),
-            output: Mutex::new(BufReader::new(output)),
-            sequence: AtomicU64::new(1),
+        Ok(Pipes {
+            child,
+            input,
+            output: BufReader::new(output),
         })
     }
+}
 
+impl PluginWorker {
     async fn health(&self) -> Result<(), WatchServiceError> {
         self.request("health", serde_json::json!({})).await?;
         Ok(())
@@ -1150,28 +1207,54 @@ impl PluginWorker {
             "method": method,
             "params": params
         });
-        let mut input = self.input.lock().await;
-        input.write_all(request.to_string().as_bytes()).await?;
-        input.write_all(b"\n").await?;
-        input.flush().await?;
-        drop(input);
+        let mut pipes = self.pipes.lock().await;
+        // Before the write, so the request goes down a pipe whose offset is
+        // known. `swap` rather than a load and a store: the flag is cleared by
+        // whoever acts on it, under this lock, so a second caller cannot start a
+        // second process for the same fault.
+        if self.desynced.swap(false, Ordering::Relaxed) {
+            self.recipe.logs.append(
+                WatchLogLevel::Warn,
+                &format!("module:{}", self.recipe.module_name),
+                "上一次请求超时后管道对不上了，重开模块进程",
+            );
+            // Dropped by the assignment, and `kill_on_drop` is what takes the
+            // old process with it.
+            *pipes = self.recipe.start().await?;
+        }
+        pipes
+            .input
+            .write_all(request.to_string().as_bytes())
+            .await?;
+        pipes.input.write_all(b"\n").await?;
+        pipes.input.flush().await?;
 
         let mut line = String::new();
-        let read = async { self.output.lock().await.read_line(&mut line).await };
         let deadline = Self::deadline(method);
-        let bytes = tokio::time::timeout(deadline, read).await.map_err(|_| {
-            WatchServiceError::ModuleFailed(format!(
-                "模块的 {method} 在 {} 秒内没有回应",
-                deadline.as_secs()
-            ))
-        })??;
+        let bytes = match tokio::time::timeout(deadline, pipes.output.read_line(&mut line)).await {
+            Ok(read) => read?,
+            Err(_) => {
+                // The read is abandoned part way through a line it has already
+                // consumed some of, so the pipe is finished — see `desynced`.
+                self.desynced.store(true, Ordering::Relaxed);
+                return Err(WatchServiceError::ModuleFailed(format!(
+                    "模块的 {method} 在 {} 秒内没有回应",
+                    deadline.as_secs()
+                )));
+            }
+        };
         if bytes == 0 {
             return Err(WatchServiceError::ModuleFailed(format!(
                 "模块在处理 {method} 时退出了"
             )));
         }
-        let response: serde_json::Value = serde_json::from_str(&line)?;
+        let response: serde_json::Value = serde_json::from_str(&line).inspect_err(|_| {
+            // A line that will not parse says the same thing a timeout does: the
+            // reader and the writer disagree about where a message starts.
+            self.desynced.store(true, Ordering::Relaxed);
+        })?;
         if response.get("id").and_then(|value| value.as_u64()) != Some(id) {
+            self.desynced.store(true, Ordering::Relaxed);
             return Err(WatchServiceError::ModuleFailed(
                 "module returned a response with the wrong request id".into(),
             ));
@@ -1192,9 +1275,9 @@ impl PluginWorker {
     }
 
     pub(crate) async fn shutdown(&self) {
-        let mut child = self.child.lock().await;
-        let _ = child.start_kill();
-        let _ = child.wait().await;
+        let mut pipes = self.pipes.lock().await;
+        let _ = pipes.child.start_kill();
+        let _ = pipes.child.wait().await;
     }
 }
 
@@ -2102,6 +2185,68 @@ mod tests {
         assert_eq!(installed.name, "test-login");
         assert!(root.join("login/test-login/1.0.0/manifest.json").exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A pipe nobody can find the message boundaries in is repaired by a new
+    /// process, because there is nothing else to repair it with.
+    ///
+    /// The regression this stands on: `read_line` is not cancel safe, so a
+    /// request that hit its deadline had already eaten some unknown prefix of
+    /// the answer. Every read after it was off by one message, the id check
+    /// turned that into an error, the caller read the error as a dropped session
+    /// and reconnected — and reconnecting reopens the session, not the process.
+    /// One slow record and that worker never worked again.
+    ///
+    /// The module here answers every request correctly and reports its own pid,
+    /// so a worker that kept its process would pass the id check and fail this.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_desynced_module_is_repaired_by_a_new_process() {
+        let dir = std::env::temp_dir().join(format!("mjai-desync-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let executable = dir.join("module");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nwhile IFS= read -r request; do\n\
+             id=$(printf '%s' \"$request\" | sed 's/.*\"id\":\\([0-9]*\\).*/\\1/')\n\
+             printf '{\"id\":%s,\"ok\":true,\"result\":{\"pid\":%s}}\\n' \"$id\" \"$$\"\n\
+             done\n",
+        )
+        .unwrap();
+        set_executable(&executable).unwrap();
+
+        let worker = PluginWorker::spawn(
+            executable,
+            &[],
+            "desync-test",
+            Arc::new(WatchLogBuffer::default()),
+        )
+        .await
+        .unwrap();
+        let first = worker
+            .request("health", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(first["pid"].is_number(), "the module answers at all");
+
+        // Exactly what a timed-out request leaves behind.
+        worker.desynced.store(true, Ordering::Relaxed);
+        let second = worker
+            .request("health", serde_json::json!({}))
+            .await
+            .unwrap();
+
+        assert_ne!(
+            first["pid"], second["pid"],
+            "a desynced pipe has to become a different process"
+        );
+        assert!(
+            !worker.desynced.load(Ordering::Relaxed),
+            "and the repair clears the flag, or every later request restarts it again"
+        );
+
+        worker.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An upgrade has to move both halves, and leave no second copy behind.
