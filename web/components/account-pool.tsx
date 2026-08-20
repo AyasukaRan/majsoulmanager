@@ -70,11 +70,24 @@ const STATES: Record<
  * separates "logged in elsewhere" from "wrong password" — both arrive as
  * 被拒 and the console does not guess between them.
  */
-function AccountStateBadge({ health }: { health?: AccountHealth }) {
-  const state = health?.state ?? "unknown";
+function AccountStateBadge({
+  health,
+  bannedAt,
+}: {
+  health?: AccountHealth;
+  bannedAt?: string | null;
+}) {
+  // A stored ban outranks the runtime state. That state is only what this
+  // process has seen since it started, and after a restart it has seen nothing —
+  // showing 未登录 for an account we already know Mahjong Soul banned is the
+  // whole reason the mark is stored.
+  const state = bannedAt ? "banned" : (health?.state ?? "unknown");
   const { label, className } = STATES[state];
   const when = health?.at ? new Date(health.at).toLocaleString("zh-CN") : null;
   const title = [
+    bannedAt
+      ? `${new Date(bannedAt).toLocaleString("zh-CN")} 被雀魂封禁，已自动停用；重新勾上「启用」就会清掉这条记录`
+      : null,
     when ? `最后一次登录 ${when}` : "本次启动以来还没有登录过",
     health?.detail,
     health && health.failures > 1 ? `已连续失败 ${health.failures} 次` : null,
@@ -271,6 +284,8 @@ export function AccountPoolCard() {
                     // Follows the pool's own exit until somebody spreads them
                     // out, which is a batch edit away once they are in the list.
                     node: "",
+                    // Set by the backend when Mahjong Soul bans it, never here.
+                    banned_at: null,
                   })),
                 ],
               }
@@ -517,7 +532,10 @@ export function AccountPoolCard() {
                   onChange={(event) => edit(index, { note: event.target.value })}
                 />
                 <div className="flex items-center gap-3">
-                  <AccountStateBadge health={health[account.username]} />
+                  <AccountStateBadge
+                    health={health[account.username]}
+                    bannedAt={account.banned_at}
+                  />
                   <label className="flex items-center gap-1.5 text-xs">
                     <Checkbox
                       checked={account.enabled}
@@ -569,6 +587,7 @@ export function AccountPoolCard() {
                     note: "",
                     enabled: true,
                     node: "",
+                    banned_at: null,
                   },
                 ],
               })

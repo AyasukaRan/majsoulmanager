@@ -238,6 +238,14 @@ export type StoredAccount = {
    * could be spread over several exits.
    */
   node: string;
+  /**
+   * When Mahjong Soul answered a login with 503, if it ever did.
+   *
+   * Kept in the document rather than in the runtime health map, because a ban
+   * never clears and forgetting it across a restart means spending a session
+   * slot to learn it again. Switching the account back on clears it.
+   */
+  banned_at: string | null;
 };
 
 export type AccountDocument = {

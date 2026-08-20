@@ -850,6 +850,7 @@ impl RegisterService {
             note: request.note.clone(),
             enabled: false,
             node: node.unwrap_or_default(),
+            banned_at: None,
         };
         match self.accounts.append(vec![stored]) {
             Ok(1) => {

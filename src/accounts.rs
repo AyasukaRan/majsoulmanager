@@ -92,6 +92,16 @@ pub struct StoredAccount {
     /// a pool session that cannot dial at all.
     #[serde(default)]
     pub node: String,
+    /// When Mahjong Soul answered a login with `503`, if it ever did.
+    ///
+    /// The one verdict worth keeping across a restart. [`AccountHealth`] is
+    /// deliberately runtime-only, and for every other state that is right — a
+    /// refusal may have been `1005 ERR_ACC_ALREADY_LOGIN`, an unreachable may
+    /// have been the proxy blinking. But `503` is not a conclusion about a
+    /// login, it is a fact about the account, and it never clears. Forgetting it
+    /// means every restart spends a session slot finding it out again.
+    #[serde(default)]
+    pub banned_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -289,6 +299,44 @@ impl AccountPool {
         entry.detail = detail;
     }
 
+    /// Switches off a pool account Mahjong Soul says is banned, and records when.
+    ///
+    /// `503` is the one refusal that never clears, so the account is not coming
+    /// back and the only question is whether this deployment remembers that
+    /// across a restart. Without this it does not: the health map is runtime
+    /// state by design, so every start hands a session slot to an account that
+    /// will spend it being refused again — and tells Mahjong Soul, once per
+    /// restart, that this address is still trying banned credentials.
+    ///
+    /// Only the pool's own. A collector is bound to one account by its
+    /// configuration, and switching that off would end live collection on its
+    /// own initiative — the one thing here that cannot be done again. That half
+    /// keeps retrying and says why on the account list instead.
+    ///
+    /// Returns whether anything changed, so the caller can log it once rather
+    /// than on every reconnect.
+    pub fn retire_banned(&self, username: &str) -> Result<bool, WatchServiceError> {
+        let mut document = self.document.write();
+        let mut next = document.clone();
+        let Some(account) = next
+            .accounts
+            .iter_mut()
+            .find(|account| account.username.eq_ignore_ascii_case(username.trim()))
+        else {
+            return Ok(false);
+        };
+        if account.purpose != AccountPurpose::Refetch || !account.enabled {
+            return Ok(false);
+        }
+        account.enabled = false;
+        account.banned_at = Some(Utc::now());
+        next.revision = next.revision.saturating_add(1);
+        next.updated_at = Some(Utc::now());
+        persist_secret_json(&self.path, &next)?;
+        *document = next;
+        Ok(true)
+    }
+
     /// Every account's last known state, by username as the document spells it.
     ///
     /// Driven by the document rather than by the health map, so an account that
@@ -376,19 +424,40 @@ impl AccountPool {
         // Restored before validation, so a document whose passwords are all
         // asterisks — which is every document the console ever read — is judged
         // on what it will actually store.
-        let stored: Vec<(String, String)> = document
+        let stored: Vec<(String, String, Option<DateTime<Utc>>)> = document
             .accounts
             .iter()
-            .map(|account| (account.id.clone(), account.password.clone()))
+            .map(|account| {
+                (
+                    account.id.clone(),
+                    account.password.clone(),
+                    account.banned_at,
+                )
+            })
             .collect();
         for account in &mut next.accounts {
             account.username = account.username.trim().to_owned();
             let previous = stored
                 .iter()
-                .find(|(id, _)| !id.is_empty() && *id == account.id)
-                .map(|(_, password)| password.as_str());
-            account.password =
-                restored_secret(Some(account.password.clone()), previous).unwrap_or_default();
+                .find(|(id, _, _)| !id.is_empty() && *id == account.id);
+            account.password = restored_secret(
+                Some(account.password.clone()),
+                previous.map(|(_, password, _)| password.as_str()),
+            )
+            .unwrap_or_default();
+            // Restored the same way a password is, and for a related reason: it
+            // is not a form field. It records what Mahjong Soul answered, and a
+            // console that never sent it back — or sent back a stale copy —
+            // must not be able to erase that.
+            //
+            // Switching the account on is the one thing that clears it, because
+            // that is an operator saying this account works, which is the only
+            // claim that outranks the observation.
+            account.banned_at = if account.enabled {
+                None
+            } else {
+                previous.and_then(|(_, _, banned_at)| *banned_at)
+            };
             if account.id.is_empty() {
                 account.id = uuid::Uuid::new_v4().to_string();
             }
@@ -566,6 +635,7 @@ mod tests {
             note: String::new(),
             enabled: true,
             node: String::new(),
+            banned_at: None,
         }
     }
 
@@ -885,6 +955,94 @@ mod tests {
             store
                 .resolve(&PoolRef::parse("refetch/two@example.com").unwrap())
                 .is_empty()
+        );
+    }
+
+    /// A `503` retires the account, and the retirement outlives this process.
+    ///
+    /// The health map is runtime state on purpose, so without a stored mark the
+    /// next start would hand a session slot to an account that will spend it
+    /// being refused again — from this address, with credentials Mahjong Soul
+    /// has already banned.
+    #[test]
+    fn a_banned_pool_account_is_switched_off_and_stays_off() {
+        let store = pool(vec![
+            account("pool@example.com", AccountPurpose::Refetch),
+            account("collector@example.com", AccountPurpose::Watch),
+        ]);
+
+        assert!(
+            store.retire_banned("POOL@example.com").unwrap(),
+            "大小写不该影响"
+        );
+        let document = store.published();
+        let retired = document
+            .accounts
+            .iter()
+            .find(|a| a.username == "pool@example.com")
+            .unwrap();
+        assert!(!retired.enabled);
+        assert!(retired.banned_at.is_some());
+        // Gone from what the pool would log in with, which is the point.
+        assert!(
+            store
+                .resolve(&PoolRef::parse("refetch").unwrap())
+                .is_empty()
+        );
+
+        // Idempotent: a second session meeting the same ban must not move the
+        // revision again, or every reconnect would look like an edit.
+        assert!(!store.retire_banned("pool@example.com").unwrap());
+
+        // A collector's account is left alone. Switching it off would end live
+        // collection on this process's own initiative — the one thing here that
+        // cannot be done again.
+        assert!(!store.retire_banned("collector@example.com").unwrap());
+        assert!(
+            store
+                .published()
+                .accounts
+                .iter()
+                .find(|a| a.username == "collector@example.com")
+                .unwrap()
+                .enabled
+        );
+
+        // A console save cannot erase the mark: it is an observation, not a form
+        // field, and the browser may be holding a copy from before the ban.
+        let mut saved = store.published();
+        for account in &mut saved.accounts {
+            account.note = "改了个备注".to_owned();
+        }
+        store.update(saved).unwrap();
+        assert!(
+            store
+                .published()
+                .accounts
+                .iter()
+                .find(|a| a.username == "pool@example.com")
+                .unwrap()
+                .banned_at
+                .is_some(),
+            "保存备注把封禁记录抹掉了"
+        );
+
+        // Switching it back on is the one thing that clears it — an operator
+        // saying the account works outranks what was observed.
+        let mut revived = store.published();
+        for account in &mut revived.accounts {
+            account.enabled = true;
+        }
+        store.update(revived).unwrap();
+        assert!(
+            store
+                .published()
+                .accounts
+                .iter()
+                .find(|a| a.username == "pool@example.com")
+                .unwrap()
+                .banned_at
+                .is_none()
         );
     }
 }

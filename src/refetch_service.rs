@@ -978,12 +978,32 @@ impl RefetchSupervisor {
                     // configured, and now the account list says which one and
                     // why.
                     if state.is_terminal() {
+                        // Switched off in the pool, not just dropped from this
+                        // run. The health map is runtime state, so without this
+                        // the next start would hand a slot to the same account
+                        // and spend it being refused again — once per restart,
+                        // from this address, with credentials Mahjong Soul has
+                        // already banned.
+                        let retired = match self.dependencies.accounts.retire_banned(&username) {
+                            Ok(retired) => retired,
+                            Err(error) => {
+                                self.report(
+                                    WatchLogLevel::Warn,
+                                    format!("停用被封账号失败：{error}"),
+                                );
+                                false
+                            }
+                        };
                         self.report(
                             WatchLogLevel::Error,
                             format!(
-                                "账号 {} 已被雀魂封禁，补抓会话 {index} 退出，不再重连；\
-                                 换一个账号再启动补抓池",
-                                masked_account(&username)
+                                "账号 {} 已被雀魂封禁，补抓会话 {index} 退出，不再重连；{}",
+                                masked_account(&username),
+                                if retired {
+                                    "已在账号池里停用它，下次启动不会再拿它登录"
+                                } else {
+                                    "换一个账号再启动补抓池"
+                                }
                             ),
                         );
                         return;
