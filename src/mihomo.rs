@@ -100,10 +100,19 @@ impl MihomoLane {
 /// How many nodes the pool may go out of at once.
 ///
 /// One listener and one select group per node, so this is a bound on generated
-/// configuration rather than on anything Mahjong Soul cares about. Sized to be
-/// larger than any subscription an operator would actually spread a pool over,
-/// and small enough that the ports stay in one legible block.
-pub(crate) const MAX_OUTBOUNDS: u16 = 32;
+/// configuration and on nothing else — Mahjong Soul has no opinion about it.
+/// What it costs when it is reached is a socket, a few lines of YAML and one
+/// controller call at boot, none of which scales with anything.
+///
+/// It was 32, chosen as "larger than any subscription an operator would spread
+/// a pool over", and that stopped being true the moment several subscriptions
+/// could be pooled. It was the wrong shape of number as well as the wrong
+/// value: what Mahjong Soul acts on is an exit address, so every node the pool
+/// can reach is worth having a listener for, and a ceiling that bites means
+/// accounts quietly sharing an address that a spare port would have separated.
+///
+/// 256 leaves ports 7901–8156, still clear of the controller on 9090.
+pub(crate) const MAX_OUTBOUNDS: u16 = 256;
 /// The first port an outbound gets. Above the two lanes, and above the shared
 /// 7890, so nothing here can collide with a port a deployment already dials.
 const OUTBOUND_PORT_BASE: u16 = 7900;
