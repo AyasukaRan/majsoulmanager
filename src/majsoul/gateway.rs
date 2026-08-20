@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -346,7 +346,7 @@ pub async fn discover_package_version(
     let ms_host = server_base_url(server);
     let prefix = server_path_prefix(server);
     let index_url = format!("{ms_host}{prefix}/");
-    let cache = cache_dir.join("package_version");
+    let cache = package_version_cache(cache_dir);
     let pattern = Regex::new(r#"productVersion:\s*"([0-9]+\.[0-9]+\.[0-9]+)""#)?;
 
     if let Ok(html) = fetch_text_cached(client, &index_url, cache_dir, true, REQUEST_TIMEOUT).await
@@ -358,14 +358,27 @@ pub async fn discover_package_version(
         }
     }
 
-    if let Ok(cached) = std::fs::read_to_string(&cache) {
-        let cached = cached.trim().to_string();
-        if !cached.is_empty() {
-            warn!("Using cached package version {cached} after index.html lookup failed");
-            return Ok(cached);
-        }
+    if let Some(cached) = cached_package_version(cache_dir) {
+        warn!("Using cached package version {cached} after index.html lookup failed");
+        return Ok(cached);
     }
     anyhow::bail!("could not determine package version from index.html")
+}
+
+fn package_version_cache(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("package_version")
+}
+
+/// The last package version [`discover_package_version`] wrote, without going
+/// to the network.
+///
+/// For callers that want the current value but have no business fetching it:
+/// the collectors run continuously and refresh this on every connect, so a
+/// reader is never far behind.
+pub fn cached_package_version(cache_dir: &Path) -> Option<String> {
+    let cached = std::fs::read_to_string(package_version_cache(cache_dir)).ok()?;
+    let cached = cached.trim().to_owned();
+    (!cached.is_empty()).then_some(cached)
 }
 
 #[cfg(test)]

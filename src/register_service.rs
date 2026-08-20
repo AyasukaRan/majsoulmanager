@@ -15,6 +15,7 @@
 //! existed inside the run that made it — so a browser closed halfway, or a
 //! process restarted, must not be able to lose the ones already made.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -264,6 +265,10 @@ pub struct RegisterService {
     /// running at the time.
     mihomo: Arc<crate::mihomo::MihomoManager>,
     logs: Arc<WatchLogBuffer>,
+    /// Where the collectors leave the client versions they discovered. Read
+    /// only — registration has no account to log in with, so it cannot search
+    /// for a version floor itself and lives off what they found.
+    cache_dir: PathBuf,
     progress: RwLock<AccountRegisterProgress>,
     /// Bumped by `stop`. The loop checks it between accounts, which is the only
     /// place stopping is safe: an account abandoned mid-registration exists on
@@ -277,12 +282,15 @@ impl RegisterService {
         accounts: Arc<AccountPool>,
         mihomo: Arc<crate::mihomo::MihomoManager>,
         logs: Arc<WatchLogBuffer>,
+        data_dir: &Path,
     ) -> Self {
         Self {
             modules,
             accounts,
             mihomo,
             logs,
+            // The same directory the collectors and the re-fetch pool share.
+            cache_dir: data_dir.join("watch/cache"),
             progress: RwLock::new(AccountRegisterProgress::default()),
             generation: AtomicU64::new(0),
         }
@@ -378,6 +386,20 @@ impl RegisterService {
                     "（不拟真，只做对照用）"
                 }
             ),
+        );
+
+        // The version this run reports, decided once. Majsoul validates the
+        // version string as a lower bound with a tolerance of about three
+        // patches, so a pinned constant fails the whole batch with 151 a few
+        // weeks after it is written. The collectors already hit that wall,
+        // search out the new floor and leave it in the cache — this reads their
+        // answer rather than pinning one of its own.
+        let versions = Arc::new(crate::managed_watch::current_client_versions(
+            &self.cache_dir,
+        ));
+        self.report(
+            WatchLogLevel::Info,
+            format!("客户端版本 {}（包 {}）", versions.0, versions.1),
         );
 
         // Which exits the accounts leave from, decided once. Empty means every
@@ -505,11 +527,14 @@ impl RegisterService {
             let request = Arc::clone(&request);
             let cloud = Arc::clone(&cloud);
             let streak = Arc::clone(&streak);
+            let versions = Arc::clone(&versions);
             launched += 1;
             tasks.spawn(async move {
                 let _permit = permit;
                 service
-                    .one_account(module, address, mailbox, cloud, node, request, streak)
+                    .one_account(
+                        module, address, mailbox, cloud, node, request, streak, versions,
+                    )
                     .await;
             });
         }
@@ -520,10 +545,11 @@ impl RegisterService {
         }
         if streak.load(Ordering::SeqCst) >= GIVE_UP_AFTER {
             let skipped = total - launched;
+            let reason = self.last_failure();
+            let hint = version_hint(&reason, &versions.0);
             return Ok(format!(
                 "连着 {GIVE_UP_AFTER} 个都失败了，剩下 {skipped} 个没有再试。\
-                 最后一个的原因：{}",
-                self.last_failure()
+                 最后一个的原因：{reason}{hint}"
             ));
         }
         let progress = self.progress.read();
@@ -572,6 +598,7 @@ impl RegisterService {
         node: Option<String>,
         request: Arc<AccountRegisterRequest>,
         streak: Arc<std::sync::atomic::AtomicUsize>,
+        versions: Arc<(String, String)>,
     ) {
         // A node with no listener falls back to whatever `proxy` says rather
         // than to no proxy at all: dialling nothing is not a quieter exit, it is
@@ -606,6 +633,10 @@ impl RegisterService {
                             "mimic": request.mimic,
                             "poll_tries": request.poll_tries,
                             "poll_interval": request.poll_interval,
+                            // The one the server checks, and the one it does not
+                            // but a real client still reports — see `versions`.
+                            "client_version": versions.0,
+                            "package_version": versions.1,
                         }),
                     )
                     .await;
@@ -653,6 +684,8 @@ impl RegisterService {
                 return self.finish(outcome);
             }
         };
+        outcome.email = reported_email(&value, address);
+
         if !value.get("ok").and_then(|ok| ok.as_bool()).unwrap_or(false) {
             outcome.stage = value
                 .get("stage")
@@ -667,17 +700,12 @@ impl RegisterService {
             return self.finish(outcome);
         }
 
-        let email = value
-            .get("email")
-            .and_then(|email| email.as_str())
-            .unwrap_or(address)
-            .to_owned();
+        let email = outcome.email.clone();
         let password = value
             .get("password")
             .and_then(|password| password.as_str())
             .unwrap_or_default()
             .to_owned();
-        outcome.email = email.clone();
         outcome.account_id = value.get("account_id").and_then(|id| id.as_u64());
         outcome.nickname = value
             .get("nickname")
@@ -860,6 +888,42 @@ fn note_result(streak: &std::sync::atomic::AtomicUsize, ok: bool) -> usize {
     } else {
         streak.fetch_add(1, Ordering::SeqCst) + 1
     }
+}
+
+/// The address to report for one account: the one the module opened, falling
+/// back to the placeholder the run started with.
+///
+/// Read for failures too, not just successes. On the on-demand mailbox sources
+/// the address does not exist until the module opens it, so the placeholder is
+/// all a failed account would otherwise carry — and by the time signup fails,
+/// that mailbox and its verification code have already been spent. Knowing
+/// which one is the difference between a reusable address and a lost one.
+fn reported_email(answer: &serde_json::Value, fallback: &str) -> String {
+    answer
+        .get("email")
+        .and_then(|email| email.as_str())
+        .filter(|email| !email.is_empty())
+        .unwrap_or(fallback)
+        .to_owned()
+}
+
+/// What to add to a given-up run's message when the wall it hit was 151.
+///
+/// 151 is about the version string and nothing else — not the account, not the
+/// mailbox, not the exit. It fails every account in the batch identically, so
+/// the message has to name the cause or the next thing tried will be the
+/// mailbox source. Registration cannot search out the new floor itself: the
+/// search is a series of logins and there is no account here to make them with.
+fn version_hint(reason: &str, current: &str) -> String {
+    if !reason.contains("151") {
+        return String::new();
+    }
+    format!(
+        "\n151 = 雀魂把客户端版本的下限抬过去了，跟账号、邮箱、出口都无关。\
+         这批报的是 {current}。注册这边没有能登录的账号，探不出新的下限；\
+         让牌谱补抓或者采集跑一次，它们撞到同一堵墙会自动探出来存下，\
+         之后注册开跑就读到了。"
+    )
 }
 
 fn too_many(count: usize) -> WatchServiceError {
@@ -1074,6 +1138,49 @@ mod tests {
             outbound("美国 03", None, true),
         ]);
         assert_eq!(exits, vec!["日本 07".to_owned()]);
+    }
+
+    /// A failed account has to say which mailbox it burned.
+    ///
+    /// The regression this pins: the failure branch used to return before the
+    /// address was read, so every failure on an on-demand source displayed the
+    /// placeholder. A batch of sixteen that all failed at signup showed
+    /// sixteen 「正在开邮箱」 and not one of the addresses whose verification
+    /// codes had already been spent.
+    #[test]
+    fn a_failure_reports_the_address_the_module_opened() {
+        let placeholder = "第 7/16 个（正在开邮箱）";
+        let failed = serde_json::json!({
+            "ok": false,
+            "email": "hj28xk@example.com",
+            "stage": "signup",
+            "error": "151 ERR_CLIENT_VERSION",
+        });
+        assert_eq!(reported_email(&failed, placeholder), "hj28xk@example.com");
+
+        // Failing before the mailbox exists is the one case the placeholder is
+        // the only thing there is.
+        let no_mailbox = serde_json::json!({"ok": false, "email": "", "stage": "mailbox"});
+        assert_eq!(reported_email(&no_mailbox, placeholder), placeholder);
+        assert_eq!(
+            reported_email(&serde_json::json!({"ok": false}), placeholder),
+            placeholder
+        );
+    }
+
+    /// 151 fails a whole batch identically, so the message has to name it.
+    #[test]
+    fn giving_up_on_151_says_it_is_the_version_and_not_the_mailbox() {
+        let hint = version_hint("[signup] 151 ERR_CLIENT_VERSION", "0.16.265");
+        assert!(hint.contains("0.16.265"), "报的是哪个版本要说出来");
+        assert!(hint.contains("补抓"), "指向真正能探出新版本的那条路");
+        // Every other failure is about the account, the mailbox or the exit,
+        // and a version lecture on those would send the operator the wrong way.
+        assert_eq!(version_hint("[fetch_code] 取码超时", "0.16.265"), "");
+        assert_eq!(
+            version_hint("[signup] 1002 ERR_ACC_NOT_EXIST", "0.16.265"),
+            ""
+        );
     }
 
     /// Concurrency is clamped, not trusted.

@@ -157,6 +157,7 @@ impl AppState {
             Arc::clone(&accounts),
             Arc::clone(&mihomo),
             Arc::clone(&watch_logs),
+            &data_dir,
         ));
         // Its own service, sharing only the log buffer: it never touches
         // Mahjong Soul, and the catalogue it writes is not the corpus.

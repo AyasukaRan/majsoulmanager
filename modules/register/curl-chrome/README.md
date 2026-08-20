@@ -174,14 +174,35 @@ GET /api/emails?email=<地址>  -> {"success":true,"data":{"emails":[...],"count
 
 这些跟 `reg_majsoul/register.py` 和内建登录路径是同一批实录抓出来的,改一处就要对齐:
 
-- `CLIENT_VERSION` / `RES_VERSION` —— 过旧则所有认证请求返回 `151 ERR_CLIENT_VERSION`
 - `LOGIN_BEAT` 的合约串 —— 5 份抓包 5 个账号完全一致
 - `enc_request_connection` 的 `f6="Web"`(大写 W;`device.f7` 才是小写 `web`)
 - `pwd_hash` 的 HMAC key `lailai`
 
+## 版本号不在上面那份名单里
+
+`DEFAULT_RES_VERSION` / `DEFAULT_CLIENT_VERSION` 是兜底,不是要对齐的常量。雀魂每隔
+几周把接受的版本下限往上抬一次,钉死的值放几周就会让整批停在 `151 ERR_CLIENT_VERSION`。
+
+真正跟着雀魂走的是 `params` 里的 `client_version` / `package_version`:管理台在开跑前
+从 `<data_dir>/watch/cache/` 读采集和补抓那两条路探到的当前值传下来。它们撞 151 会自动
+二分探出服务端接受的最低版本并存下 —— 注册这边没有能登录的账号,自己探不了(探测就是
+一连串登录),所以蹭现成的。
+
+服务端只校验 `client_version_string`(`WebGL_2022-<code>`),而且是**下界**,容差约 3 个
+patch;`client_version{resource, package}` 完全不看。所以 151 只由 `RES_VERSION` 决定。
+
+单跑模块时用文件头的兜底值,或者自己传:
+
+```bash
+echo '{"id":1,"protocol_version":1,"method":"register","params":{"client_version":"0.16.265"}}'
+```
+
 ## 自测
 
 ```bash
+# 版本号的六个消费点都跟着 params 走(不联网)
+python3 module.py --selftest
+
 # 协议冒烟(不联网)
 echo '{"id":1,"protocol_version":1,"method":"health","params":{}}' | python3 module.py
 
