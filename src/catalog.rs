@@ -2376,6 +2376,36 @@ impl Catalog {
         self.table_totals(GAME_UUIDS_TABLE).await
     }
 
+    /// How many uuids are still ahead of a walk resuming from `after` — the
+    /// denominator of the sweep's progress bar.
+    ///
+    /// The predicate is [`GAME_UUIDS_AFTER`], the same string the page reads
+    /// with, because a bar drawn against a differently-worded bound would drift
+    /// from the walk by exactly the games sharing the cursor's second and no
+    /// test would ever notice.
+    ///
+    /// One count over a key range rather than the table's size: partition
+    /// pruning by year and then the primary index leave it reading marks, not
+    /// rows, and it is asked once per run.
+    pub async fn game_uuids_ahead(
+        &self,
+        after: Option<&SweepPosition>,
+    ) -> Result<u64, CatalogError> {
+        #[derive(Default, Deserialize)]
+        struct Row {
+            games: u64,
+        }
+        let mut sql = format!("SELECT count() AS games FROM {GAME_UUIDS_TABLE}");
+        let mut params: Vec<(&str, String)> = Vec::new();
+        if let Some(after) = after {
+            sql.push_str(GAME_UUIDS_AFTER);
+            params.push(("after_ms", after.started_at.timestamp_millis().to_string()));
+            params.push(("after_uuid", after.uuid.clone()));
+        }
+        let rows: Vec<Row> = self.index.query(&sql, &params).await?;
+        Ok(rows.into_iter().next().unwrap_or_default().games)
+    }
+
     /// Row count and `started_at` range of one of the two game tables.
     ///
     /// No FINAL: these are headline counts, and the same reasoning `stats`
@@ -2584,15 +2614,19 @@ fn game_uuid_listings_sql(with_cursor: bool) -> String {
         "SELECT uuid, toUnixTimestamp64Milli(started_at) AS started_ms FROM {GAME_UUIDS_TABLE}"
     );
     if with_cursor {
-        sql.push_str(
-            " WHERE started_at >= fromUnixTimestamp64Milli({after_ms:Int64}) \
-             AND (started_at, uuid) > \
-             (fromUnixTimestamp64Milli({after_ms:Int64}), {after_uuid:String})",
-        );
+        sql.push_str(GAME_UUIDS_AFTER);
     }
     sql.push_str(" ORDER BY started_at, uuid LIMIT {limit:UInt32}");
     sql
 }
+
+/// Everything in `mjai.game_uuids` that sorts after a keyset position.
+///
+/// Shared by the page and by [`Catalog::game_uuids_ahead`] so the bar and the
+/// walk cannot disagree about where the cursor is.
+const GAME_UUIDS_AFTER: &str = " WHERE started_at >= fromUnixTimestamp64Milli({after_ms:Int64}) \
+     AND (started_at, uuid) > \
+     (fromUnixTimestamp64Milli({after_ms:Int64}), {after_uuid:String})";
 
 /// One row of the re-fetch walk's work list: a game uuid Mahjong Soul will
 /// accept. Nothing about the game itself — the protobuf that comes back

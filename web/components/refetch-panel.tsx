@@ -70,12 +70,12 @@ function moment(value: string) {
 /**
  * Live numbers for a run.
  *
- * Two shapes, because the two backlogs are not the same kind of thing. The pb
- * repair has an end: `backlog` is read once when a run starts, so the bar
- * measures this run against the work it set out to do rather than against a
- * figure that moves under it, and records the walk skipped stay in it forever,
- * which is why the bar is not the only thing shown. The 牌谱屋 sweep has no end
- * to measure against, so it reports where in the catalogue it has read to.
+ * Two shapes, because the two backlogs are not the same kind of thing, but one
+ * bar: `backlog` is read once when a run starts — rows missing a protobuf for
+ * the repair, uuids left ahead of the cursor for the sweep — so the bar measures
+ * this run against the work it set out to do rather than against a figure moving
+ * under it. The sweep also reports where in the catalogue it has read to, which
+ * is the part that survives a restart.
  */
 function RefetchStatusCard({
   status,
@@ -90,15 +90,15 @@ function RefetchStatusCard({
   const backlog = status?.backlog ?? null;
   const done = progress?.replaced ?? 0;
   const sweeping = work === "known_games";
-  // No bar for the sweep, and not because one is hard to draw. 牌谱屋 lists
-  // three orders of magnitude more games than this corpus holds, so a
-  // percentage would be this run's fetches over a number no year of fetching
-  // approaches — 0.0% for the life of the deployment. What the walk actually
-  // has is a position in the catalogue, and that is what is shown instead.
+  // Rows walked, not rows fetched. A record the walk looked at and could not
+  // fix — refused, unreadable, unconvertible — is work this run has done and
+  // will not do again, but it never enters `replaced`, so a bar drawn from
+  // `replaced` on a corpus where most records are past their retention crawls
+  // along the bottom while the run is nearly over. On the sweep the gap is three
+  // orders of magnitude: almost every uuid ahead of the cursor is already held.
+  const walked = progress?.scanned ?? 0;
   const percent =
-    !sweeping && backlog && backlog > 0
-      ? Math.min(100, (done / backlog) * 100)
-      : null;
+    backlog && backlog > 0 ? Math.min(100, (walked / backlog) * 100) : null;
 
   const tiles = sweeping
     ? [
@@ -197,10 +197,21 @@ function RefetchStatusCard({
         {percent === null ? null : (
           <div>
             <div className="flex items-center justify-between text-xs text-muted-foreground">
-              <span>本轮开始时待补 {count(backlog ?? 0)} 条</span>
+              <span>
+                {sweeping
+                  ? `本轮开始时待走查 ${count(backlog ?? 0)} 局`
+                  : `本轮开始时待补 ${count(backlog ?? 0)} 条`}
+              </span>
               <span className="font-mono">{percent.toFixed(1)}%</span>
             </div>
-            <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-muted">
+            <div
+              role="progressbar"
+              aria-label={sweeping ? "走查进度" : "补抓进度"}
+              aria-valuenow={Math.round(percent)}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-muted"
+            >
               <div
                 className="h-full rounded-full bg-primary transition-all"
                 style={{ width: `${percent}%` }}

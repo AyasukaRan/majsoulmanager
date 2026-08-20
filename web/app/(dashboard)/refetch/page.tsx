@@ -18,10 +18,16 @@ export default function RefetchPage() {
       <PaipuyaSyncCard />
       <PaipuyaGapCard />
       <RefetchPanel />
+      {/* Not just `refetch`. `paipuya` is the two cards above this one — the
+          牌谱屋 sync and the gap comparison — whose lines were readable only on
+          the Watch page, beside services this page has nothing to do with. And
+          `backfill` is the one the sweep refuses to start without: it tells the
+          operator to search the log for 「对局幂等认领」, which has to be a log
+          this page shows. */}
       <WatchLogPanel
-        source="refetch"
+        source={["refetch", "paipuya", "backfill"]}
         title="补抓日志"
-        description="只显示补抓服务与它各个会话的日志；采集实例的日志在 Watch 服务页"
+        description="只显示补抓服务、它各个会话、牌谱屋同步与幂等回填的日志；采集实例的日志在 Watch 服务页"
         emptyHint="补抓启动后日志会自动出现在这里"
       />
     </div>

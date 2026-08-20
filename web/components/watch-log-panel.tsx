@@ -4,6 +4,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -61,12 +62,26 @@ export function WatchLogPanel({
   description = "Watch 后台服务与协议模块的最近日志(内存环形缓冲,最多保留 500 条)",
   emptyHint = "Watch 服务启动后日志会自动出现在这里",
 }: {
-  /** Prefix of `entry.source`; unset shows every service. */
-  source?: string;
+  /**
+   * Prefixes of `entry.source`; unset shows every service. A list because the
+   * services do not divide along one prefix: the collection page wants
+   * `service` and `collector:` and `module`, and everything it does not want —
+   * the re-fetch pool's eighty-odd sessions above all — is loud enough to bury
+   * its own lines in a shared 500-entry ring.
+   */
+  source?: string | string[];
   title?: string;
   description?: string;
   emptyHint?: string;
 } = {}) {
+  // Through a joined string, so a caller writing the prop inline as an array
+  // literal does not hand `refresh` a new dependency on every render and
+  // restart the poll timer with it.
+  const prefixKey = Array.isArray(source) ? source.join("\n") : (source ?? "");
+  const prefixes = useMemo(
+    () => (prefixKey ? prefixKey.split("\n") : null),
+    [prefixKey],
+  );
   const [entries, setEntries] = useState<WatchLogEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -113,8 +128,10 @@ export function WatchLogPanel({
         if (page.next_cursor !== null) {
           cursorRef.current = page.next_cursor;
         }
-        const fresh = source
-          ? page.items.filter((entry) => entry.source.startsWith(source))
+        const fresh = prefixes
+          ? page.items.filter((entry) =>
+              prefixes.some((prefix) => entry.source.startsWith(prefix)),
+            )
           : page.items;
         if (fresh.length) {
           setEntries((prev) => {
@@ -134,7 +151,7 @@ export function WatchLogPanel({
         }
       }
     },
-    [fetchPage, source],
+    [fetchPage, prefixes],
   );
 
   useEffect(() => {

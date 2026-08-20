@@ -1,5 +1,6 @@
 import { AccountPoolCard } from "@/components/account-pool";
 import { AccountRegisterCard } from "@/components/account-register";
+import { WatchLogPanel } from "@/components/watch-log-panel";
 
 export default function AccountsPage() {
   return (
@@ -16,6 +17,15 @@ export default function AccountsPage() {
       {/* Below the pool, not above: registering is the occasional thing, and
           what an operator opens this page for is the list. */}
       <AccountRegisterCard />
+      {/* Registration's own lines. They used to be readable only on the Watch
+          page, mixed into the collectors' — and now that each page filters to
+          its own services, this is the only place they appear. */}
+      <WatchLogPanel
+        source="register"
+        title="注册日志"
+        description="只显示批量注册的日志（内存环形缓冲，最多保留 500 条）"
+        emptyHint="开始注册后日志会自动出现在这里"
+      />
     </div>
   );
 }
