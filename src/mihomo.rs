@@ -278,6 +278,17 @@ pub struct MihomoManager {
     /// live collection its lane.
     slots_ready: std::sync::atomic::AtomicBool,
     slots: RwLock<OutboundSlots>,
+    /// Nodes a run has borrowed, which a re-file from anywhere else must keep.
+    ///
+    /// The assignment is derived from the account pool, so saving the pool
+    /// re-files everything — and re-filing is set replacement, which would hand
+    /// back the slots a registration run is in the middle of using. The port a
+    /// session dials stays the same either way; what changes is which node
+    /// answers on it, because slots are handed out lowest-first and the one just
+    /// released is the next one given away. An account would finish its
+    /// registration through a different country than the one recorded against
+    /// it, silently.
+    leased: RwLock<Vec<String>>,
     subscription: RwLock<Option<StoredSubscription>>,
     client: Client,
 }
@@ -318,6 +329,10 @@ impl MihomoManager {
             lanes_ready: std::sync::atomic::AtomicBool::new(false),
             slots_ready: std::sync::atomic::AtomicBool::new(false),
             slots: RwLock::new(slots),
+            // Never restored from disk: a lease belongs to a run, and no run
+            // survives a restart. The slots it borrowed are re-filed from the
+            // account pool at boot, which is what frees them.
+            leased: RwLock::new(Vec::new()),
             subscription: RwLock::new(subscription),
             client,
         };
@@ -389,8 +404,17 @@ impl MihomoManager {
     /// outbounds as usable.
     pub fn set_outbound_nodes(&self, nodes: &[String]) -> Result<bool, MihomoError> {
         let changed = {
+            // Borrowed slots survive somebody else's re-file. Held across the
+            // `slots` write so a lease cannot be taken out between the two.
+            let leased = self.leased.read();
+            let mut wanted = nodes.to_vec();
+            for node in leased.iter() {
+                if !wanted.contains(node) {
+                    wanted.push(node.clone());
+                }
+            }
             let mut slots = self.slots.write();
-            let changed = slots.refile(nodes);
+            let changed = slots.refile(&wanted);
             if changed {
                 atomic_write(
                     &self.root.join("outbounds.json"),
@@ -409,6 +433,32 @@ impl MihomoManager {
             self.write_runtime_config()?;
         }
         Ok(changed)
+    }
+
+    /// Borrow listeners for `nodes` on top of whatever the account pool holds.
+    ///
+    /// For work that needs its own exits for a while and gives them back:
+    /// account registration spreads a batch over several addresses, and a
+    /// deployment that never bound a node to a re-fetch account has none to
+    /// spread over. The lease is what stops a save of the account pool — which
+    /// re-files from scratch — from taking them back mid-run.
+    ///
+    /// Replaces any previous lease rather than adding to it. One run at a time
+    /// borrows these, and a lease left behind by a run that died is a slot
+    /// nothing frees.
+    pub fn lease_outbound_nodes(
+        &self,
+        nodes: &[String],
+        held: &[String],
+    ) -> Result<bool, MihomoError> {
+        *self.leased.write() = nodes.to_vec();
+        self.set_outbound_nodes(held)
+    }
+
+    /// Give the borrowed listeners back, leaving the pool's own in place.
+    pub fn release_outbound_nodes(&self, held: &[String]) -> Result<bool, MihomoError> {
+        self.leased.write().clear();
+        self.set_outbound_nodes(held)
     }
 
     pub async fn status(&self) -> MihomoStatus {
@@ -1250,6 +1300,75 @@ mod lane_tests {
         // or a save that touched a note does not rewrite the configuration and
         // make mihomo reload for no reason.
         assert!(!manager.set_outbound_nodes(&second).expect("unchanged"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A lease survives somebody else's re-file.
+    ///
+    /// The failure it prevents is quiet rather than loud. Saving the account
+    /// pool re-files from the pool alone, which would drop a borrowed node's
+    /// slot; slots are handed out lowest-first, so the next node to arrive
+    /// takes the freed number — and the registration still dialling that port
+    /// finishes through a different country than the one recorded against the
+    /// account it made. Nothing errors, and the log says what was intended.
+    #[test]
+    fn a_leased_outbound_is_not_taken_back_by_a_pool_save() {
+        let root = std::env::temp_dir().join(format!("mjai-mihomo-lease-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let manager = MihomoManager::new(
+            root.clone(),
+            "http://127.0.0.1:9090",
+            "secret".into(),
+            "http://mihomo:7890".into(),
+        )
+        .expect("a manager");
+
+        let held = ["日本 07".to_owned()];
+        let borrowed = ["美国 03".to_owned(), "德国 01".to_owned()];
+        manager.set_outbound_nodes(&held).expect("written");
+        manager
+            .lease_outbound_nodes(&borrowed, &held)
+            .expect("leased");
+        let leased_slots: Vec<u16> = borrowed
+            .iter()
+            .map(|node| {
+                manager
+                    .slots
+                    .read()
+                    .assignments
+                    .get(node)
+                    .copied()
+                    .expect("a slot")
+            })
+            .collect();
+
+        // What the console does on every save of the account pool. It knows
+        // nothing about the run in flight, and it must not have to.
+        manager.set_outbound_nodes(&held).expect("re-filed");
+        let slots = manager.slots.read().assignments.clone();
+        for (node, slot) in borrowed.iter().zip(&leased_slots) {
+            assert_eq!(
+                slots.get(node).copied(),
+                Some(*slot),
+                "{node} 的出站被账号池的保存顶掉了"
+            );
+        }
+        assert!(slots.contains_key("日本 07"), "池子自己的也还在");
+
+        // Giving them back is the only thing that frees them — and then the
+        // numbering does reuse the slot, which is exactly why the lease has to
+        // hold while a run is using it.
+        manager.release_outbound_nodes(&held).expect("released");
+        assert_eq!(manager.slots.read().assignments.len(), 1);
+        manager
+            .set_outbound_nodes(&["日本 07".to_owned(), "新加坡 02".to_owned()])
+            .expect("re-filed");
+        assert_eq!(
+            manager.slots.read().assignments.get("新加坡 02").copied(),
+            Some(leased_slots[0]),
+            "释放之后槽号本来就会被复用"
+        );
+
         std::fs::remove_dir_all(root).ok();
     }
 }
