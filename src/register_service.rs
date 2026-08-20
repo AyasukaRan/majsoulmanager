@@ -1061,7 +1061,7 @@ fn nodes_to_borrow(held: &[String], alive: Vec<String>, want: usize) -> Vec<Stri
 /// unbiased — taking `nodes[..want]` off an unshuffled list would pick the same
 /// exits every time, which for a subscription ordered by region means every
 /// batch leaves from the same country.
-fn shuffle(nodes: &mut [String]) {
+pub(crate) fn shuffle(nodes: &mut [String]) {
     for index in (1..nodes.len()).rev() {
         let random = u128::from_le_bytes(*uuid::Uuid::new_v4().as_bytes()) as usize;
         nodes.swap(index, random % (index + 1));

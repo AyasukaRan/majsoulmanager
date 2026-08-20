@@ -562,6 +562,75 @@ impl AccountPool {
         nodes
     }
 
+    /// Spreads the enabled re-fetch accounts over `nodes`, round robin.
+    ///
+    /// The pool's whole point is that ninety-odd accounts do not go out of one
+    /// address, and until now that meant an operator picking a node in a
+    /// dropdown ninety times — so in practice most of them were left on
+    /// 「跟随补抓出站」, which is one address. This is that job done in one
+    /// press, against the nodes mihomo says can currently reach Mahjong Soul.
+    ///
+    /// Round robin over a caller-shuffled list rather than one node per account:
+    /// there are more accounts than nodes and more nodes than listeners, so
+    /// sharing is the normal case and the only question is whether it is even.
+    ///
+    /// Disabled accounts are assigned too. They are accounts the operator may
+    /// switch back on, and leaving them out would mean the spread changed the
+    /// moment one was re-enabled. Watch accounts are never touched: a collector
+    /// is one session that already has a lane.
+    ///
+    /// An empty `nodes` clears the bindings, which is a real answer — it puts
+    /// every session back on the re-fetch lane, and it is what an operator whose
+    /// subscription just expired wants rather than ninety sessions dialling
+    /// listeners for nodes that no longer exist.
+    pub fn spread_over(&self, nodes: &[String]) -> Result<usize, WatchServiceError> {
+        let mut document = self.document.read().clone();
+        let mut spread = 0usize;
+        for (index, account) in document
+            .accounts
+            .iter_mut()
+            .filter(|account| account.purpose == AccountPurpose::Refetch)
+            .enumerate()
+        {
+            account.node = match nodes.is_empty() {
+                true => String::new(),
+                false => nodes[index % nodes.len()].clone(),
+            };
+            spread += 1;
+        }
+        // Through `update`, never straight to the file: it is what validates,
+        // bumps the revision and keeps the passwords the console never saw.
+        self.update(document)?;
+        Ok(spread)
+    }
+
+    /// Every re-fetch account as `username,password`, one per line.
+    ///
+    /// The one place a stored password leaves this process, and it exists
+    /// because the pool is the only copy: an operator who has registered ninety
+    /// accounts through the console has them nowhere else, and a data directory
+    /// is not a backup. The format is the one a `file:` or `env:` secret already
+    /// uses, so what comes out goes back in.
+    ///
+    /// Disabled accounts are included and banned ones are not: a `503` is
+    /// permanent, and an export is something you keep, so carrying accounts
+    /// Mahjong Soul will never accept again into the copy you keep is carrying
+    /// a list of dead accounts forward for ever.
+    pub fn export_refetch(&self) -> String {
+        let document = self.document.read();
+        let mut out = String::new();
+        for account in &document.accounts {
+            if account.purpose != AccountPurpose::Refetch || account.banned_at.is_some() {
+                continue;
+            }
+            out.push_str(account.username.trim());
+            out.push(',');
+            out.push_str(&account.password);
+            out.push('\n');
+        }
+        out
+    }
+
     /// The account a submitted document would take away from a collector, if
     /// there is one. `in_use` is lowercased, as `referenced_accounts` returns
     /// it.

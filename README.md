@@ -149,8 +149,10 @@ Watch 默认关闭。账号在管理台「账号池」页里填，采集实例�
 存在数据目录里，接口只回 `***`。也可以继续用 `file:...` 或 `env:...` 引用，内容
 是一行一个 `username,password`——但 Compose 不挂任何 `/run/secrets` 路径，用
 `file:` 得自己加绑定挂载。本地也可以在 `.env` 里设 `MAJSOUL_ACCOUNTS=username,password`
-然后在网页选 `env:MAJSOUL_ACCOUNTS`。订阅链接由后端以 `0600` 权限保存在数据目录中，
-状态 API 只返回订阅域名。协议模块的打包和进程接口见
+然后在网页选 `env:MAJSOUL_ACCOUNTS`。可以配多条订阅，节点合成一个池子（第二条起的
+节点会自动加前缀，免得两家重名）；订阅链接由后端以 `0600` 权限保存在数据目录中，
+状态 API 只返回订阅域名和节点数。节点的可用与否探的是雀魂本身而不是能不能上网，
+所以「能连上雀魂」这个数才是补抓真正能用的节点数。协议模块的打包和进程接口见
 [docs/watch-modules.md](docs/watch-modules.md)。
 
 生产路径不会把每个约 10KB 的 mjson 分别存成 RustFS 对象。打包器把每条记录压成独立 Zstandard frame，再合并为约 256MB 的 `.mjpack`；单条读取根据 ClickHouse 中的 offset/length 发起 Range GET，只下载对应的几 KB。
@@ -168,7 +170,7 @@ Watch 默认关闭。账号在管理台「账号池」页里填，采集实例�
 | `api/` | 用户、Watch 状态与已发现的 uuid、导出产物、对象存储之前的本地语料 | 账号和 Watch 进度要重来 |
 | `postgres/` | 采集幂等状态和下载任务 | 幂等键重置，重传过的批次会被再收一次 |
 | `redpanda/` | 已回 `202` 但还没打包的记录 | 丢这一段。停掉采集、等消费追平之后它可以是空的 |
-| `mihomo/` | 代理订阅与配置 | 重新填一次订阅 |
+| `mihomo/` | 代理订阅与配置 | 重新填一次订阅；账号绑的节点名会失效，用账号池页的「重新分配节点」重来一次 |
 
 要把某一份放到单独的盘上不必改 compose，把盘挂到对应子目录即可——通常是最大的
 `rustfs/`。绑定挂载不归 Docker 管，所以 `docker compose down -v` 也不再会连数据
