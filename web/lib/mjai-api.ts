@@ -529,16 +529,39 @@ export type MihomoOutboundStatus = {
 export type MihomoNode = {
   name: string;
   node_type: string;
+  /**
+   * Whether it reached Mahjong Soul on the last check — not whether it can
+   * reach the internet. `null` means it has not been checked yet, which the
+   * pool treats exactly like false.
+   */
   alive: boolean | null;
   delay_ms: number | null;
   selected: boolean;
+  /** Which subscription it came from, by that subscription's id. */
+  subscription: string;
+};
+
+/**
+ * One subscription. Never the link itself — that is a bearer credential and it
+ * does not leave the backend — only the host it points at.
+ */
+export type SubscriptionStatus = {
+  id: string;
+  label: string;
+  host: string | null;
+  update_interval_secs: number;
+  /** What its nodes are renamed with, or null for the one that predates this. */
+  prefix: string | null;
+  nodes: number;
+  /** Of those, the ones that can currently reach Mahjong Soul. */
+  healthy: number;
 };
 
 export type MihomoStatus = {
   available: boolean;
   subscription_configured: boolean;
-  subscription_host: string | null;
-  update_interval_secs: number;
+  /** Every configured subscription; their nodes are pooled into one list. */
+  subscriptions: SubscriptionStatus[];
   /** What the shared `MAJSOUL` group is on; both lanes follow it by default. */
   selected_node: string | null;
   lanes: MihomoLaneStatus[];

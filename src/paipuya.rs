@@ -617,8 +617,21 @@ impl PaipuyaSupervisor {
                     .to_owned(),
             );
         }
+        // No proxy, and said rather than left to chance. 牌谱屋 is not Mahjong
+        // Soul: it rate-limits by API key, it has never cared where a request
+        // comes from, and the exits this deployment owns are a scarce thing the
+        // re-fetch pool spends on Mahjong Soul. Sending a catalogue sweep
+        // through one buys nothing and takes an address away from the half that
+        // needs it.
+        //
+        // `no_proxy` rather than simply not setting one: reqwest reads
+        // `HTTPS_PROXY` from the environment by default, so "does not use a
+        // proxy" was true only for as long as nobody set that variable on the
+        // container — and a deployment that set it to route something else
+        // would have moved this sweep without anybody choosing to.
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
+            .no_proxy()
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|error| WatchServiceError::InvalidConfig(error.to_string()))?;

@@ -10,14 +10,45 @@ use reqwest::{Client, Method, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-const PROVIDER_NAME: &str = "majsoul";
+/// The provider the single-subscription version wrote, and the one a migrated
+/// deployment keeps. New subscriptions get an id of their own; this name stays
+/// spoken for so the nodes an operator has already bound accounts to keep the
+/// names they were bound under.
+const LEGACY_PROVIDER: &str = "majsoul";
 /// The original group, kept exactly as it was. Nothing selects it any more —
 /// both halves have their own — but it is what `mixed-port: 7890` and the rule
 /// still point at, and 7890 is the address every deployment before this one
 /// dials. Removing it would move the outbound path of a live collector as a
 /// side effect of an upgrade.
 const GROUP_NAME: &str = "MAJSOUL";
-const HEALTH_URL: &str = "https://www.gstatic.com/generate_204";
+
+/// What a node has to be able to reach before this pool will send an account
+/// through it.
+///
+/// Mahjong Soul's own origin, not `gstatic.com/generate_204`. The two are not
+/// the same question and the pool only ever cared about one of them: a node can
+/// be perfectly alive to Google and still be somewhere Mahjong Soul will not
+/// serve, or rate-limited, or routed the long way round. Every node this
+/// deployment hands to an account was picked on the strength of the wrong test.
+///
+/// This file because it is 85 bytes and it is what a client asks for before it
+/// asks for anything else, so a hundred of these an hour across a subscription
+/// is the least remarkable traffic a node could carry.
+const HEALTH_URL: &str = "https://game.maj-soul.com/1/version.json";
+/// It answers `200`, where `generate_204` answered `204`.
+const HEALTH_EXPECTED_STATUS: &str = "200";
+/// Longer than the 5s the 204 check used. A round trip to Mahjong Soul through
+/// an exit two countries away is not a round trip to the nearest Google edge,
+/// and a node marked dead for being slow is a node the pool will not use.
+const HEALTH_TIMEOUT_MS: u32 = 10_000;
+/// Every node, whether or not anything is currently going through it.
+///
+/// `lazy` skips the check for a provider nothing is using, which is the right
+/// default for a client whose user picks a node by hand and the wrong one for a
+/// pool: the pool picks *by* the answer, so a node nobody has used yet has no
+/// `alive` and gets filtered out — and it stays unused for exactly that reason.
+/// Fifty nodes every five minutes is one request every six seconds.
+const HEALTH_LAZY: bool = false;
 
 /// How many times the boot pass asks mihomo to load the lane groups, and how
 /// long it waits between asks. Sized to cover a mihomo that is still starting —
@@ -129,10 +160,80 @@ impl OutboundSlots {
     }
 }
 
+/// One subscription, and everything about it that must not drift.
+///
+/// Three of these fields are stored rather than derived, and each of them is a
+/// name something else has already been keyed to. `id` is mihomo's
+/// `proxy-providers` key, this subscription's cache file, and what the console
+/// removes it by. `prefix` is what its nodes are called — accounts are bound to
+/// node names, so a prefix that moved would quietly unbind them. `label` is
+/// only ever shown, so it is the one an operator may change freely.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct StoredSubscription {
+    /// Defaulted for the file the single-subscription version wrote, which had
+    /// no idea it would ever need one. See [`load_subscriptions`].
+    #[serde(default = "legacy_provider")]
+    id: String,
+    #[serde(default = "legacy_provider")]
+    label: String,
+    /// Prepended to every node name this subscription contributes, through
+    /// mihomo's `override.additional-prefix`.
+    ///
+    /// `None` for the migrated subscription and only for it. Two providers that
+    /// both call a node 「香港 01」 collapse into one entry in mihomo's proxy
+    /// map, so a group selecting that name reaches whichever one won — which is
+    /// not a thing that fails, it is a thing that quietly goes out of the wrong
+    /// country. Every subscription added from here on is prefixed. The one that
+    /// was already here is not, because its node names are what the account pool
+    /// is bound to, and renaming them would leave every binding pointing at a
+    /// node that no longer exists.
+    #[serde(default)]
+    prefix: Option<String>,
     url: String,
     update_interval_secs: u64,
+}
+
+impl StoredSubscription {
+    /// The node-name prefix as mihomo wants it, empty when there is none.
+    fn prefix(&self) -> &str {
+        self.prefix.as_deref().unwrap_or_default()
+    }
+}
+
+fn legacy_provider() -> String {
+    LEGACY_PROVIDER.to_owned()
+}
+
+/// What is on disk. A struct rather than a bare `Vec` so a later field has
+/// somewhere to go without another migration.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct StoredSubscriptions {
+    #[serde(default)]
+    subscriptions: Vec<StoredSubscription>,
+}
+
+/// Reads `subscription.json`, in either shape it has ever had.
+///
+/// The old shape is a bare `{"url": ..., "update_interval_secs": ...}` and the
+/// new one is `{"subscriptions": [...]}`. Told apart by the presence of `url`
+/// at the top level, because that is the field the old shape cannot be without
+/// and the new one never has.
+///
+/// Strict about everything else, deliberately, and this is the one file in the
+/// process where that is the right answer: a subscription that will not parse
+/// is a deployment about to send every account out of the host's own address
+/// while the console shows a node. Failing to start is louder. The migration is
+/// what makes strictness safe for an upgrade — without it every existing
+/// deployment would fail to start on this version.
+fn load_subscriptions(bytes: &[u8]) -> Result<StoredSubscriptions, MihomoError> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)?;
+    if value.get("url").is_some() {
+        let legacy: StoredSubscription = serde_json::from_value(value)?;
+        return Ok(StoredSubscriptions {
+            subscriptions: vec![legacy],
+        });
+    }
+    Ok(serde_json::from_value(value)?)
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -140,10 +241,36 @@ pub struct SubscriptionUpdate {
     pub url: String,
     #[serde(default = "default_update_interval")]
     pub update_interval_secs: u64,
+    /// What to call it on the console. Defaulted from the URL's host, which is
+    /// the only part of a subscription link this process is willing to show.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Which subscription this replaces. Absent adds one.
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 fn default_update_interval() -> u64 {
     3600
+}
+
+/// One subscription, as the console is allowed to see it.
+///
+/// No URL. A subscription link is a bearer credential — it is the whole of the
+/// operator's account with that provider — and the rule that it never leaves
+/// this process is older than this struct.
+#[derive(Clone, Debug, Serialize)]
+pub struct SubscriptionStatus {
+    pub id: String,
+    pub label: String,
+    /// Host and port, never the path or the query. Both of those carry tokens.
+    pub host: Option<String>,
+    pub update_interval_secs: u64,
+    pub prefix: Option<String>,
+    /// How many nodes mihomo currently has from it, and how many of those can
+    /// reach Mahjong Soul.
+    pub nodes: usize,
+    pub healthy: usize,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -159,11 +286,16 @@ fn default_lane() -> MihomoLane {
     MihomoLane::Watch
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+/// Externally tagged, so the two unit variants keep serialising as the bare
+/// strings a console built before this did send: `{"action":"health_check"}`
+/// still parses, and a variant that needs a payload arrives as
+/// `{"action":{"remove_subscription":{"id":"..."}}}`.
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MihomoAction {
     RefreshSubscription,
     HealthCheck,
+    RemoveSubscription { id: String },
 }
 
 /// One lane's own selection, and whether mihomo actually has its group.
@@ -213,17 +345,24 @@ pub struct MihomoOutboundStatus {
 pub struct MihomoNode {
     pub name: String,
     pub node_type: String,
+    /// Whether it reached Mahjong Soul on the last check. `None` means it has
+    /// not been checked yet, which the pool treats exactly like `false` —
+    /// spending an account on an unknown node is the thing this answers.
     pub alive: Option<bool>,
     pub delay_ms: Option<u64>,
     pub selected: bool,
+    /// Which subscription it came from, so the console can say so and so a
+    /// pool spread over several does not put every account behind one provider.
+    pub subscription: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct MihomoStatus {
     pub available: bool,
     pub subscription_configured: bool,
-    pub subscription_host: Option<String>,
-    pub update_interval_secs: u64,
+    /// Every subscription, in the order they were added. Replaces the single
+    /// `subscription_host` this used to carry.
+    pub subscriptions: Vec<SubscriptionStatus>,
     /// What the shared `MAJSOUL` group is on, which is what this field has
     /// always meant. Both lanes follow it until somebody picks otherwise, so it
     /// is still the one answer to "where does this deployment go out from".
@@ -237,6 +376,34 @@ pub struct MihomoStatus {
     pub nodes: Vec<MihomoNode>,
     pub updated_at: DateTime<Utc>,
     pub error: Option<String>,
+}
+
+impl MihomoStatus {
+    /// The nodes worth spending an account on, best first.
+    ///
+    /// One rule in one place, because everything that hands a node to an account
+    /// has to apply the same one and they used to each have their own. `alive`
+    /// is mihomo's answer to "did this reach Mahjong Soul on the last check" —
+    /// see [`HEALTH_URL`], which is the thing that makes this a usable filter at
+    /// all rather than a statement about Google. `None` counts as no: a node
+    /// nobody has probed is not one to find out about with a real account.
+    ///
+    /// Sorted by latency and then by name, so the answer is stable for the same
+    /// set and a caller that takes the first few takes the fastest few. Callers
+    /// that want them spread out shuffle it themselves — registration does,
+    /// deliberately, so a batch does not pile onto one address.
+    pub fn usable_nodes(&self) -> Vec<String> {
+        let mut usable: Vec<&MihomoNode> = self
+            .nodes
+            .iter()
+            .filter(|node| node.alive.unwrap_or(false))
+            .collect();
+        usable.sort_by(|left, right| {
+            (left.delay_ms.unwrap_or(u64::MAX), &left.name)
+                .cmp(&(right.delay_ms.unwrap_or(u64::MAX), &right.name))
+        });
+        usable.into_iter().map(|node| node.name.clone()).collect()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -289,7 +456,11 @@ pub struct MihomoManager {
     /// registration through a different country than the one recorded against
     /// it, silently.
     leased: RwLock<Vec<String>>,
-    subscription: RwLock<Option<StoredSubscription>>,
+    /// Every configured subscription. Their nodes are pooled: each one becomes
+    /// a `proxy-providers` entry and every group `use:`s all of them, so what a
+    /// node belongs to matters for naming and for reporting and for nothing
+    /// else.
+    subscriptions: RwLock<Vec<StoredSubscription>>,
     client: Client,
 }
 
@@ -302,9 +473,9 @@ impl MihomoManager {
     ) -> Result<Self, MihomoError> {
         std::fs::create_dir_all(root.join("providers"))?;
         let subscription_path = root.join("subscription.json");
-        let subscription = match std::fs::read(&subscription_path) {
-            Ok(bytes) => Some(serde_json::from_slice(&bytes)?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        let subscriptions = match std::fs::read(&subscription_path) {
+            Ok(bytes) => load_subscriptions(&bytes)?.subscriptions,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(error.into()),
         };
         let controller_url = Url::parse(controller_url)
@@ -333,7 +504,7 @@ impl MihomoManager {
             // survives a restart. The slots it borrowed are re-filed from the
             // account pool at boot, which is what frees them.
             leased: RwLock::new(Vec::new()),
-            subscription: RwLock::new(subscription),
+            subscriptions: RwLock::new(subscriptions),
             client,
         };
         manager.write_runtime_config()?;
@@ -486,16 +657,34 @@ impl MihomoManager {
         nodes: Vec<MihomoNode>,
         error: Option<String>,
     ) -> MihomoStatus {
-        let subscription = self.subscription.read().clone();
+        let configured = self.subscriptions.read().clone();
+        let subscriptions: Vec<SubscriptionStatus> = configured
+            .iter()
+            .map(|subscription| {
+                // Counted from what mihomo actually has rather than from what
+                // was configured: a subscription whose fetch failed is one this
+                // has zero nodes from, and that is the number worth showing.
+                let mine = nodes
+                    .iter()
+                    .filter(|node| node.subscription == subscription.id);
+                let (nodes, healthy) = mine.fold((0usize, 0usize), |(all, up), node| {
+                    (all + 1, up + usize::from(node.alive.unwrap_or(false)))
+                });
+                SubscriptionStatus {
+                    id: subscription.id.clone(),
+                    label: subscription.label.clone(),
+                    host: redacted_host(&subscription.url),
+                    update_interval_secs: subscription.update_interval_secs,
+                    prefix: subscription.prefix.clone(),
+                    nodes,
+                    healthy,
+                }
+            })
+            .collect();
         MihomoStatus {
             available,
-            subscription_configured: subscription.is_some(),
-            subscription_host: subscription
-                .as_ref()
-                .and_then(|value| redacted_host(&value.url)),
-            update_interval_secs: subscription
-                .map(|value| value.update_interval_secs)
-                .unwrap_or(default_update_interval()),
+            subscription_configured: !configured.is_empty(),
+            subscriptions,
             selected_node,
             lanes,
             outbounds,
@@ -617,25 +806,112 @@ impl MihomoManager {
             .all(|lane| proxies.contains_key(lane.group()))
     }
 
+    /// Adds a subscription, or replaces one by id.
+    ///
+    /// A new one is always prefixed and the prefix is derived once, here, from
+    /// the id — never from the label, which an operator may rename, and never
+    /// recomputed, because a node name is what an account is bound to. Replacing
+    /// an existing subscription keeps its id and its prefix for the same reason:
+    /// re-pasting a link whose token expired must not rename fifty nodes.
     pub async fn update_subscription(
         &self,
         update: SubscriptionUpdate,
     ) -> Result<MihomoStatus, MihomoError> {
         validate_subscription(&update)?;
-        let stored = StoredSubscription {
-            url: update.url,
-            update_interval_secs: update.update_interval_secs,
-        };
-        persist_secret_json(&self.root.join("subscription.json"), &stored)?;
+        let label = update
+            .label
+            .as_deref()
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .map(str::to_owned)
+            .or_else(|| redacted_host(&update.url))
+            .unwrap_or_else(legacy_provider);
 
-        let previous = self.subscription.read().clone();
-        *self.subscription.write() = Some(stored);
+        let previous = self.subscriptions.read().clone();
+        let mut next = previous.clone();
+        match update
+            .id
+            .as_deref()
+            .and_then(|id| next.iter_mut().find(|stored| stored.id == id))
+        {
+            Some(stored) => {
+                stored.label = label;
+                stored.url = update.url;
+                stored.update_interval_secs = update.update_interval_secs;
+            }
+            None => {
+                if next.len() >= MAX_SUBSCRIPTIONS {
+                    return Err(MihomoError::InvalidConfig(format!(
+                        "最多 {MAX_SUBSCRIPTIONS} 条订阅，先删掉一条再加"
+                    )));
+                }
+                // A short id rather than a whole uuid: it is a YAML key, a file
+                // name and the visible half of every node name from this
+                // subscription. Collisions are checked rather than assumed away.
+                let id = std::iter::repeat_with(|| {
+                    format!(
+                        "majsoul-{}",
+                        &uuid::Uuid::new_v4().simple().to_string()[..6]
+                    )
+                })
+                .find(|id| next.iter().all(|stored| &stored.id != id))
+                .expect("an id that is free");
+                let prefix = format!("[{}] ", &id["majsoul-".len()..]);
+                next.push(StoredSubscription {
+                    id,
+                    label,
+                    prefix: Some(prefix),
+                    url: update.url,
+                    update_interval_secs: update.update_interval_secs,
+                });
+            }
+        }
+        self.commit_subscriptions(next, previous).await
+    }
+
+    /// Drops a subscription and the provider that carried it.
+    ///
+    /// The nodes go with it, and any account bound to one keeps a name that no
+    /// longer resolves — which is why the account pool holds on to names it does
+    /// not recognise rather than silently rewriting them.
+    pub async fn remove_subscription(&self, id: &str) -> Result<MihomoStatus, MihomoError> {
+        let previous = self.subscriptions.read().clone();
+        let next: Vec<StoredSubscription> = previous
+            .iter()
+            .filter(|stored| stored.id != id)
+            .cloned()
+            .collect();
+        if next.len() == previous.len() {
+            return Err(MihomoError::InvalidConfig("没有这条订阅".into()));
+        }
+        self.commit_subscriptions(next, previous).await
+    }
+
+    /// Writes the new set, regenerates the configuration and makes mihomo take
+    /// it, rolling the memory back if the file cannot be written.
+    async fn commit_subscriptions(
+        &self,
+        next: Vec<StoredSubscription>,
+        previous: Vec<StoredSubscription>,
+    ) -> Result<MihomoStatus, MihomoError> {
+        persist_secret_json(
+            &self.root.join("subscription.json"),
+            &StoredSubscriptions {
+                subscriptions: next.clone(),
+            },
+        )?;
+        *self.subscriptions.write() = next;
         if let Err(error) = self.write_runtime_config() {
-            *self.subscription.write() = previous;
+            *self.subscriptions.write() = previous;
             return Err(error);
         }
         self.reload_config().await?;
-        self.refresh_subscription().await?;
+        // Not fatal. The configuration is written and mihomo has it; a provider
+        // that could not be fetched right now is one the console shows with zero
+        // nodes, and mihomo retries it on its own interval.
+        if let Err(error) = self.refresh_subscription().await {
+            tracing::warn!(%error, "订阅已保存，但这次没能立刻拉到节点");
+        }
         Ok(self.status().await)
     }
 
@@ -660,31 +936,70 @@ impl MihomoManager {
     pub async fn action(&self, action: MihomoAction) -> Result<MihomoStatus, MihomoError> {
         match action {
             MihomoAction::RefreshSubscription => self.refresh_subscription().await?,
-            MihomoAction::HealthCheck => {
-                self.controller_json(
-                    Method::GET,
-                    &format!("/providers/proxies/{PROVIDER_NAME}/healthcheck"),
-                    None,
-                )
-                .await?;
-            }
+            MihomoAction::HealthCheck => self.health_check().await?,
+            MihomoAction::RemoveSubscription { id } => return self.remove_subscription(&id).await,
         }
         Ok(self.status().await)
     }
 
+    /// The provider keys mihomo knows about, in configured order.
+    fn provider_ids(&self) -> Vec<String> {
+        self.subscriptions
+            .read()
+            .iter()
+            .map(|stored| stored.id.clone())
+            .collect()
+    }
+
+    /// Asks every provider to re-fetch now.
+    ///
+    /// One failure does not stop the others and does not fail the call unless
+    /// every one of them failed: a pool spread over several subscriptions must
+    /// not lose the ones that answered because one provider's host was down.
     async fn refresh_subscription(&self) -> Result<(), MihomoError> {
-        if self.subscription.read().is_none() {
+        self.for_each_provider(Method::PUT, "", "刷新订阅").await
+    }
+
+    async fn health_check(&self) -> Result<(), MihomoError> {
+        self.for_each_provider(Method::GET, "/healthcheck", "测试节点")
+            .await
+    }
+
+    async fn for_each_provider(
+        &self,
+        method: Method,
+        suffix: &str,
+        what: &str,
+    ) -> Result<(), MihomoError> {
+        let providers = self.provider_ids();
+        if providers.is_empty() {
             return Err(MihomoError::InvalidConfig(
                 "configure a subscription before refreshing it".into(),
             ));
         }
-        self.controller_json(
-            Method::PUT,
-            &format!("/providers/proxies/{PROVIDER_NAME}"),
-            Some(serde_json::json!({})),
-        )
-        .await?;
-        Ok(())
+        let mut last = None;
+        let mut ok = 0usize;
+        for id in &providers {
+            let body = matches!(method, Method::PUT).then(|| serde_json::json!({}));
+            match self
+                .controller_json(
+                    method.clone(),
+                    &format!("/providers/proxies/{id}{suffix}"),
+                    body,
+                )
+                .await
+            {
+                Ok(_) => ok += 1,
+                Err(error) => {
+                    tracing::warn!(provider = id, %error, "{what}失败，其它订阅继续");
+                    last = Some(error);
+                }
+            }
+        }
+        match last {
+            Some(error) if ok == 0 => Err(error),
+            _ => Ok(()),
+        }
     }
 
     async fn reload_config(&self) -> Result<(), MihomoError> {
@@ -795,9 +1110,9 @@ impl MihomoManager {
             std::sync::atomic::Ordering::Relaxed,
         );
         let selected = shared;
-        let provider_names = self.provider_node_names().await.unwrap_or_default();
+        let provider_names = self.provider_node_names().await;
         let mut nodes = Vec::new();
-        for name in provider_names {
+        for (name, subscription) in provider_names {
             let Some(node) = proxies.get(&name) else {
                 continue;
             };
@@ -817,6 +1132,7 @@ impl MihomoManager {
                     .to_owned(),
                 alive: node.get("alive").and_then(serde_json::Value::as_bool),
                 delay_ms,
+                subscription,
             });
         }
         nodes.sort_by(|left, right| {
@@ -834,22 +1150,37 @@ impl MihomoManager {
         Ok((selected, lanes, outbounds, nodes))
     }
 
-    async fn provider_node_names(&self) -> Result<Vec<String>, MihomoError> {
-        let value = self
-            .controller_json(
-                Method::GET,
-                &format!("/providers/proxies/{PROVIDER_NAME}"),
-                None,
-            )
-            .await?;
-        Ok(value
-            .get("proxies")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|node| node.get("name").and_then(serde_json::Value::as_str))
-            .map(str::to_owned)
-            .collect())
+    /// Every node the pool has, tagged with the subscription it came from.
+    ///
+    /// One request per provider rather than one for all of them, because the
+    /// tag is the point: mihomo's global proxy map has no idea which provider a
+    /// name arrived from, and a pool spread over several subscriptions has to
+    /// be able to say. A provider that fails is skipped rather than failing the
+    /// lot — its nodes are simply not in the pool this poll.
+    async fn provider_node_names(&self) -> Vec<(String, String)> {
+        let mut named = Vec::new();
+        for id in self.provider_ids() {
+            let value = match self
+                .controller_json(Method::GET, &format!("/providers/proxies/{id}"), None)
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::debug!(provider = id, %error, "读不到这条订阅的节点");
+                    continue;
+                }
+            };
+            named.extend(
+                value
+                    .get("proxies")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|node| node.get("name").and_then(serde_json::Value::as_str))
+                    .map(|name| (name.to_owned(), id.clone())),
+            );
+        }
+        named
     }
 
     async fn controller_json(
@@ -886,32 +1217,48 @@ impl MihomoManager {
     }
 
     fn write_runtime_config(&self) -> Result<(), MihomoError> {
-        let subscription = self.subscription.read().clone();
-        let provider = subscription.as_ref().map(|value| {
-            format!(
-                r#"
-proxy-providers:
-  {PROVIDER_NAME}:
-    type: http
-    url: {}
-    path: ./providers/majsoul.yaml
-    interval: {}
-    health-check:
-      enable: true
-      url: {HEALTH_URL}
-      interval: 300
-      timeout: 5000
-      lazy: true
-      expected-status: 204
-"#,
-                serde_json::to_string(&value.url).expect("URL can be JSON encoded"),
-                value.update_interval_secs,
-            )
+        let subscriptions = self.subscriptions.read().clone();
+        // One provider per subscription, and every group uses all of them. That
+        // union is the pool: what a node came from decides its name and nothing
+        // else, so an account bound to one and a run borrowing another are the
+        // same mechanism.
+        //
+        // `override.additional-prefix` is what keeps two providers from both
+        // contributing a node called 「香港 01」. Duplicate names do not fail —
+        // they collapse in mihomo's proxy map, and a group selecting that name
+        // reaches whichever one won.
+        let provider = (!subscriptions.is_empty()).then(|| {
+            let entries: String = subscriptions
+                .iter()
+                .map(|value| {
+                    let prefix = value.prefix();
+                    let override_block = if prefix.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "    override:\n      additional-prefix: {}\n",
+                            serde_json::to_string(prefix).expect("prefix can be JSON encoded")
+                        )
+                    };
+                    format!(
+                        "  {}:\n    type: http\n    url: {}\n    path: ./providers/{}.yaml\n    interval: {}\n{override_block}    health-check:\n      enable: true\n      url: {HEALTH_URL}\n      interval: 300\n      timeout: {HEALTH_TIMEOUT_MS}\n      lazy: {HEALTH_LAZY}\n      expected-status: {HEALTH_EXPECTED_STATUS}\n",
+                        value.id,
+                        serde_json::to_string(&value.url).expect("URL can be JSON encoded"),
+                        value.id,
+                        value.update_interval_secs,
+                    )
+                })
+                .collect();
+            format!("\nproxy-providers:\n{entries}")
         });
-        let provider_use = if subscription.is_some() {
-            format!("    use:\n      - {PROVIDER_NAME}\n")
-        } else {
+        let provider_use = if subscriptions.is_empty() {
             String::new()
+        } else {
+            let names: String = subscriptions
+                .iter()
+                .map(|value| format!("      - {}\n", value.id))
+                .collect();
+            format!("    use:\n{names}")
         };
         // One select group per lane, plus the original. Their listeners are
         // bound straight to a group, which bypasses `rules` entirely — that is
@@ -1035,6 +1382,15 @@ proxy-groups:
     }
 }
 
+/// How many subscriptions one deployment may hold.
+///
+/// A bound on generated configuration rather than on anything mihomo minds:
+/// each one is a provider block, an HTTP fetch on its own interval, and a
+/// health check per node against Mahjong Soul. Well above what an operator
+/// aggregating a few providers would use, low enough that a paste loop cannot
+/// grow the file without end.
+const MAX_SUBSCRIPTIONS: usize = 16;
+
 fn validate_subscription(update: &SubscriptionUpdate) -> Result<(), MihomoError> {
     let url =
         Url::parse(&update.url).map_err(|error| MihomoError::InvalidConfig(error.to_string()))?;
@@ -1096,21 +1452,199 @@ mod tests {
         );
     }
 
+    fn update(url: &str) -> SubscriptionUpdate {
+        SubscriptionUpdate {
+            url: url.into(),
+            update_interval_secs: 3600,
+            label: None,
+            id: None,
+        }
+    }
+
     #[test]
     fn rejects_non_http_subscription() {
+        assert!(validate_subscription(&update("file:///tmp/sub")).is_err());
+        assert!(validate_subscription(&update("https://example.com/sub")).is_ok());
+    }
+
+    /// The file the single-subscription version wrote has to keep loading, and
+    /// it has to load as the subscription it already was.
+    ///
+    /// This is the one file in the process where a parse failure stops the API
+    /// from starting at all — `MihomoManager::new` returns the error and
+    /// `AppState::local` takes it up — so a shape change without this is every
+    /// existing deployment failing to boot on the upgrade.
+    #[test]
+    fn the_single_subscription_file_migrates_and_keeps_its_node_names() {
+        let legacy =
+            br#"{"url":"https://sub.example.com/link?token=x","update_interval_secs":900}"#;
+        let loaded = load_subscriptions(legacy).expect("the old shape still loads");
+        assert_eq!(loaded.subscriptions.len(), 1);
+        let migrated = &loaded.subscriptions[0];
+        assert_eq!(migrated.url, "https://sub.example.com/link?token=x");
+        assert_eq!(migrated.update_interval_secs, 900);
+        // The provider keeps the name its cache file and its controller paths
+        // already use...
+        assert_eq!(migrated.id, LEGACY_PROVIDER);
+        // ...and its nodes keep the names the account pool is bound to. A
+        // prefix here would leave every bound account pointing at a node that
+        // no longer exists, and the pool holds unknown names rather than
+        // reporting them, so nothing would say so.
+        assert_eq!(migrated.prefix, None);
+        assert!(migrated.prefix().is_empty());
+
+        // And the new shape loads as itself.
+        let both = load_subscriptions(
+            br#"{"subscriptions":[{"id":"majsoul","label":"a","url":"https://a.example.com/s","update_interval_secs":3600},
+                                  {"id":"majsoul-ab12cd","label":"b","prefix":"[ab12cd] ","url":"https://b.example.com/s","update_interval_secs":600}]}"#,
+        )
+        .expect("the new shape loads");
+        assert_eq!(both.subscriptions.len(), 2);
+        assert_eq!(both.subscriptions[1].prefix(), "[ab12cd] ");
+        // An empty file is no subscriptions rather than an error.
         assert!(
-            validate_subscription(&SubscriptionUpdate {
-                url: "file:///tmp/sub".into(),
-                update_interval_secs: 3600,
-            })
-            .is_err()
+            load_subscriptions(b"{}")
+                .expect("an empty object is empty")
+                .subscriptions
+                .is_empty()
         );
+        assert!(load_subscriptions(b"not json").is_err());
+    }
+
+    /// The rule every caller that hands a node to an account has to share.
+    ///
+    /// `alive` is mihomo's answer to "did this reach Mahjong Soul on the last
+    /// check", and `None` is not a softer yes — a node nobody has probed is not
+    /// one to find out about with a real account. Sorted by latency so a caller
+    /// taking the first few takes the fastest few, and by name after that so
+    /// the same set always answers the same way.
+    #[test]
+    fn only_nodes_that_reached_mahjong_soul_are_worth_an_account() {
+        fn node(name: &str, alive: Option<bool>, delay_ms: Option<u64>) -> MihomoNode {
+            MihomoNode {
+                name: name.into(),
+                node_type: "Trojan".into(),
+                alive,
+                delay_ms,
+                selected: false,
+                subscription: LEGACY_PROVIDER.into(),
+            }
+        }
+        let status = MihomoStatus {
+            available: true,
+            subscription_configured: true,
+            subscriptions: Vec::new(),
+            selected_node: None,
+            lanes: Vec::new(),
+            outbounds: Vec::new(),
+            proxy_url: "http://mihomo:7890".into(),
+            nodes: vec![
+                node("slow", Some(true), Some(900)),
+                node("dead", Some(false), Some(10)),
+                node("unprobed", None, None),
+                node("quick", Some(true), Some(120)),
+                // Alive but never timed: behind the ones with a number, not
+                // ahead of them, because unknown is not fast.
+                node("untimed", Some(true), None),
+            ],
+            updated_at: Utc::now(),
+            error: None,
+        };
+        assert_eq!(status.usable_nodes(), ["quick", "slow", "untimed"]);
     }
 }
 
 #[cfg(test)]
 mod lane_tests {
     use super::*;
+
+    /// Several subscriptions pooled into one set of nodes.
+    ///
+    /// Every group `use:`s every provider, which is what makes the pool one
+    /// pool: where a node came from decides what it is called and nothing else.
+    /// The prefix is the part that has to be right — two providers both
+    /// offering 「香港 01」 do not fail, they collapse into one entry in
+    /// mihomo's proxy map, and a group selecting that name reaches whichever
+    /// one won. The migrated subscription is the exception and keeps bare
+    /// names, because those are what the account pool is bound to.
+    #[test]
+    fn every_subscription_becomes_a_provider_and_every_group_uses_all_of_them() {
+        let root = std::env::temp_dir().join(format!("mjai-mihomo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("subscription.json"),
+            r#"{"subscriptions":[
+                {"id":"majsoul","label":"旧的","url":"https://a.example/sub?token=x","update_interval_secs":3600},
+                {"id":"majsoul-ab12cd","label":"第二家","prefix":"[ab12cd] ","url":"https://b.example/sub?token=y","update_interval_secs":600}
+            ]}"#
+            .as_bytes(),
+        )
+        .unwrap();
+        let manager = MihomoManager::new(
+            root.clone(),
+            "http://127.0.0.1:9090",
+            "secret".into(),
+            "http://mihomo:7890".into(),
+        )
+        .expect("a manager with two subscriptions");
+        let config = std::fs::read_to_string(root.join("config.yaml")).expect("a written config");
+
+        // One provider block each, each with its own cache file and interval.
+        assert!(config.contains("  majsoul:\n"), "{config}");
+        assert!(config.contains("  majsoul-ab12cd:\n"), "{config}");
+        assert!(
+            config.contains("path: ./providers/majsoul.yaml"),
+            "{config}"
+        );
+        assert!(
+            config.contains("path: ./providers/majsoul-ab12cd.yaml"),
+            "{config}"
+        );
+        assert!(config.contains("interval: 3600"), "{config}");
+        assert!(config.contains("interval: 600"), "{config}");
+        // Exactly one `proxy-providers:` key, whatever the count.
+        assert_eq!(config.matches("proxy-providers:").count(), 1, "{config}");
+
+        // The migrated one keeps bare node names; the added one is prefixed.
+        assert_eq!(
+            config.matches("additional-prefix:").count(),
+            1,
+            "only the added subscription is renamed: {config}"
+        );
+        assert!(
+            config.contains(r#"additional-prefix: "[ab12cd] ""#),
+            "{config}"
+        );
+
+        // Every select group draws from both. The lane groups and the shared
+        // one all carry the same `use:` block, so a node from either provider
+        // is selectable from any of them.
+        let both = "    use:\n      - majsoul\n      - majsoul-ab12cd\n";
+        assert_eq!(
+            config.matches(both).count(),
+            1 + MihomoLane::ALL.len(),
+            "the shared group and both lanes each use every provider: {config}"
+        );
+
+        // The health check reaches Mahjong Soul rather than Google, and runs
+        // whether or not anything is going through the node.
+        assert!(
+            config.contains("url: https://game.maj-soul.com/"),
+            "{config}"
+        );
+        assert!(config.contains("expected-status: 200"), "{config}");
+        assert!(config.contains("lazy: false"), "{config}");
+        assert!(!config.contains("generate_204"), "{config}");
+
+        // And nothing about the split moved.
+        assert!(config.contains("mixed-port: 7890"), "{config}");
+        assert!(config.contains("  - MATCH,MAJSOUL\n"), "{config}");
+        // The links themselves are in the file mihomo reads and nowhere else.
+        let status = std::fs::read_to_string(root.join("subscription.json")).unwrap();
+        assert!(status.contains("token=x"));
+        let _ = &manager;
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     /// The generated configuration, checked for the things that decide whether
     /// the split works at all.

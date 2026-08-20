@@ -227,7 +227,20 @@ impl Default for WatchServiceConfig {
             revision: 1,
             enabled: false,
             server: "cn".into(),
-            proxy_mode: WatchProxyMode::Mihomo,
+            // Direct, unlike the re-fetch pool. Live collection is one session
+            // per instance behaving like a player, and it works from the host's
+            // own address — the proxy is there for when that address stops
+            // being served, not because collection needs one. The exits this
+            // deployment owns are few and the pool spends them on Mahjong Soul
+            // by the thousand; a collector holding one takes it from the half
+            // that has a use for it.
+            //
+            // Only a deployment with no configuration yet gets this. The
+            // `#[serde(default)]` on the field itself still reads `Mihomo`,
+            // which is what a configuration written before the field existed
+            // was running — moving a live collector's exit as a side effect of
+            // an upgrade is the one thing this whole area refuses to do.
+            proxy_mode: WatchProxyMode::Direct,
             custom_proxy_url: None,
             poll_interval_secs: 10,
             request_delay_ms: 500,

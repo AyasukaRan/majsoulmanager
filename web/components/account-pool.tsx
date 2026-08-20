@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { KeyRound, Plus, Save, Trash2 } from "lucide-react";
+import { Download, KeyRound, Plus, Save, Shuffle, Trash2 } from "lucide-react";
 
 import { parseAccountsJsonl } from "@/lib/accounts-jsonl.mjs";
 import {
@@ -191,6 +191,37 @@ export function AccountPoolCard() {
     const timer = window.setInterval(() => void loadHealth(), 20_000);
     return () => window.clearInterval(timer);
   }, [loadHealth]);
+
+  /**
+   * Spreads the whole re-fetch pool over the nodes that can currently reach
+   * Mahjong Soul.
+   *
+   * The alternative is the dropdown in every row, once per account, which for
+   * ninety accounts means most of them stay on 「跟随补抓出站」 — one address for
+   * the whole pool, which is the thing the per-node outbounds exist to avoid.
+   *
+   * Writes on the backend rather than editing the table here, so it cannot be
+   * left unsaved: the bindings and the mihomo listeners behind them have to
+   * move together.
+   */
+  async function redistribute() {
+    await run("重新分配节点失败", async () => {
+      const spread = await jsonRequest<{
+        accounts: number;
+        nodes: number;
+        usable: number;
+      }>("/api/accounts/nodes", { method: "POST" });
+      await load();
+      if (spread.nodes === 0) {
+        return "现在一个能连上雀魂的节点都没有，已经把账号全部改回跟随补抓出站";
+      }
+      const capped =
+        spread.usable > spread.nodes
+          ? `（能用的有 ${spread.usable} 个，最多同时开 ${spread.nodes} 条独立出站）`
+          : "";
+      return `${spread.accounts} 个补抓账号已经摊到 ${spread.nodes} 个节点上${capped}`;
+    });
+  }
 
   async function save() {
     if (!document_) return;
@@ -614,11 +645,31 @@ export function AccountPoolCard() {
               if (file) void importJsonl(file);
             }}
           />
+          {/* Two pool-wide actions. Both talk to the backend directly rather
+              than editing the table, so neither can be left unsaved. */}
+          <Button
+            variant="outline"
+            onClick={() => void redistribute()}
+            disabled={busy}
+          >
+            <Shuffle className="size-4" />
+            重新分配节点
+          </Button>
+          {/* A plain link, not a fetch: the response is a file with passwords in
+              it, and the browser's own download is the one path that never
+              parks it in this page's memory. */}
+          <Button variant="outline" render={<a href="/api/accounts/export" download />}>
+            <Download className="size-4" />
+            导出
+          </Button>
           <Button onClick={() => void save()} disabled={busy}>
             <Save className="size-4" />
             保存
           </Button>
         </div>
+        <p className="text-xs text-muted-foreground">
+          {"「重新分配节点」把补抓账号平摊到当前能连上雀魂的节点上，立即生效、不用再点保存。「导出」下载的是 username,password 每行一个——注册出来的账号只存在这里，导出的文件请自己收好。"}
+        </p>
         {message ? (
           <p className="rounded-lg border bg-background px-3 py-2 text-xs text-muted-foreground">
             {message}

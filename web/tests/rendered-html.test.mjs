@@ -571,3 +571,77 @@ test("every service's log lines land on a console page", async () => {
     /game_uuids_ahead\(resuming\.as_ref\(\)\)/,
   );
 });
+
+/**
+ * The proxy is a pool, and three separate things have to stay true for that to
+ * mean anything.
+ *
+ * Nodes are picked on whether they can reach Mahjong Soul, not whether they can
+ * reach the internet — every node this deployment ever handed to an account was
+ * chosen on the strength of a `gstatic.com/generate_204`. Subscriptions
+ * aggregate, and their links never leave the backend. And the two halves that
+ * do not need an exit do not take one: live collection defaults to direct, and
+ * the 牌谱屋 sweep refuses a proxy outright rather than inheriting one from the
+ * environment.
+ */
+test("the proxy pool is measured against Mahjong Soul and shared by subscription", async () => {
+  const [mihomo, paipuya, watch, card, pool, api] = await Promise.all(
+    [
+      "../../src/mihomo.rs",
+      "../../src/paipuya.rs",
+      "../../src/watch_service.rs",
+      "../components/watch/proxy-card.tsx",
+      "../components/account-pool.tsx",
+      "../lib/mjai-api.ts",
+    ].map((file) => readFile(new URL(file, import.meta.url), "utf8")),
+  );
+
+  // The health check the whole pool is filtered on. Asserted on the constant
+  // rather than on the absence of the old endpoint: both the doc comment that
+  // explains the change and the Rust test that pins it out of the generated
+  // config name the URL it replaced.
+  assert.match(mihomo, /HEALTH_URL: &str = "https:\/\/game\.maj-soul\.com\//);
+  assert.doesNotMatch(mihomo, /HEALTH_URL: &str = "https:\/\/www\.gstatic/);
+  // `lazy` skips the check for a provider nothing is using, and the pool picks
+  // what to use *from* the check — an unprobed node would stay unprobed.
+  assert.match(mihomo, /HEALTH_LAZY: bool = false/);
+  // Two providers both offering 「香港 01」 collapse into one entry in mihomo's
+  // proxy map, so a group selecting that name reaches whichever won.
+  assert.match(mihomo, /additional-prefix/);
+
+  // 牌谱屋 rate-limits by API key and has never cared where a request comes
+  // from. `no_proxy` rather than simply not setting one: reqwest reads
+  // HTTPS_PROXY from the environment by default.
+  assert.match(paipuya, /\.no_proxy\(\)/);
+  // Live collection works from the host's own address; the pool spends the
+  // exits on Mahjong Soul by the thousand.
+  assert.match(watch, /proxy_mode: WatchProxyMode::Direct/);
+
+  // The console shows the host and the node counts. Never the link — that is
+  // the whole of the operator's account with the provider.
+  assert.match(api, /subscriptions: SubscriptionStatus\[\];/);
+  assert.doesNotMatch(api, /subscription_host/);
+  assert.match(card, /subscription\.host/);
+  assert.match(card, /remove_subscription/);
+  assert.doesNotMatch(card, /subscription\.url/);
+  // `null` is not a softer yes: a node nobody has probed is not one to find out
+  // about with a real account.
+  assert.match(card, /node\.alive === null/);
+
+  // Ninety accounts is ninety dropdowns, which in practice meant most of them
+  // stayed on one address.
+  assert.match(pool, /\/api\/accounts\/nodes/);
+  assert.match(pool, /重新分配节点/);
+  assert.match(pool, /href="\/api\/accounts\/export"/);
+
+  // Both new routes forward the session, because the backend refuses either
+  // without an administrator's.
+  for (const route of ["app/api/accounts/nodes", "app/api/accounts/export"]) {
+    const source = await readFile(
+      new URL(`../${route}/route.ts`, import.meta.url),
+      "utf8",
+    );
+    assert.match(source, /x-mjai-user-session/);
+    assert.match(source, /getSessionUser/);
+  }
+});

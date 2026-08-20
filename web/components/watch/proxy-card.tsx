@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Cable, Gauge, RefreshCw } from "lucide-react";
+import { Cable, Gauge, RefreshCw, Trash2 } from "lucide-react";
 
 import {
   jsonRequest,
@@ -40,8 +40,13 @@ export function WatchProxyCard({
   onMessage: (message: string) => void;
 }) {
   const [subscriptionUrl, setSubscriptionUrl] = useState("");
+  const [subscriptionLabel, setSubscriptionLabel] = useState("");
+  const subscriptions = proxy?.subscriptions ?? [];
+  const healthy = (proxy?.nodes ?? []).filter(
+    (node) => node.alive === true,
+  ).length;
 
-  async function updateSubscription() {
+  async function addSubscription() {
     if (!subscriptionUrl) {
       onMessage("请输入订阅链接");
       return;
@@ -53,13 +58,29 @@ export function WatchProxyCard({
           method: "PUT",
           body: JSON.stringify({
             url: subscriptionUrl,
-            update_interval_secs: proxy?.update_interval_secs ?? 3600,
+            label: subscriptionLabel.trim() || null,
+            // Per subscription, not per deployment. The box for it lives with
+            // the link because that is the thing it belongs to.
+            update_interval_secs: 3600,
           }),
         },
       );
       onProxy(status);
       setSubscriptionUrl("");
+      setSubscriptionLabel("");
       return "订阅已写入私密配置并刷新节点";
+    });
+  }
+
+  async function removeSubscription(id: string, label: string) {
+    await run("删除订阅失败", async () => {
+      onProxy(
+        await jsonRequest<MihomoStatus>("/api/watch/proxy/actions", {
+          method: "POST",
+          body: JSON.stringify({ action: { remove_subscription: { id } } }),
+        }),
+      );
+      return `已删除订阅 ${label}；绑在它节点上的账号会回到补抓出站`;
     });
   }
 
@@ -71,7 +92,9 @@ export function WatchProxyCard({
           body: JSON.stringify({ action }),
         }),
       );
-      return action === "health_check" ? "节点延迟已更新" : "订阅已刷新";
+      return action === "health_check"
+        ? "已重测每个节点能不能连上雀魂"
+        : "订阅已刷新";
     });
   }
 
@@ -97,7 +120,8 @@ export function WatchProxyCard({
               mihomo 代理
             </CardTitle>
             <CardDescription className="mt-1">
-              订阅由后端保密保存。实时采集和批量补抓各走一条自己的出站，可以选不同节点
+              订阅由后端保密保存，可以加多条、节点合成一个池子。健康检查探的是雀魂本身，
+              不是能不能上网
             </CardDescription>
           </div>
           <Badge
@@ -115,9 +139,11 @@ export function WatchProxyCard({
       <CardContent className="space-y-4 pt-5">
         <div className="rounded-lg border bg-muted/25 p-3 text-xs">
           <div className="flex justify-between gap-3">
-            <span className="text-muted-foreground">订阅</span>
-            <span className="font-mono">
-              {proxy?.subscription_host ?? "未配置"}
+            <span className="text-muted-foreground">节点池</span>
+            <span className="font-medium">
+              {subscriptions.length === 0
+                ? "未配置订阅"
+                : `${proxy?.nodes.length ?? 0} 个节点，${healthy} 个能连上雀魂`}
             </span>
           </div>
           <div className="mt-2 flex justify-between gap-3">
@@ -142,25 +168,79 @@ export function WatchProxyCard({
           ))}
         </div>
 
-        <label className="block space-y-1.5 text-xs font-medium">
-          订阅链接
+        {/* One row per subscription. No link, ever — a subscription URL is the
+            whole of the operator's account with that provider, so the backend
+            answers with the host and nothing else. The node counts are what an
+            operator actually needs from this list: a provider contributing zero
+            healthy nodes is one to stop paying for. */}
+        {subscriptions.length > 0 ? (
+          <div className="space-y-1.5 rounded-lg border bg-muted/25 p-3">
+            {subscriptions.map((subscription) => (
+              <div
+                key={subscription.id}
+                className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs"
+              >
+                <span className="font-medium">{subscription.label}</span>
+                <span className="font-mono text-muted-foreground">
+                  {subscription.host ?? "—"}
+                </span>
+                <span
+                  className={
+                    subscription.healthy > 0
+                      ? "text-muted-foreground"
+                      : "text-amber-700"
+                  }
+                >
+                  {subscription.nodes} 个节点 · {subscription.healthy} 个能连雀魂
+                </span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="ml-auto h-7 gap-1 px-2 text-muted-foreground"
+                  onClick={() =>
+                    void removeSubscription(subscription.id, subscription.label)
+                  }
+                  disabled={busy}
+                >
+                  <Trash2 className="size-3.5" />
+                  删除
+                </Button>
+              </div>
+            ))}
+          </div>
+        ) : null}
+
+        <div className="space-y-1.5 text-xs font-medium">
+          添加订阅
           <div className="flex gap-2">
+            <Input
+              className="max-w-32"
+              autoComplete="off"
+              value={subscriptionLabel}
+              onChange={(event) => setSubscriptionLabel(event.target.value)}
+              placeholder="名称（可选）"
+              aria-label="订阅名称"
+            />
             <Input
               type="password"
               autoComplete="off"
               value={subscriptionUrl}
               onChange={(event) => setSubscriptionUrl(event.target.value)}
               placeholder="https://provider.example/sub?token=…"
+              aria-label="订阅链接"
             />
             <Button
               variant="outline"
-              onClick={() => void updateSubscription()}
+              onClick={() => void addSubscription()}
               disabled={busy}
             >
-              更新
+              添加
             </Button>
           </div>
-        </label>
+          <span className="block font-normal text-muted-foreground">
+            第二条起的节点会自动加上前缀，免得两家都叫「香港 01」的节点撞在一起
+          </span>
+        </div>
 
         {/* One picker per half. They are separate because the two log in with
             different accounts and behave visibly differently — the re-fetch pool
@@ -191,7 +271,14 @@ export function WatchProxyCard({
                 <option key={node.name} value={node.name}>
                   {node.name}
                   {node.delay_ms !== null ? ` · ${node.delay_ms} ms` : ""}
-                  {node.alive === false ? " · 不可用" : ""}
+                  {/* Three states, not two. `null` is "never checked", which
+                      the pool treats as unusable — showing it as if it were
+                      fine is how an unprobed node gets picked by hand. */}
+                  {node.alive === false
+                    ? " · 连不上雀魂"
+                    : node.alive === null
+                      ? " · 未探测"
+                      : ""}
                 </option>
               ))}
             </select>
@@ -248,7 +335,7 @@ export function WatchProxyCard({
             disabled={!proxy?.subscription_configured || busy}
           >
             <Gauge className="size-4" />
-            测试延迟
+            重测节点
           </Button>
         </div>
         {proxy?.error ? (

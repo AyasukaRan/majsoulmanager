@@ -93,6 +93,14 @@ pub fn router(state: AppState) -> Router {
         // last login with each one did — but an account name is itself the thing
         // the route above is restricted for.
         .route("/api/v1/accounts/health", get(get_account_health))
+        // Spreads the pool over the nodes that can currently reach Mahjong
+        // Soul. A write to the same list as `put_accounts` and behind the same
+        // door.
+        .route("/api/v1/accounts/nodes", post(post_account_nodes))
+        // The one endpoint that serves passwords in full, which is why it is in
+        // this group and why it says so in its own doc comment. An operator who
+        // registered these through the console has them nowhere else.
+        .route("/api/v1/accounts/export", get(get_accounts_export))
         .route(
             "/api/v1/accounts/register/status",
             get(get_account_register_status),
@@ -378,6 +386,95 @@ async fn get_account_health(
     State(state): State<AppState>,
 ) -> Json<BTreeMap<String, AccountHealth>> {
     Json(state.accounts.health())
+}
+
+#[derive(Debug, Serialize)]
+struct AccountNodesSpread {
+    /// Re-fetch accounts that were given a node.
+    accounts: usize,
+    /// Distinct nodes they were spread over.
+    nodes: usize,
+    /// Nodes mihomo says can currently reach Mahjong Soul, before the ceiling
+    /// below was applied. The console shows both so a pool spread over sixteen
+    /// out of fifty does not look like a subscription with sixteen nodes.
+    usable: usize,
+}
+
+/// Spreads the re-fetch pool over the nodes that can currently reach Mahjong
+/// Soul.
+///
+/// The alternative was the operator picking a node in a dropdown once per
+/// account, ninety times, which in practice meant most accounts stayed on
+/// 「跟随补抓出站」 — one address for the whole pool, which is the thing the
+/// per-node outbounds exist to avoid.
+///
+/// Capped at `MAX_OUTBOUNDS`, and that is not a detail: a node only becomes an
+/// address when mihomo has a listener for it, there are only so many listeners,
+/// and accounts bound to a node without one fall back to the lane. Spreading
+/// over more nodes than there are slots would quietly put the overflow back on
+/// one address.
+async fn post_account_nodes(
+    State(state): State<AppState>,
+) -> Result<Json<AccountNodesSpread>, ApiError> {
+    let status = state.mihomo.status().await;
+    let mut usable = status.usable_nodes();
+    let available = usable.len();
+    // Shuffled before the ceiling, so the pool is not always spread over the
+    // same fastest sixteen — a subscription's fastest nodes are usually one
+    // region, and one region is one place to be blocked from.
+    crate::register_service::shuffle(&mut usable);
+    usable.truncate(usize::from(crate::mihomo::MAX_OUTBOUNDS));
+
+    let accounts = state.accounts.spread_over(&usable)?;
+    for password in state.accounts.secrets() {
+        state.watch_service.log_buffer().register_secret(password);
+    }
+    // Exactly what `put_accounts` does after a save, and for the same reason:
+    // the bindings are written, and mihomo has to grow the listeners behind
+    // them before a session can dial one.
+    if let Err(error) = state
+        .mihomo
+        .set_outbound_nodes(&state.accounts.refetch_nodes())
+    {
+        tracing::warn!(%error, "重新分配的节点没能写进 mihomo 配置");
+    } else {
+        let mihomo = std::sync::Arc::clone(&state.mihomo);
+        tokio::spawn(async move { mihomo.apply_runtime_config().await });
+    }
+    Ok(Json(AccountNodesSpread {
+        accounts,
+        nodes: usable.len(),
+        usable: available,
+    }))
+}
+
+/// The re-fetch pool as `username,password` lines.
+///
+/// The one endpoint in this process that serves a stored password in full, and
+/// it is deliberate: an operator who registered ninety accounts through the
+/// console has them in exactly one place, and a data directory is not a backup.
+/// The format is the one a `file:` or `env:` secret already takes, so what comes
+/// out goes back in.
+///
+/// Administrator session only, like the rest of this group. Never logged: the
+/// body is built and handed to the response, and the passwords in it are the
+/// same strings `register_secret` has taught the console's log buffer to redact.
+async fn get_accounts_export(State(state): State<AppState>) -> Response {
+    let body = state.accounts.export_refetch();
+    (
+        [
+            (
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            ),
+            (
+                CONTENT_DISPOSITION,
+                HeaderValue::from_static("attachment; filename=\"majsoul-refetch-accounts.txt\""),
+            ),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// Starts a registration run. Returns immediately with the opening progress —
