@@ -212,7 +212,9 @@ pub struct RefetchServiceConfig {
     /// How many sessions to run at once. Capped by the number of usable
     /// accounts, because one account is one session.
     pub concurrency: usize,
-    /// How long each session waits between two requests.
+    /// How long a session leaves between two requests, measured from one being
+    /// sent to the next — so it is the session's rate, not an idle time added
+    /// on top of however long Mahjong Soul took to answer.
     pub request_delay_ms: u64,
     pub client_version: Option<String>,
 }
@@ -233,6 +235,15 @@ impl Default for RefetchServiceConfig {
             // a handful of requests per poll and then sleeps; this sends one
             // after another for as long as the backlog lasts, from an account
             // that never plays a game.
+            //
+            // Left at 1500 when the pacing became a cadence, which does raise
+            // what a deployment holding this default actually sends: the wait
+            // used to be added to the round trip, so 1500 paced a session at
+            // one request every 2.6 seconds and now paces it at 1.5. The number
+            // was never chosen against a measurement — nobody here has found a
+            // per-account limit on `fetchGameRecord` — and the box on the page
+            // is where it is set, which is worth more than a default picked to
+            // reproduce an interval that was an accident of the network.
             request_delay_ms: 1_500,
             client_version: None,
         }
@@ -1071,6 +1082,9 @@ impl RefetchSupervisor {
                 self.dependencies.broker.wait_for_work(IDLE_POLL).await;
                 continue;
             };
+            // Stamped before the request, not after it: the pacing below is a
+            // cadence, and a cadence is measured from one request to the next.
+            let sent = tokio::time::Instant::now();
             match fetch_game_record(transport, pb_worker, request.uuid(), client_version).await {
                 Ok(raw) => request.answer(Ok(raw)),
                 Err(error) => {
@@ -1090,7 +1104,24 @@ impl RefetchSupervisor {
                     tracing::debug!(%source, error = %format!("{error:#}"), "雀魂拒绝了一局");
                 }
             }
-            tokio::time::sleep(Duration::from_millis(config.request_delay_ms)).await;
+            // One request per `request_delay_ms`, counting from when it was
+            // sent — not that long of doing nothing *after* one came back.
+            //
+            // The difference is the whole worth of the setting. A round trip
+            // here is a module call, a websocket exchange through a mihomo exit
+            // and a decode, and it is not small beside the wait: sleeping after
+            // it made the real interval `round trip + delay`, so a box reading
+            // 1500 paced a session at one request every 2.6 seconds, and the
+            // figure moved with whatever the network was doing. Nobody could
+            // set a rate with it, and nobody could reproduce one either.
+            //
+            // Not a floor on the gap, because it does not need one: the clock
+            // starts at the previous request, so a round trip longer than the
+            // wait means the next request goes out immediately and the session
+            // is *still* under one request per `request_delay_ms`. That is the
+            // ceiling this setting exists to state, and it holds however slow
+            // Mahjong Soul is being.
+            tokio::time::sleep_until(sent + Duration::from_millis(config.request_delay_ms)).await;
         }
     }
 
