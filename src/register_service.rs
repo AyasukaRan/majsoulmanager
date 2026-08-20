@@ -613,15 +613,21 @@ impl RegisterService {
         shuffle(&mut alive);
 
         let held = self.accounts.refetch_nodes();
-        let wanted = nodes_to_register(&held, alive, want);
-        let taken = wanted.len() - held.len();
+        let borrowed = nodes_to_borrow(&held, alive, want);
 
+        // A lease rather than a plain re-file: saving the account pool re-files
+        // from scratch, and taking these back mid-run would not stop a session —
+        // it would leave it dialling the same port with a different country
+        // behind it, which is worse than stopping.
         self.mihomo
-            .set_outbound_nodes(&wanted)
+            .lease_outbound_nodes(&borrowed, &held)
             .map_err(|error| WatchServiceError::InvalidConfig(format!("登记出口失败：{error}")))?;
         self.report(
             WatchLogLevel::Info,
-            format!("向 mihomo 要 {taken} 个出口，等它把监听建起来（最多一分钟）"),
+            format!(
+                "向 mihomo 要 {} 个出口，等它把监听建起来（最多一分钟）",
+                borrowed.len()
+            ),
         );
         self.mihomo.apply_runtime_config().await;
 
@@ -648,7 +654,7 @@ impl RegisterService {
     /// old one would silently drop whatever they just bound.
     async fn release_exits(&self) {
         let held = self.accounts.refetch_nodes();
-        match self.mihomo.set_outbound_nodes(&held) {
+        match self.mihomo.release_outbound_nodes(&held) {
             Ok(true) => {
                 self.mihomo.apply_runtime_config().await;
                 self.report(WatchLogLevel::Info, "出口已经还给账号池");
@@ -1011,28 +1017,27 @@ fn concurrency_for(asked: usize, jobs: usize, exits: usize) -> usize {
     if exits == 0 { width } else { width.min(exits) }
 }
 
-/// The full set to hand `set_outbound_nodes`: what the pool holds, plus up to
-/// `want` more off the (already shuffled) live list.
+/// Which nodes to borrow: up to `want` off the (already shuffled) live list.
 ///
-/// `held` comes first and is never dropped, because the call replaces the set
-/// rather than adding to it — leaving one out releases the slot of a node the
-/// re-fetch pool is on right now. A node the pool already holds is also already
-/// a listener, so asking for it again would spend one of the remaining slots on
-/// nothing.
-fn nodes_to_register(held: &[String], alive: Vec<String>, want: usize) -> Vec<String> {
-    let mut wanted = held.to_vec();
-    let mut taken = 0;
+/// Excludes what the pool already holds, on both counts — those are listeners
+/// already, so borrowing one would spend a slot on nothing, and the pool's own
+/// are kept by the lease rather than by this list.
+///
+/// The ceiling is on generated configuration, one listener and one group per
+/// node, so it counts the pool's against the same budget.
+fn nodes_to_borrow(held: &[String], alive: Vec<String>, want: usize) -> Vec<String> {
+    let ceiling = usize::from(crate::mihomo::MAX_OUTBOUNDS).saturating_sub(held.len());
+    let mut borrowed: Vec<String> = Vec::new();
     for node in alive {
-        if taken >= want || wanted.len() >= usize::from(crate::mihomo::MAX_OUTBOUNDS) {
+        if borrowed.len() >= want.min(ceiling) {
             break;
         }
-        if wanted.contains(&node) {
+        if held.contains(&node) || borrowed.contains(&node) {
             continue;
         }
-        wanted.push(node);
-        taken += 1;
+        borrowed.push(node);
     }
-    wanted
+    borrowed
 }
 
 /// Fisher-Yates, with a v4 UUID per swap as the randomness.
@@ -1369,44 +1374,34 @@ mod tests {
         assert_eq!(clamp(16, 100, 20), 16, "出口比并发多时不受影响");
     }
 
-    /// The set handed to mihomo has to keep the pool's nodes in it.
-    ///
-    /// `set_outbound_nodes` replaces the set rather than adding to it, so a
-    /// node left out of this list loses its listener — and the re-fetch
-    /// sessions on it move to the shared exit mid-run.
+    /// What a run borrows, and what it leaves alone.
     #[test]
-    fn leasing_exits_never_releases_the_pools_own() {
+    fn a_run_borrows_only_nodes_the_pool_is_not_already_on() {
         let held = vec!["日本 07".to_owned(), "香港 11".to_owned()];
         let alive = vec![
-            "香港 11".to_owned(), // already held — must not spend a slot
+            "香港 11".to_owned(), // already a listener — borrowing it wastes a slot
             "美国 03".to_owned(),
             "新加坡 02".to_owned(),
             "德国 01".to_owned(),
         ];
 
-        let wanted = nodes_to_register(&held, alive.clone(), 2);
         assert_eq!(
-            wanted,
-            vec![
-                "日本 07".to_owned(),
-                "香港 11".to_owned(),
-                "美国 03".to_owned(),
-                "新加坡 02".to_owned(),
-            ],
-            "池子的两个保住，另外要两个新的，已经持有的那个不重复要"
+            nodes_to_borrow(&held, alive.clone(), 2),
+            vec!["美国 03".to_owned(), "新加坡 02".to_owned()],
         );
 
         // Asking for more than there are leaves the list short rather than
-        // failing: three exits for four accounts still beats one.
-        assert_eq!(nodes_to_register(&held, alive.clone(), 99).len(), 5);
-        assert_eq!(nodes_to_register(&held, Vec::new(), 4), held);
+        // failing: two exits for four accounts still beats one.
+        assert_eq!(nodes_to_borrow(&held, alive.clone(), 99).len(), 3);
+        assert!(nodes_to_borrow(&held, Vec::new(), 4).is_empty());
 
-        // The ceiling is on the generated configuration, so it counts the
-        // pool's nodes too.
+        // The ceiling counts the pool's nodes: one listener and one group each,
+        // and the budget is on the generated configuration.
         let many: Vec<String> = (0..64).map(|index| format!("节点 {index:02}")).collect();
-        let wanted = nodes_to_register(&held, many, 64);
-        assert_eq!(wanted.len(), usize::from(crate::mihomo::MAX_OUTBOUNDS));
-        assert!(wanted.starts_with(&held), "满了也不能挤掉池子的");
+        assert_eq!(
+            nodes_to_borrow(&held, many, 64).len(),
+            usize::from(crate::mihomo::MAX_OUTBOUNDS) - held.len(),
+        );
     }
 
     /// Shuffled, or a batch narrower than the node list always leaves from the
