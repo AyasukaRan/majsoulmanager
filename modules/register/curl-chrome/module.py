@@ -68,17 +68,18 @@ from curl_cffi.const import CurlHttpVersion
 PROTOCOL_VERSION = 1
 IMPERSONATE = "chrome142"          # 133a~142 的 JA4 一致; 更早的第三段不同
 
-# ---- 版本/环境常量 (随雀魂更新变化; 失效时对照最新客户端抓包更新) ----
-CLIENT_VERSION = "4.0.45"
-RES_VERSION = "0.16.257"                    # 不匹配则所有认证请求返回 151
+# ---- 版本/环境常量 (随雀魂更新变化) ----
+# 这两个是兜底。管理台每次调用都会把它自己探到的当前值放进 params 传下来 ——
+# 服务端校验的是版本串的【下限】(容差约 3 个 patch), 钉死的常量写下几周后必然
+# 整批 151, 所以真正跟着雀魂走的是传进来的那个, 这里的只管单跑模块时有个值用。
+DEFAULT_CLIENT_VERSION = "4.0.46"           # 包版本; 服务端不校验, 但真客户端会报
+DEFAULT_RES_VERSION = "0.16.265"            # 代码版本; 太旧则所有认证请求返回 151
+CLIENT_VERSION = DEFAULT_CLIENT_VERSION
+RES_VERSION = DEFAULT_RES_VERSION
 VERSION_STR = f"WebGL_2022-{RES_VERSION}"
 REGION = "cn"
 ORIGIN = "https://game.maj-soul.com"
 SIGN_UP_CODE_URL = "https://common-202411.maj-soul.com/api/user/sign_up_code"
-ROUTES_URL = (
-    "https://route-2.maj-soul.com/api/clientgate/routes"
-    f"?platform=Web&version={CLIENT_VERSION}&lang=chs_t"
-)
 CODE_API = "https://query.paopaodw.com/api/GetLastEmails"
 # 自建 Cloud Mail 的开放 API (https://doc.skymail.ink/api/api-doc)。base_url 由调用
 # 方给, 这里只有路径。websiteConfig 不在开放 API 里, 但它不需要鉴权, 而且是唯一能问
@@ -385,8 +386,14 @@ async def send_signup_code(session, email: str, p: dict, proxy: str | None):
     return r.status_code, r.text
 
 
+def routes_url() -> str:
+    # 函数而不是常量: 版本号由每次调用从 params 定, 常量会停在导入那一刻的值。
+    return ("https://route-2.maj-soul.com/api/clientgate/routes"
+            f"?platform=Web&version={CLIENT_VERSION}&lang=chs_t")
+
+
 async def fetch_gateways(session, p: dict, proxy: str | None) -> list[str]:
-    r = await session.get(ROUTES_URL, headers=headers_for(p), **_no_proxy({"proxy": proxy}))
+    r = await session.get(routes_url(), headers=headers_for(p), **_no_proxy({"proxy": proxy}))
     routes = json.loads(r.text).get("data", {}).get("routes", [])
     return [f"wss://{rt['domain']}/gateway" for rt in routes if rt.get("domain")]
 
@@ -770,7 +777,8 @@ async def signup_flow(call, route_name: str, gw: str, *, email: str, password_ha
             await call(".lq.Lobby.signup", enc_signup(email, password_hash, code, device))
         )
         if err != 0:
-            # 151 = ERR_CLIENT_VERSION: RES_VERSION 过旧, 抓包对照更新
+            # 151 = ERR_CLIENT_VERSION: 版本串过旧。管理台传的 client_version 跟着
+            # 采集那条路探到的下限走; 单跑模块时是文件头的 DEFAULT_RES_VERSION。
             return {"ok": False, "stage": "signup", "error": f"{err} {ename}".strip()}
         out = {"ok": True, "account_id": None, "nickname": None}
 
@@ -919,6 +927,19 @@ async def open_mailbox(session, params: dict, p: dict, proxy: str | None,
         session, credential, p, since, tries, interval)
 
 
+def apply_versions(params: dict) -> None:
+    """把这次调用要报的版本号装上。
+
+    改全局而不是层层传参: 版本号有六个消费点 (signup.f6 · login.f6/f11 · 遥测两项 ·
+    routes URL), 传参要穿过 over_websocket/signup_flow 整条链。之所以安全 ——
+    管理台给每个账号起一个独立的模块进程, 一个进程只发一次 register; 就算复用,
+    每次调用也都从自己的 params 重新推导, 不会串上一次的值。"""
+    global CLIENT_VERSION, RES_VERSION, VERSION_STR
+    RES_VERSION = (params.get("client_version") or "").strip() or DEFAULT_RES_VERSION
+    CLIENT_VERSION = (params.get("package_version") or "").strip() or DEFAULT_CLIENT_VERSION
+    VERSION_STR = f"WebGL_2022-{RES_VERSION}"
+
+
 async def register(params: dict) -> dict:
     """注册一个账号。
 
@@ -930,6 +951,7 @@ async def register(params: dict) -> dict:
     tries = int(params.get("poll_tries") or 40)
     interval = float(params.get("poll_interval") or 3.0)
     mimic = params.get("mimic", True)
+    apply_versions(params)
 
     # 一个号一台机器: 发码/网关/WS/遥测全程共用这一套硬件信息。
     p = pick_persona()
@@ -964,6 +986,8 @@ async def register(params: dict) -> dict:
         result = await over_websocket(session, address, pwd_hash(password), code, gateways,
                                       p, nickname, proxy, mimic)
     result["email"] = address
+    # 报回实际用的版本串: 151 时这是唯一能分清"传下来的值也旧了"和"根本没传下来"的东西。
+    result["client_version"] = VERSION_STR
     if result.get("ok"):
         result["password"] = password
     return result
@@ -1006,5 +1030,31 @@ async def main() -> None:
         sys.stdout.flush()
 
 
+def _selftest() -> None:
+    """不联网的自检。
+
+    只钉版本号这一处: 填错了不会报错, 只会让整批停在 151, 而六个消费点里漏掉任何
+    一个都长得像"版本没跟上"。"""
+    apply_versions({"client_version": "0.17.3", "package_version": "4.1.0"})
+    assert VERSION_STR == "WebGL_2022-0.17.3", VERSION_STR
+    assert "version=4.1.0" in routes_url(), routes_url()
+    assert f_str(6, VERSION_STR) in enc_signup("a@b.c", "h", "1234", b""), "signup.f6"
+    login = enc_login("a@b.c", "h", b"", "dev")
+    assert f_str(11, VERSION_STR) in login, "login.f11"
+    assert f_str(1, "0.17.3") + f_str(2, "4.1.0") in login, "login.f6"
+    telemetry = telemetry_params(pick_persona(), 1, "d", "wss://x/gateway")
+    assert (telemetry["res_version"], telemetry["client_version"]) == ("0.17.3", "4.1.0")
+
+    # 空串和缺失都回落到兜底 —— 发一个空版本串是必然的 151, 而且看起来像别的毛病。
+    for params in ({"client_version": "  ", "package_version": None}, {}):
+        apply_versions(params)
+        assert VERSION_STR == f"WebGL_2022-{DEFAULT_RES_VERSION}", VERSION_STR
+        assert CLIENT_VERSION == DEFAULT_CLIENT_VERSION
+    print("selftest OK")
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    if "--selftest" in sys.argv:
+        _selftest()
+    else:
+        asyncio.run(main())

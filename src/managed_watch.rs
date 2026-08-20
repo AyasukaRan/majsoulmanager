@@ -164,13 +164,9 @@ pub(crate) async fn run(
     // each other's lookups.
     let cache_dir = dependencies.data_dir.join("watch/cache");
     // A previously discovered floor, so a restart does not pay for the search
-    // again. Ignored when it is below the pinned default, which a code update
-    // may have moved past it.
-    if instance.client_version.is_none()
-        && let Some(stored) = load_client_version(&cache_dir)
-        && parse_version(&stored) > parse_version(CN_CODE_VERSION)
-    {
-        instance.client_version = Some(stored);
+    // again.
+    if instance.client_version.is_none() {
+        instance.client_version = adopted_client_version(&cache_dir);
     }
     let (tracked_state, pending_state) = load_state(&state_path)?;
     let mut tracked = tracked_state
@@ -503,6 +499,30 @@ fn load_client_version(cache_dir: &Path) -> Option<String> {
     let stored = std::fs::read_to_string(client_version_path(cache_dir)).ok()?;
     let stored = stored.trim().to_string();
     parse_version(&stored).map(|_| stored)
+}
+
+/// A discovered floor worth using over the pinned default, if there is one.
+///
+/// A stored floor below the default is stale rather than useful: a code update
+/// may have moved the pin past what the last search found.
+pub(crate) fn adopted_client_version(cache_dir: &Path) -> Option<String> {
+    load_client_version(cache_dir)
+        .filter(|stored| parse_version(stored) > parse_version(CN_CODE_VERSION))
+}
+
+/// The `(code, package)` versions to report right now.
+///
+/// Both are maintained by the paths that log in: the code version is the floor
+/// [`discover_version_floor`] searched out after a 151, and the package version
+/// is what [`discover_package_version`] read off the game's index page. Callers
+/// that cannot discover either for themselves — registration has no account to
+/// log in with yet — read what those paths already learned.
+pub(crate) fn current_client_versions(cache_dir: &Path) -> (String, String) {
+    (
+        adopted_client_version(cache_dir).unwrap_or_else(|| CN_CODE_VERSION.to_owned()),
+        crate::majsoul::gateway::cached_package_version(cache_dir)
+            .unwrap_or_else(|| CN_PACKAGE_VERSION.to_owned()),
+    )
 }
 
 fn store_client_version(cache_dir: &Path, version: &str) {
@@ -1529,6 +1549,35 @@ mod tests {
         assert_eq!(parse_version("0.16.257.w"), None);
         assert_eq!(parse_version("1.0.0"), None);
         assert_eq!(parse_version("WebGL_2022-0.16.257"), None);
+    }
+
+    #[test]
+    fn reads_back_a_discovered_floor_but_never_a_stale_one() {
+        let dir = std::env::temp_dir().join(format!("mjai-ver-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Nothing discovered yet: the pinned pair, so a fresh deployment still
+        // reports something a client would.
+        assert_eq!(
+            current_client_versions(&dir),
+            (CN_CODE_VERSION.to_owned(), CN_PACKAGE_VERSION.to_owned())
+        );
+
+        // A floor found after Majsoul raised its own. This is the case that
+        // matters: the pin is what fails a batch with 151, and the search that
+        // fixed it ran on another path entirely.
+        let raised = format_version(parse_version(CN_CODE_VERSION).unwrap() + 8);
+        store_client_version(&dir, &raised);
+        std::fs::write(dir.join("package_version"), "4.0.99\n").unwrap();
+        assert_eq!(current_client_versions(&dir), (raised, "4.0.99".to_owned()));
+
+        // Below the pin: a code update moved past what the last search found,
+        // so the stored value is history rather than an answer.
+        store_client_version(&dir, "0.1.0");
+        assert_eq!(adopted_client_version(&dir), None);
+        assert_eq!(current_client_versions(&dir).0, CN_CODE_VERSION);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
