@@ -192,6 +192,13 @@ pub struct Config {
     /// The durable replacement for the old in-memory pending-row cap. Ingest is
     /// refused past this backlog so the topic cannot outgrow its retention and
     /// silently drop records that were already acknowledged as accepted.
+    ///
+    /// **Per partition**, like `retention_bytes` and for the same reason: a
+    /// pack worker commits its offset when it seals, so each partition sits one
+    /// pack cycle behind as a matter of course, and eight of them sit eight
+    /// times as far behind while every one of them is caught up. Read as a
+    /// topic-wide total it turned into a throttle on a healthy pipeline —
+    /// 26,000 of normal backlog against a 25,000 ceiling.
     #[arg(long, env = "MJAI_KAFKA_MAX_LAG", default_value_t = 50_000)]
     pub kafka_max_lag: i64,
 
@@ -215,7 +222,17 @@ pub struct Config {
     /// `indexed_pack_keys` scale with the number of packs. Raise it if
     /// that starts to cost more than the visibility is worth; past that point
     /// the honest fix is compacting small packs, not waiting longer.
-    #[arg(long, env = "MJAI_PACK_IDLE_SECS", default_value_t = 30)]
+    ///
+    /// Which is where thirty seconds got to. "Under load the worker is never
+    /// caught up" stopped being true when the topic went to eight partitions:
+    /// each worker sees an eighth of the flow and reaches the end of its own
+    /// partition constantly, so the idle rule decided almost every seal.
+    /// Measured at 670 records a second — 56 packs in five minutes, 48MB each
+    /// against a 256MB target, sixteen thousand objects a day where the size
+    /// rule would have made three thousand. Two minutes is still a bounded wait
+    /// for a record to become readable, and lets a pack reach about 135MB at
+    /// that rate.
+    #[arg(long, env = "MJAI_PACK_IDLE_SECS", default_value_t = 120)]
     pub pack_idle_secs: u64,
 
     /// An object younger than this is never collected, however orphaned it
