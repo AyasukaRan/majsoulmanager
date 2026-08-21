@@ -427,9 +427,22 @@ export type RefetchStatus = {
  */
 export type RefetchNodeStatus = {
   node: string;
+  /** Bound to it in the pool document. */
   accounts: number;
+  /**
+   * Logged in through it right now, which is what produced the counters below.
+   * Under `accounts` for a minute after a move, because a session resolves its
+   * exit at login and keeps it until it ends.
+   */
+  sessions: number;
   fetched: number;
   failed: number;
+  /**
+   * Average round trip for one record through this exit. The number that
+   * separates "this exit is slow" from "Mahjong Soul is slow": if they all read
+   * the same, the exits are not what is holding the pool back.
+   */
+  took_ms: number;
 };
 
 /**
