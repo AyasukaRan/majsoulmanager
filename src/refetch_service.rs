@@ -17,7 +17,7 @@
 //! collector with spare time keeps answering them for free.
 
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -123,6 +123,145 @@ fn in_flight_for(workers: usize, request_delay_ms: u64) -> usize {
 
 /// How long a worker waits before logging in again after a session ended.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+
+/// How often the pool re-weighs its accounts against the exits they go out
+/// through. Long enough that a round is a measurement rather than a sample —
+/// at the live rate it is a hundred thousand records over a hundred-odd nodes —
+/// and short enough that a subscription's bad evening is not the whole night.
+const BALANCE_INTERVAL: Duration = Duration::from_secs(300);
+
+/// The fewest accounts a bound node keeps.
+///
+/// One, and never zero, for two separate reasons. A node with no accounts
+/// fetches nothing, so it is never measured again and can never come back —
+/// the balancer would be a ratchet. And dropping the last account off a node
+/// takes it out of `refetch_nodes`, which changes the set mihomo has listeners
+/// for, which is a configuration reload, which drops every session in the pool.
+/// Holding the set still is what makes rebalancing free.
+const MIN_PER_NODE: usize = 1;
+
+/// At most a twentieth of the pool changes exit in one round. The measurement
+/// that decided the move is five minutes old and the sessions that act on it
+/// reconnect over the following minute or two; moving everything at once would
+/// be steering by a photograph.
+const MOVE_SHARE: usize = 20;
+
+/// How far above an even share one node may be loaded.
+///
+/// This is not a performance limit — the balancer's own rule would happily put
+/// two hundred accounts behind the one exit that is fastest, and by throughput
+/// alone it would be right. It is a ban limit. Every account behind one node
+/// shares its address, Mahjong Soul sees them as one client, and the thing this
+/// deployment has already been banned for once was a pattern on the login path.
+const MAX_NODE_SHARE: usize = 4;
+
+/// How far from the middle an exit has to be before its accounts move.
+///
+/// Without a band the rule never rests. The two exits either side of the middle
+/// are what define the median, so one of them is always a fraction below it and
+/// one a fraction above, and the pool would shuffle accounts every round to
+/// chase a difference that is noise. A move costs the account a re-login, so
+/// this is what makes "settled" a state the pool can be in rather than a speed
+/// it slows to.
+const BALANCE_BAND: f64 = 0.25;
+
+/// What one exit did for the pool over a balancing round.
+#[derive(Clone, Copy, Default, Debug, serde::Serialize)]
+pub struct NodeTally {
+    /// Records this node's accounts brought back.
+    pub fetched: u64,
+    /// Requests that came back an error — a refusal, a dropped session, a
+    /// handshake that never completed. Reported but not weighed: a node whose
+    /// sessions keep dying already scores badly on `fetched`, and counting the
+    /// failure twice would take accounts off a node that is merely being
+    /// offered games Mahjong Soul no longer serves.
+    pub failed: u64,
+}
+
+/// Which accounts should change exit, given what each exit just produced.
+///
+/// The rule is one line: **take from the exits producing less per account than
+/// the median, give to the exits producing more.** Repeated every round it
+/// settles where every node produces the same per account, which is where the
+/// pool as a whole produces the most — a node that has been given accounts
+/// until it slows down stops being a receiver, and one that has been emptied to
+/// a single account is measured again on the next round and comes back if it
+/// deserves to.
+///
+/// It is average product per account, not marginal. Equalising averages is not
+/// exactly equalising marginals, and where the two differ this converges
+/// slightly early — the honest description is "moves in the right direction and
+/// stops", not "finds the optimum".
+///
+/// What it replaces is `nodes[index % nodes.len()]`: a hundred and twenty-nine
+/// exits, an even twelve accounts each, and a measured spread of six and a half
+/// times between the fastest quarter and the rest — with a quarter of the pool
+/// sitting on exits two to six seconds away from Mahjong Soul, holding accounts
+/// that fetched almost nothing. That is why adding accounts stopped moving the
+/// rate: they were added evenly, which means most of them were added to exits
+/// that could not use them.
+fn rebalance(
+    bindings: &[(String, String)],
+    tally: &HashMap<String, NodeTally>,
+    cap: usize,
+) -> Vec<(String, String)> {
+    let mut holders: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (username, node) in bindings {
+        holders
+            .entry(node.as_str())
+            .or_default()
+            .push(username.as_str());
+    }
+    if holders.len() < 2 {
+        return Vec::new();
+    }
+    // Best first, and by name within a tie so the answer does not depend on how
+    // a `HashMap` happened to order itself.
+    let mut ranked: Vec<(&str, usize, f64)> = holders
+        .iter()
+        .map(|(node, held)| {
+            let fetched = tally.get(*node).map_or(0, |tally| tally.fetched) as f64;
+            (*node, held.len(), fetched / held.len() as f64)
+        })
+        .collect();
+    ranked.sort_by(|left, right| right.2.total_cmp(&left.2).then(left.0.cmp(right.0)));
+    // A real median, both middles averaged when there is an even number of
+    // them: taking one side of the pair makes the rule degenerate at two nodes,
+    // where the lower middle *is* the worse node and nothing is ever below it.
+    let middle = ranked.len() / 2;
+    let median = match ranked.len() % 2 {
+        0 => (ranked[middle - 1].2 + ranked[middle].2) / 2.0,
+        _ => ranked[middle].2,
+    };
+    let (poor, rich) = (median * (1.0 - BALANCE_BAND), median * (1.0 + BALANCE_BAND));
+    let budget = (bindings.len() / MOVE_SHARE).max(1);
+
+    // Freed from the worst exits, worst first, never taking one below the floor.
+    let mut spare: Vec<&str> = Vec::new();
+    for (node, held, produced) in ranked.iter().rev() {
+        if spare.len() >= budget || *produced >= poor {
+            break;
+        }
+        let give = held.saturating_sub(MIN_PER_NODE).min(budget - spare.len());
+        spare.extend(holders[node].iter().rev().take(give).copied());
+    }
+
+    // Handed to the best, best first, none of them past the cap.
+    let mut spare = spare.into_iter();
+    let mut moves = Vec::new();
+    for (node, held, produced) in &ranked {
+        if *produced <= rich {
+            break;
+        }
+        for _ in 0..cap.saturating_sub(*held) {
+            let Some(username) = spare.next() else {
+                return moves;
+            };
+            moves.push((username.to_owned(), (*node).to_owned()));
+        }
+    }
+    moves
+}
 
 /// How long the walk waits before looking at the packing backlog again.
 ///
@@ -453,6 +592,21 @@ pub struct RefetchRuntimeStatus {
     /// The most recent rejections, newest first. Bounded — a display buffer,
     /// not a record of what happened; the service log has that.
     pub failures: Vec<RefetchFailure>,
+    /// What each exit has produced since the last balancing round, busiest
+    /// first. This is what the balancer decides on, so it is also the one way
+    /// to see whether it is deciding anything sensible: a pool that has settled
+    /// reads as similar numbers against dissimilar account counts.
+    pub nodes: Vec<RefetchNodeStatus>,
+}
+
+/// One exit's share of the pool, as the console shows it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RefetchNodeStatus {
+    pub node: String,
+    /// Accounts bound to it right now.
+    pub accounts: usize,
+    pub fetched: u64,
+    pub failed: u64,
 }
 
 impl Default for RefetchRuntimeStatus {
@@ -472,6 +626,7 @@ impl Default for RefetchRuntimeStatus {
             progress: RefetchProgress::default(),
             qps: 0.0,
             failures: Vec::new(),
+            nodes: Vec::new(),
         }
     }
 }
@@ -502,6 +657,10 @@ pub struct RefetchSupervisor {
     rate: RwLock<RateWindow>,
     failures: RwLock<std::collections::VecDeque<RefetchFailure>>,
     sessions: AtomicUsize,
+    /// What each exit has produced since the last balancing round, and what the
+    /// console reports per node. Cleared by the balancer, which is the only
+    /// reader that takes anything out of it.
+    node_tally: RwLock<HashMap<String, NodeTally>>,
     /// Whether the walk is currently standing aside for the pack worker. Only
     /// so that the two transitions are logged once each: every request in the
     /// air meets the gate together, and a line per request is 16,000 of them in
@@ -515,6 +674,7 @@ pub struct RefetchSupervisor {
     /// to fetch is an account sitting online for no reason.
     sessions_tasks: Mutex<Vec<JoinHandle<()>>>,
     walk_task: Mutex<Option<JoinHandle<()>>>,
+    balance_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl RefetchSupervisor {
@@ -552,11 +712,13 @@ impl RefetchSupervisor {
             rate: RwLock::new(RateWindow::default()),
             failures: RwLock::new(std::collections::VecDeque::new()),
             sessions: AtomicUsize::new(0),
+            node_tally: RwLock::new(HashMap::new()),
             throttled: AtomicBool::new(false),
             dependencies,
             generation: AtomicU64::new(0),
             sessions_tasks: Mutex::new(Vec::new()),
             walk_task: Mutex::new(None),
+            balance_task: Mutex::new(None),
         })
     }
 
@@ -582,7 +744,39 @@ impl RefetchSupervisor {
         status.progress = *self.progress.read();
         status.qps = self.rate.read().qps();
         status.failures = self.failures.read().iter().rev().cloned().collect();
+        status.nodes = self.node_status();
         status
+    }
+
+    /// Per-exit counters joined to the account bindings they are measured
+    /// against. Busiest first, because that is the end an operator reads: the
+    /// tail is nodes holding one account each, which is where the balancer puts
+    /// the ones that produce nothing.
+    fn node_status(&self) -> Vec<RefetchNodeStatus> {
+        let mut held: HashMap<String, usize> = HashMap::new();
+        for (_, node) in self.dependencies.accounts.refetch_bindings() {
+            *held.entry(node).or_default() += 1;
+        }
+        let tally = self.node_tally.read();
+        let mut nodes: Vec<RefetchNodeStatus> = held
+            .into_iter()
+            .map(|(node, accounts)| {
+                let counted = tally.get(&node).copied().unwrap_or_default();
+                RefetchNodeStatus {
+                    node,
+                    accounts,
+                    fetched: counted.fetched,
+                    failed: counted.failed,
+                }
+            })
+            .collect();
+        nodes.sort_by(|left, right| {
+            right
+                .fetched
+                .cmp(&left.fetched)
+                .then(left.node.cmp(&right.node))
+        });
+        nodes
     }
 
     pub async fn update_config(
@@ -830,14 +1024,18 @@ impl RefetchSupervisor {
         for (index, (username, password)) in accounts.into_iter().take(workers).enumerate() {
             let supervisor = Arc::clone(self);
             let config = config.clone();
-            let proxy = self.account_proxy(&config, &username, proxy.as_deref());
+            let lane = proxy.clone();
             sessions.push(tokio::spawn(async move {
                 supervisor
-                    .run_worker(generation, config, index, username, password, proxy)
+                    .run_worker(generation, config, index, username, password, lane)
                     .await;
             }));
         }
         *self.sessions_tasks.lock().await = sessions;
+        let balancer = Arc::clone(self);
+        *self.balance_task.lock().await = Some(tokio::spawn(async move {
+            balancer.balance_forever(generation).await;
+        }));
         let supervisor = Arc::clone(self);
         let work = config.work;
         *self.walk_task.lock().await = Some(tokio::spawn(async move {
@@ -873,6 +1071,13 @@ impl RefetchSupervisor {
         if let Some(walk) = walk {
             walk.abort();
             let _ = walk.await;
+        }
+        // The balancer only ever writes the account pool, so aborting it
+        // mid-round loses at most one round's measurement.
+        let balance = self.balance_task.lock().await.take();
+        if let Some(balance) = balance {
+            balance.abort();
+            let _ = balance.await;
         }
         self.stop_sessions().await;
     }
@@ -970,6 +1175,62 @@ impl RefetchSupervisor {
         self.report(WatchLogLevel::Error, message.to_owned());
     }
 
+    /// Re-weighs the pool against its exits, for as long as this generation
+    /// lasts. See [`rebalance`] for the rule.
+    ///
+    /// Nothing here touches mihomo. Every bound node keeps at least one account
+    /// ([`MIN_PER_NODE`]), so the set of nodes never changes and the listeners
+    /// stay exactly as they are — a move is one field in the account pool, and
+    /// the session picks it up the next time it logs in, which for this pool is
+    /// minutes at most.
+    async fn balance_forever(self: Arc<Self>, generation: u64) {
+        loop {
+            tokio::time::sleep(BALANCE_INTERVAL).await;
+            if self.generation.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            let tally = std::mem::take(&mut *self.node_tally.write());
+            let bindings = self.dependencies.accounts.refetch_bindings();
+            let nodes = tally.len().max(1);
+            // Four times an even share, floored so that a pool smaller than its
+            // exits can still gather two or three accounts somewhere.
+            let cap = (bindings.len() * MAX_NODE_SHARE / nodes).max(MAX_NODE_SHARE);
+            let moves = rebalance(&bindings, &tally, cap);
+            if moves.is_empty() {
+                continue;
+            }
+            let landing = moves
+                .iter()
+                .map(|(_, node)| node.as_str())
+                .collect::<HashSet<_>>()
+                .len();
+            match self.dependencies.accounts.rebind_nodes(&moves) {
+                Ok(0) => {}
+                Ok(moved) => self.report(
+                    WatchLogLevel::Info,
+                    format!("按出口产出调整了 {moved} 个账号，挪到 {landing} 个更快的节点上"),
+                ),
+                Err(error) => self.report(
+                    WatchLogLevel::Warn,
+                    format!("按出口产出调整账号失败，这一轮跳过：{error}"),
+                ),
+            }
+        }
+    }
+
+    /// Counts one request against the exit that carried it.
+    fn record_node(&self, node: Option<&str>, fetched: bool) {
+        let Some(node) = node else {
+            return;
+        };
+        let mut tally = self.node_tally.write();
+        let entry = tally.entry(node.to_owned()).or_default();
+        match fetched {
+            true => entry.fetched += 1,
+            false => entry.failed += 1,
+        }
+    }
+
     /// One session, for as long as this generation lasts: log in, answer
     /// requests until the session ends, log in again.
     async fn run_worker(
@@ -979,7 +1240,9 @@ impl RefetchSupervisor {
         index: usize,
         username: String,
         password: String,
-        proxy: Option<String>,
+        // The pool's own exit. Which node this account actually goes out
+        // through is resolved per login, not here — see the loop.
+        lane: Option<String>,
     ) {
         let source = format!("{LOG_SOURCE}:{index}");
         // Shared with the collectors: the gateway, the package version and the
@@ -1024,6 +1287,14 @@ impl RefetchSupervisor {
                 );
                 return;
             }
+            // Re-read every login, for the same reason the collector list above
+            // is. This used to be resolved once, by the caller, and held for the
+            // life of the worker — so an account moved to another exit went on
+            // dialling the old one until the whole pool was restarted, and
+            // 「重新分配节点」 did nothing to a running pool but reload mihomo and
+            // drop every session. It is also what lets the balancer act at all.
+            let node = self.dependencies.accounts.node_for(&username);
+            let proxy = self.account_proxy(&config, &username, lane.as_deref());
             self.dependencies.logs.append(
                 WatchLogLevel::Info,
                 &source,
@@ -1064,6 +1335,7 @@ impl RefetchSupervisor {
                             pb_worker.as_ref(),
                             &negotiated,
                             &source,
+                            node.as_deref(),
                         )
                         .await;
                     self.sessions.fetch_sub(1, Ordering::Relaxed);
@@ -1162,6 +1434,10 @@ impl RefetchSupervisor {
         pb_worker: Option<&Arc<PluginWorker>>,
         client_version: &str,
         source: &str,
+        // The exit this session goes out through, which is what its requests
+        // are counted against. `None` when the account follows the shared lane:
+        // nothing there is attributable to one node.
+        node: Option<&str>,
     ) -> anyhow::Result<()> {
         loop {
             let Some(request) = self.dependencies.broker.claim() else {
@@ -1173,7 +1449,10 @@ impl RefetchSupervisor {
             // Stamped before the request, not after it: the pacing below is a
             // cadence, and a cadence is measured from one request to the next.
             let sent = tokio::time::Instant::now();
-            match fetch_game_record(transport, pb_worker, request.uuid(), client_version).await {
+            let fetched =
+                fetch_game_record(transport, pb_worker, request.uuid(), client_version).await;
+            self.record_node(node, fetched.is_ok());
+            match fetched {
                 Ok(raw) => request.answer(Ok(raw)),
                 Err(error) => {
                     // Answered before the session is torn down, so a waiter
@@ -3167,6 +3446,164 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn bindings(spread: &[(&str, usize)]) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for (node, count) in spread {
+            for index in 0..*count {
+                out.push((format!("{node}-{index}"), (*node).to_owned()));
+            }
+        }
+        out
+    }
+
+    fn tally(counts: &[(&str, u64)]) -> HashMap<String, NodeTally> {
+        counts
+            .iter()
+            .map(|(node, fetched)| {
+                (
+                    (*node).to_owned(),
+                    NodeTally {
+                        fetched: *fetched,
+                        failed: 0,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn holdings(bindings: &[(String, String)]) -> Vec<(String, usize)> {
+        let mut held: HashMap<String, usize> = HashMap::new();
+        for (_, node) in bindings {
+            *held.entry(node.clone()).or_default() += 1;
+        }
+        let mut held: Vec<(String, usize)> = held.into_iter().collect();
+        held.sort();
+        held
+    }
+
+    /// The pool moves accounts off the exits that produce least and onto the
+    /// ones that produce most, and stops when they all produce the same.
+    #[test]
+    fn accounts_move_toward_the_exits_that_use_them() {
+        // Two hundred accounts, evenly spread, and one exit doing four times
+        // what the others manage per account.
+        let mut spread = bindings(&[("fast", 50), ("ok", 50), ("slow", 50), ("dead", 50)]);
+        let counts = tally(&[("fast", 4_000), ("ok", 1_000), ("slow", 1_000), ("dead", 0)]);
+        let moves = rebalance(&spread, &counts, 200);
+        assert!(
+            !moves.is_empty(),
+            "an obvious imbalance has to move something"
+        );
+        // Bounded: a round is one twentieth of the pool at most.
+        assert!(
+            moves.len() <= spread.len() / MOVE_SHARE + 1,
+            "{}",
+            moves.len()
+        );
+        // Off the worst, onto the best. `dead` produced nothing, `fast` most.
+        assert!(moves.iter().all(|(_, node)| node == "fast"));
+        let from: HashSet<&str> = moves
+            .iter()
+            .map(|(username, _)| username.split('-').next().unwrap())
+            .collect();
+        assert_eq!(from, HashSet::from(["dead"]));
+
+        // Applied and repeated, it keeps going in the same direction rather
+        // than oscillating: `dead` drains, `fast` fills.
+        for (username, node) in &moves {
+            let held = spread
+                .iter_mut()
+                .find(|(name, _)| name == username)
+                .unwrap();
+            held.1 = node.clone();
+        }
+        let again = rebalance(&spread, &counts, 200);
+        assert!(again.iter().all(|(_, node)| node == "fast"));
+    }
+
+    /// Two things the rule must never do, because both of them are one-way.
+    #[test]
+    fn the_balancer_never_empties_an_exit_or_piles_onto_one() {
+        // A node at the floor is not drained further: it would stop being
+        // measured, and losing the last account changes the node set, which is
+        // a mihomo reload and a pool-wide disconnect.
+        let spread = bindings(&[("fast", 40), ("dead", 1)]);
+        let counts = tally(&[("fast", 4_000), ("dead", 0)]);
+        assert!(rebalance(&spread, &counts, 200).is_empty());
+
+        // And the cap holds even when the fast exit is the only sensible
+        // destination — it is a ban limit, not a throughput one.
+        let spread = bindings(&[("fast", 20), ("slow", 60)]);
+        let counts = tally(&[("fast", 4_000), ("slow", 60)]);
+        let moves = rebalance(&spread, &counts, 22);
+        assert_eq!(moves.len(), 2, "only two seats left under the cap");
+
+        // Nothing to compare against is nothing to decide.
+        assert!(rebalance(&bindings(&[("only", 30)]), &tally(&[("only", 9)]), 40).is_empty());
+    }
+
+    /// Where it ends up, which is the whole point: run the loop until it stops
+    /// moving and check that it stopped somewhere better than it started.
+    #[test]
+    fn the_spread_settles_where_every_exit_produces_the_same() {
+        // Four exits with real capacity limits: each returns what its accounts
+        // can pull, up to its own ceiling. `dead` can do nothing at all.
+        let capacity = HashMap::from([
+            ("fast", 800.0),
+            ("ok", 400.0),
+            ("slow", 80.0),
+            ("dead", 0.0),
+        ]);
+        let per_account = 20.0;
+        let produced = |spread: &[(String, String)]| -> (HashMap<String, NodeTally>, f64) {
+            let mut counts = HashMap::new();
+            let mut total = 0.0;
+            for (node, held) in holdings(spread) {
+                let ceiling = capacity[node.as_str()];
+                let fetched = (held as f64 * per_account).min(ceiling);
+                total += fetched;
+                counts.insert(
+                    node,
+                    NodeTally {
+                        fetched: fetched as u64,
+                        failed: 0,
+                    },
+                );
+            }
+            (counts, total)
+        };
+
+        let mut spread = bindings(&[("fast", 25), ("ok", 25), ("slow", 25), ("dead", 25)]);
+        let (_, before) = produced(&spread);
+        let mut rounds = 0;
+        loop {
+            let (counts, _) = produced(&spread);
+            let moves = rebalance(&spread, &counts, 100);
+            if moves.is_empty() || rounds > 200 {
+                break;
+            }
+            for (username, node) in &moves {
+                let held = spread
+                    .iter_mut()
+                    .find(|(name, _)| name == username)
+                    .unwrap();
+                held.1 = node.clone();
+            }
+            rounds += 1;
+        }
+        let (_, after) = produced(&spread);
+        assert!(rounds <= 200, "it has to stop moving, not just slow down");
+        assert!(
+            after > before,
+            "settled at {after} records against {before} to start with"
+        );
+        // The dead exit is down to the floor and the fast one is carrying the
+        // accounts that were wasted on it.
+        let held: HashMap<String, usize> = holdings(&spread).into_iter().collect();
+        assert_eq!(held["dead"], MIN_PER_NODE);
+        assert!(held["fast"] > held["slow"], "{held:?}");
     }
 
     /// The meter has to be able to report a rate faster than itself.

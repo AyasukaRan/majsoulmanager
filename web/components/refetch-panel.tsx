@@ -229,6 +229,36 @@ function RefetchStatusCard({
             </div>
           ))}
         </div>
+        {/* What the balancer is looking at. Worth showing rather than trusting:
+            it moves accounts between exits on its own every five minutes, and
+            the only way to tell a working spread from a broken one is that the
+            per-account column is flat while the account column is not. */}
+        {(status?.nodes ?? []).length < 2 ? null : (
+          <details className="rounded-lg border bg-muted/25 px-3 py-2">
+            <summary className="cursor-pointer text-xs text-muted-foreground">
+              出口 {status!.nodes.length} 个 ——{" "}
+              {"账号按每个出口的产出自动调整，慢的会被挪走，每个出口至少留一个"}
+            </summary>
+            <div className="mt-2 max-h-64 space-y-1 overflow-y-auto text-xs">
+              {status!.nodes.map((node) => (
+                <div
+                  key={node.node}
+                  className="flex items-baseline justify-between gap-3 border-b pb-1 last:border-0"
+                >
+                  <span className="min-w-0 truncate">{node.node}</span>
+                  <span className="shrink-0 font-mono tabular-nums text-muted-foreground">
+                    {node.accounts} 号 · {count(node.fetched)} 条 ·{" "}
+                    <span className="font-semibold text-foreground">
+                      {(node.fetched / Math.max(node.accounts, 1)).toFixed(1)}
+                    </span>{" "}
+                    条/号
+                    {node.failed > 0 ? ` · 失败 ${count(node.failed)}` : ""}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </details>
+        )}
         {breakdown.length === 0 ? null : (
           <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
             <span>无法替换的原因：</span>
