@@ -246,14 +246,28 @@ fn rebalance(
         spare.extend(holders[node].iter().rev().take(give).copied());
     }
 
-    // Handed to the best, best first, none of them past the cap.
+    // Handed to the best, best first, none of them past the cap and none of
+    // them more than doubling.
+    //
+    // Doubling is what makes a per-account rate safe to act on. It is a mean,
+    // and a mean says nothing about how many samples are behind it: a node
+    // drained to its floor has exactly one account, so one lucky run puts it
+    // above every seven-account node in the pool and the next round hands it
+    // twenty-eight. That is not a thought experiment — it is what the live pool
+    // did within two rounds, 29 accounts each on two exits producing 5.2 and
+    // 2.4 records per account against a median of 18.
+    //
+    // Growing by at most what a node already holds re-measures it at every step
+    // with twice the sample: 1, 2, 4, 8. Five rounds to fill an exit that
+    // deserves filling, and a bad guess costs what the node was already worth
+    // rather than a fifth of the pool.
     let mut spare = spare.into_iter();
     let mut moves = Vec::new();
     for (node, held, produced) in &ranked {
         if *produced <= rich {
             break;
         }
-        for _ in 0..cap.saturating_sub(*held) {
+        for _ in 0..cap.saturating_sub(*held).min(*held) {
             let Some(username) = spare.next() else {
                 return moves;
             };
@@ -3542,6 +3556,26 @@ mod tests {
 
         // Nothing to compare against is nothing to decide.
         assert!(rebalance(&bindings(&[("only", 30)]), &tally(&[("only", 9)]), 40).is_empty());
+    }
+
+    /// A per-account rate is a mean, and a mean carries no sample size.
+    ///
+    /// The live pool found this within two rounds of the balancer being turned
+    /// on: two exits drained to the floor had their one remaining account have a
+    /// good five minutes, which put them above every seven-account node, and the
+    /// next round handed each of them twenty-nine — 58 accounts onto exits that
+    /// then produced 5.2 and 2.4 records per account against a median of 18.
+    #[test]
+    fn a_lucky_single_account_does_not_win_the_pool() {
+        // `lucky` sits at the floor with a rate no seven-account node can match.
+        let spread = bindings(&[("lucky", 1), ("good", 60), ("ok", 60), ("dead", 60)]);
+        let counts = tally(&[("lucky", 200), ("good", 4_920), ("ok", 4_280), ("dead", 0)]);
+        let moves = rebalance(&spread, &counts, 28);
+        // Nine were free to move and the cap was twenty-eight away. It gets one:
+        // what it already holds, which is what re-measures it with twice the
+        // sample rather than betting a twentieth of the pool on one account.
+        assert_eq!(moves.len(), 1, "{moves:?}");
+        assert_eq!(moves[0].1, "lucky");
     }
 
     /// Where it ends up, which is the whole point: run the loop until it stops
