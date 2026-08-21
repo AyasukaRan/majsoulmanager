@@ -3,7 +3,15 @@
 # The overlay is what publishes the infrastructure ports on 127.0.0.1; the base
 # file alone keeps them inside the Compose network, which is right for a
 # deployment and useless for anything running on the host.
-DEV_COMPOSE = docker compose -f docker-compose.yml -f docker-compose.dev.yml
+#
+# The broker is sized down here for the same reason the ports are moved: a CI
+# runner is four cores and sixteen gigabytes for the entire job, and Seastar
+# takes its `--memory` up front, so the deployment's eight would either refuse
+# to start or leave nothing for the compiler. The suite produces a handful of
+# records into one topic; one core and a gigabyte is the quickstart's own size
+# and more than covers it. The deployment's numbers stay in docker-compose.yml,
+# where they are read by anything that does not go through this file.
+DEV_COMPOSE = MJAI_REDPANDA_CORES=1 MJAI_REDPANDA_MEMORY=1G docker compose -f docker-compose.yml -f docker-compose.dev.yml
 
 install:
 	cargo fetch
