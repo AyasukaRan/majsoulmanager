@@ -126,9 +126,16 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
 /// How often the pool re-weighs its accounts against the exits they go out
 /// through. Long enough that a round is a measurement rather than a sample —
-/// at the live rate it is a hundred thousand records over a hundred-odd nodes —
-/// and short enough that a subscription's bad evening is not the whole night.
-const BALANCE_INTERVAL: Duration = Duration::from_secs(300);
+/// at the live rate it is two hundred thousand records over a hundred-odd
+/// nodes — and short enough that a subscription's bad evening is not the whole
+/// night.
+///
+/// Three minutes rather than five because a round is also a step of the
+/// convergence, and the first convergence is long: from an even spread it takes
+/// a node five rounds to grow from the floor to the cap, and the pool nine to
+/// move everything that should move. Five minutes made that two hours of the
+/// pool running at a fraction of what it settles at.
+const BALANCE_INTERVAL: Duration = Duration::from_secs(180);
 
 /// The fewest accounts a bound node keeps.
 ///
@@ -140,11 +147,17 @@ const BALANCE_INTERVAL: Duration = Duration::from_secs(300);
 /// Holding the set still is what makes rebalancing free.
 const MIN_PER_NODE: usize = 1;
 
-/// At most a twentieth of the pool changes exit in one round. The measurement
-/// that decided the move is five minutes old and the sessions that act on it
-/// reconnect over the following minute or two; moving everything at once would
-/// be steering by a photograph.
-const MOVE_SHARE: usize = 20;
+/// At most an eighth of the pool changes exit in one round. The measurement that
+/// decided the move is a round old and the sessions that act on it pick the new
+/// exit up on their next login, so moving everything at once would be steering
+/// by a photograph.
+///
+/// A move costs nothing by itself, which is what makes an eighth safe: the node
+/// is re-read per login rather than held for the life of the worker, so a
+/// re-pointed account keeps using its old exit until its session ends on its
+/// own — about a minute here — and no extra login is spent on it. What bounds
+/// this is the measurement being stale, not the moving being expensive.
+const MOVE_SHARE: usize = 8;
 
 /// How far above an even share one node may be loaded.
 ///
