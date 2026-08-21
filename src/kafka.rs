@@ -390,9 +390,49 @@ impl Kafka {
             Err(error) => return Err(error),
         }
 
-        // `Error` rather than `Retry`: the topic was just ensured, so a
-        // partition that is still unknown means the configuration and the
-        // cluster disagree, and retrying that only hides it.
+        // How many partitions the topic actually has, which is not always how
+        // many the configuration asks for. `CreateTopics` is the only topic call
+        // rskafka implements — there is no `CreatePartitions` — so a topic that
+        // already exists cannot be widened from here, and both directions of the
+        // disagreement are worth more than an assumption:
+        //
+        //   fewer live than configured — raising `MJAI_KAFKA_PARTITIONS` on a
+        //     deployment that already has a topic. Connecting a partition that
+        //     does not exist fails, so the process would not start at all, and
+        //     the reason would be an `UnknownTopicOrPartition` from a partition
+        //     nobody asked about by name.
+        //   more live than configured — lowering it, or restoring an old `.env`
+        //     over a widened topic. The extra partitions still hold whatever the
+        //     wider run produced to them, and nothing would ever consume them:
+        //     records accepted with a `202`, never packed, never indexed, gone
+        //     at the retention horizon.
+        //
+        // So the topic decides and the difference is reported. Widening is
+        // `rpk topic add-partitions` on the broker followed by a restart, which
+        // is the message below.
+        let live = bounded(CONTROL_TIMEOUT, client.list_topics())
+            .await?
+            .into_iter()
+            .find(|topic| topic.name == config.kafka_topic)
+            .map_or(config.kafka_partitions as usize, |topic| {
+                topic.partitions.len()
+            });
+        if live != config.kafka_partitions as usize {
+            tracing::warn!(
+                topic = config.kafka_topic,
+                configured = config.kafka_partitions,
+                live,
+                "topic 现有 {live} 个分区，MJAI_KAFKA_PARTITIONS 写的是 {}，按现有的算。\
+                 一个分区一条打包线程，这是打包吞吐唯一的横向扩展点：要加宽就在 broker 上跑 \
+                 `rpk topic add-partitions {} --num <再加几个>` 再重启，分区只能加不能减。",
+                config.kafka_partitions,
+                config.kafka_topic
+            );
+        }
+
+        // `Error` rather than `Retry`: the topic was just ensured and its
+        // partitions counted, so a partition that is still unknown means the
+        // cluster changed under us, and retrying that only hides it.
         let connect_partition = async |partition| {
             Ok::<_, KafkaError>(Arc::new(
                 bounded(
@@ -406,9 +446,9 @@ impl Kafka {
                 .await?,
             ))
         };
-        let mut producers = Vec::with_capacity(config.kafka_partitions as usize);
-        let mut consumers = Vec::with_capacity(config.kafka_partitions as usize);
-        for partition in 0..config.kafka_partitions {
+        let mut producers = Vec::with_capacity(live);
+        let mut consumers = Vec::with_capacity(live);
+        for partition in 0..live as i32 {
             // Every one of these is its own connection, and that is the whole
             // point of counting them out rather than cloning a handle: one
             // `PartitionClient` is one socket, and a broker will not read a

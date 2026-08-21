@@ -157,6 +157,15 @@ Watch 默认关闭。账号在管理台「账号池」页里填，采集实例�
 
 生产路径不会把每个约 10KB 的 mjson 分别存成 RustFS 对象。打包器把每条记录压成独立 Zstandard frame，再合并为约 256MB 的 `.mjpack`；单条读取根据 ClickHouse 中的 offset/length 发起 Range GET，只下载对应的几 KB。
 
+**打包线程是整条管道最窄的地方，`MJAI_KAFKA_PARTITIONS` 是它唯一的横向扩展点。**
+一个分区一条打包线程，每条记录在那条线程上要解 gzip、解析两遍 mjai、跑一遍牌局算
+选手统计、算 sha256、压两个 zstd 帧——实测 3.4 毫秒，而且它封包上传的那几秒完全不
+消费。补抓压过它之后 topic 会顶在 `MJAI_KAFKA_MAX_LAG` 的一半上，补抓请求就整批
+让位，表现是「几百个账号全在睡觉、条/秒在 0 和峰值之间来回跳」——这时候加账号一点
+用都没有。已经有 topic 的部署要加宽得两步：`rpk topic add-partitions <topic> --num N`
+之后重启（rskafka 只会建 topic，加不了分区；分区只能加不能减）。启动时按 topic
+现有的分区数来，和配置对不上会打日志说清楚。
+
 ## 数据目录与迁移
 
 六份持久化数据都是 `MJAI_STORAGE_ROOT`（默认 `./storage`）下的一个目录，不是 Docker

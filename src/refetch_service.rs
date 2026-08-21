@@ -21,7 +21,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -104,10 +104,21 @@ fn in_flight_for(workers: usize, request_delay_ms: u64) -> usize {
 /// How long a worker waits before logging in again after a session ended.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
-/// How long the walk waits before looking at the packing backlog again. Long
-/// enough that a queue draining at the worker's own pace makes visible progress
-/// between checks, short enough that it does not idle once it has.
-const BACKLOG_BACKOFF: Duration = Duration::from_secs(15);
+/// How long the walk waits before looking at the packing backlog again.
+///
+/// The lag it looks at is a sample, refreshed by `sample_lag_forever` every
+/// `LAG_SAMPLE_INTERVAL` — five seconds, in `main`. Waiting less than that
+/// re-reads the same number; waiting longer, which this did at fifteen seconds,
+/// keeps the whole walk asleep for up to two sampling intervals after the
+/// backlog has already cleared.
+///
+/// That is not a small waste, because the gate is not per record: every request
+/// in the air meets it at once and they all sleep together. On the live
+/// deployment the console showed 0.1 records a second with 390 sessions logged
+/// in and `waiting` at zero — the entire pool idle, not throttled — and then a
+/// burst as they all woke. Five seconds is the shortest wait that can see a
+/// different answer.
+const BACKLOG_BACKOFF: Duration = Duration::from_secs(5);
 
 /// How long an idle worker parks on the request counter before looking again.
 /// It is woken the moment a request arrives, so this only bounds how long a
@@ -471,6 +482,12 @@ pub struct RefetchSupervisor {
     rate: RwLock<RateWindow>,
     failures: RwLock<std::collections::VecDeque<RefetchFailure>>,
     sessions: AtomicUsize,
+    /// Whether the walk is currently standing aside for the pack worker. Only
+    /// so that the two transitions are logged once each: every request in the
+    /// air meets the gate together, and a line per request is 16,000 of them in
+    /// forty minutes — measured, on the deployment, where they buried
+    /// everything else in the container log.
+    throttled: AtomicBool,
     dependencies: RefetchDependencies,
     generation: AtomicU64,
     /// The sessions, held apart from the walk so that the walk can end them when
@@ -515,6 +532,7 @@ impl RefetchSupervisor {
             rate: RwLock::new(RateWindow::default()),
             failures: RwLock::new(std::collections::VecDeque::new()),
             sessions: AtomicUsize::new(0),
+            throttled: AtomicBool::new(false),
             dependencies,
             generation: AtomicU64::new(0),
             sessions_tasks: Mutex::new(Vec::new()),
@@ -1819,14 +1837,7 @@ impl RefetchSupervisor {
         // attempt without copying a megabyte each time.
         let (mjai, pb) = (Arc::new(mjai), Arc::new(pb));
         loop {
-            // Behind the same ceiling live ingest answers `503` on. Waiting is
-            // free here: the backlog is somebody else's work being done, and the
-            // records at risk if the topic overruns are the collectors' — the
-            // ones nobody can fetch a second time.
-            while self.dependencies.kafka.lag() >= self.dependencies.kafka.max_lag() / 2 {
-                tracing::info!("打包队列积压，补抓让出写入位置");
-                tokio::time::sleep(BACKLOG_BACKOFF).await;
-            }
+            self.yield_to_packing().await;
             // Spawned and immediately awaited, which reads like nothing at all
             // and is the one thing standing between this walk and silent data
             // loss.
@@ -1881,6 +1892,35 @@ impl RefetchSupervisor {
                 }
                 Err(error) => return Err(error.into()),
             }
+        }
+    }
+
+    /// Stands aside while the pack worker is behind, and comes back the moment
+    /// it is not.
+    ///
+    /// Behind the same ceiling live ingest answers `503` on. Waiting is free
+    /// here: the backlog is somebody else's work being done, and the records at
+    /// risk if the topic overruns are the collectors' — the ones nobody can
+    /// fetch a second time.
+    ///
+    /// This is also the whole reason a sweep runs in a sawtooth rather than at a
+    /// rate. The gate is all-or-nothing across every request in the air, so the
+    /// pool goes from full to idle and back on the pack worker's cycle; the only
+    /// real cure is a pack worker fast enough that it never closes, which is
+    /// what `MJAI_KAFKA_PARTITIONS` is for — one worker per partition, and the
+    /// deployment ran with one.
+    async fn yield_to_packing(&self) {
+        while self.dependencies.kafka.lag() >= self.dependencies.kafka.max_lag() / 2 {
+            if !self.throttled.swap(true, Ordering::Relaxed) {
+                tracing::info!(
+                    lag = self.dependencies.kafka.lag(),
+                    "打包队列积压，补抓让出写入位置"
+                );
+            }
+            tokio::time::sleep(BACKLOG_BACKOFF).await;
+        }
+        if self.throttled.swap(false, Ordering::Relaxed) {
+            tracing::info!("打包队列跟上了，补抓继续");
         }
     }
 
@@ -1952,16 +1992,9 @@ impl RefetchSupervisor {
                 return Ok(Outcome::Unconvertible(rejected.why));
             }
         };
-        // Behind the same backlog ceiling live ingest answers `503` on, because
-        // this path does not go through `indexer::claim` and would otherwise be
-        // the one writer that ignores it. A topic past that ceiling drops
-        // records the API has already acknowledged, and the records at risk are
-        // the collectors' — the ones nobody can fetch a second time. Waiting is
-        // free here: the backlog is somebody else's work being done.
-        while self.dependencies.kafka.lag() >= self.dependencies.kafka.max_lag() / 2 {
-            tracing::info!("打包队列积压，补抓让出写入位置");
-            tokio::time::sleep(BACKLOG_BACKOFF).await;
-        }
+        // This path does not go through `indexer::claim` and would otherwise be
+        // the one writer that ignores the ceiling.
+        self.yield_to_packing().await;
         indexer::reindex_one(&self.dependencies.kafka, &row, mjai, Some(pb)).await?;
         Ok(Outcome::Replaced)
     }
@@ -2015,46 +2048,82 @@ pub struct RefetchFailure {
     pub detail: String,
 }
 
-/// Completion instants over a short window, for the console's live rate. A
+/// Completions per second over a short window, for the console's live rate. A
 /// window rather than "since last poll", so two browsers watching do not each
 /// see a rate the other consumed.
-#[derive(Default)]
+///
+/// One counter per second of the window, rather than one instant per
+/// completion. What it replaces was a deque of instants capped at 4,096
+/// entries, and a cap on the entries is a cap on the rate: 4,096 over thirty
+/// seconds is 136.533, so every sweep quick enough to reach it read exactly
+/// 136.5333333 however fast it really was. The live deployment sat on that
+/// number through two changes to the pool — 402 accounts reporting what 278 had
+/// — while ClickHouse was taking 290 records a second. A meter that saturates
+/// silently is worse than no meter: it was read as evidence that the accounts
+/// were not the bottleneck, which happened to be true, and it would have read
+/// exactly the same if they were.
 struct RateWindow {
-    hits: std::collections::VecDeque<std::time::Instant>,
+    /// `(which second it counts, how many landed in it)`, indexed by that
+    /// second modulo the window. Two seconds that share a slot are always
+    /// exactly `WINDOW_SECS` apart, so the stale one is always outside the
+    /// window and is simply overwritten.
+    buckets: [(u64, u32); Self::WINDOW_SECS],
+    /// When the first completion landed. Seconds are counted from there so a
+    /// bucket is identified by an integer rather than by an `Instant`.
+    origin: Option<std::time::Instant>,
+}
+
+impl Default for RateWindow {
+    fn default() -> Self {
+        Self {
+            buckets: [(0, 0); Self::WINDOW_SECS],
+            origin: None,
+        }
+    }
 }
 
 impl RateWindow {
-    const WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
-    const CAP: usize = 4_096;
+    const WINDOW_SECS: usize = 30;
 
     fn hit(&mut self) {
-        let now = std::time::Instant::now();
-        self.hits.push_back(now);
-        while self.hits.len() > Self::CAP
-            || self
-                .hits
-                .front()
-                .is_some_and(|at| now.duration_since(*at) > Self::WINDOW)
-        {
-            self.hits.pop_front();
+        let second = self
+            .origin
+            .get_or_insert_with(std::time::Instant::now)
+            .elapsed()
+            .as_secs();
+        let slot = &mut self.buckets[second as usize % Self::WINDOW_SECS];
+        if slot.0 == second {
+            slot.1 += 1;
+        } else {
+            *slot = (second, 1);
         }
     }
 
     /// Records per second over the window. Zero once the walk stops, because
-    /// everything in the deque ages out of it.
+    /// every bucket ages out of it.
     fn qps(&self) -> f64 {
-        let now = std::time::Instant::now();
-        let live = self
-            .hits
+        match self.origin {
+            Some(origin) => self.qps_at(origin.elapsed().as_secs()),
+            None => 0.0,
+        }
+    }
+
+    /// Split from `qps` for the same reason the buckets are numbered: a rate
+    /// over a window cannot be tested at all if the only way to reach the second
+    /// it is measured at is to wait for it.
+    fn qps_at(&self, now: u64) -> f64 {
+        let live: u32 = self
+            .buckets
             .iter()
-            .filter(|at| now.duration_since(**at) <= Self::WINDOW)
-            .count();
+            .filter(|(second, _)| now.saturating_sub(*second) < Self::WINDOW_SECS as u64)
+            .map(|(_, hits)| hits)
+            .sum();
         if live < 2 {
             return 0.0;
         }
         // Against the window, not against first-to-last: the latter reads as a
         // full rate when only two records landed in thirty seconds.
-        live as f64 / Self::WINDOW.as_secs_f64()
+        live as f64 / Self::WINDOW_SECS as f64
     }
 }
 
@@ -3074,5 +3143,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The meter has to be able to report a rate faster than itself.
+    ///
+    /// The deque this replaced held at most 4,096 instants, so anything quicker
+    /// than 4,096 per thirty seconds read as exactly 136.5333 — and the live
+    /// deployment, doing 290, read 136.5333 for a day while two changes to the
+    /// account pool were judged against it.
+    #[test]
+    fn the_rate_reads_faster_than_the_old_cap() {
+        let mut rate = RateWindow::default();
+        assert_eq!(rate.qps(), 0.0, "nothing has landed yet");
+
+        // Ten thousand inside one second, which is the shape of this walk: the
+        // backlog gate opens and everything in the air lands at once.
+        for _ in 0..10_000 {
+            rate.hit();
+        }
+        // Averaged over the window, because that is what the window means.
+        let window = RateWindow::WINDOW_SECS as f64;
+        assert_eq!(rate.qps_at(0), 10_000.0 / window);
+        assert!(
+            rate.qps_at(0) > 4_096.0 / window,
+            "the meter is capped again"
+        );
+
+        // Still inside the window on its last second, and gone on the next: a
+        // bucket is counted for the second it was written for, never for the
+        // one a whole window later that shares its slot.
+        assert_eq!(
+            rate.qps_at(RateWindow::WINDOW_SECS as u64 - 1),
+            10_000.0 / window
+        );
+        assert_eq!(rate.qps_at(RateWindow::WINDOW_SECS as u64), 0.0);
     }
 }
