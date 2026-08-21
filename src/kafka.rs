@@ -476,11 +476,26 @@ impl Kafka {
         &self.topic
     }
 
-    /// The backlog at which ingest is refused. Carried here rather than read
-    /// from the configuration at every call site so that the reading and the
-    /// ceiling it is compared against cannot come from two different places.
+    /// The backlog at which ingest is refused, summed over the partitions the
+    /// way [`Self::lag`] is. Carried here rather than read from the
+    /// configuration at every call site so that the reading and the ceiling it
+    /// is compared against cannot come from two different places.
+    ///
+    /// `MJAI_KAFKA_MAX_LAG` is **per partition**, and it has to be: a worker
+    /// commits its offset when it seals a pack, so a partition's steady-state
+    /// backlog is one pack cycle's worth of records whether or not anything is
+    /// behind. Eight partitions therefore idle at eight times the backlog one
+    /// did, and a ceiling read as a topic-wide total would be crossed by a
+    /// pipeline that is perfectly healthy.
+    ///
+    /// Which is what it did. Raising the partitions to eight put the normal
+    /// backlog at about 26,000 against a total ceiling of 25,000: the re-fetch
+    /// walk stood aside eleven times in ten minutes, for a pack worker that had
+    /// caught up with its partition every time.
     pub fn max_lag(&self) -> i64 {
-        self.max_lag
+        // Zero stays zero: `MJAI_KAFKA_MAX_LAG=0` is the off switch for ingest,
+        // and multiplying it must not turn it back on.
+        self.max_lag.saturating_mul(self.producers.len() as i64)
     }
 
     pub fn partition_count(&self) -> i32 {
