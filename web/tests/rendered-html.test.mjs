@@ -399,6 +399,35 @@ test("the account pool edits a selection, and a delete drops it", async () => {
 });
 
 /**
+ * A pool of a thousand accounts is six thousand form controls if the table
+ * renders whole, so it renders a page at a time. Two things that costs, both of
+ * them silent:
+ *
+ * every callback in a row addresses that row by its position in the whole pool,
+ * so a row carrying its per-page index would have page 2 editing and deleting
+ * page 1's accounts; and 全选 is the reason the batch controls are usable at
+ * this size at all, so it stays the whole pool rather than quietly becoming
+ * "this page" — twenty rounds of a batch edit is not a batch edit.
+ */
+test("the account pool pages its rows and still selects the whole pool", async () => {
+  const source = await readFile(
+    new URL("../components/account-pool.tsx", import.meta.url),
+    "utf8",
+  );
+  assert.match(source, /const PAGE_SIZE = \d+/);
+  assert.match(source, /accounts\s*\.slice\(start, start \+ PAGE_SIZE\)/);
+  // The row's index is the pool's, not the page's.
+  assert.match(source, /index: start \+ offset/);
+  assert.match(source, /visible\.map\(\(\{ account, index \}\)/);
+  // Clamped where it is read: a delete can drop the page count under the page
+  // that is open, and a table that renders blank is a pool that looks lost.
+  assert.match(source, /Math\.min\(page, pages - 1\)/);
+  // 全选 covers `accounts`, never `visible`.
+  assert.match(source, /checked \? new Set\(accounts\.map\(\(_, at\) => at\)\)/);
+  assert.doesNotMatch(source, /new Set\(visible\.map/);
+});
+
+/**
  * An account can be sent out of its own mihomo node, which is what spreads a
  * pool of eighty sessions over several exits. Two things about the picker are
  * worth pinning, both of them ways to silently re-file somebody's accounts:
