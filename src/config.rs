@@ -112,6 +112,20 @@ pub struct Config {
     )]
     pub mihomo_proxy_url: String,
 
+    /// The traffic multiplier above which a node is not given accounts.
+    ///
+    /// Subscriptions bill bytes times a number they write into the node's name
+    /// — `x0.8`, `2x`, `倍率:3` — and this walk is not a small consumer: 52KiB a
+    /// game across 191 million games is nine terabytes at par. A node billed at
+    /// three times spends that quota three times over for a game that is worth
+    /// the same whichever exit fetched it.
+    ///
+    /// Two, so the ordinary premium lines a provider charges 1.5 or 2 for stay
+    /// in and the 3-and-up ones are left alone. Nodes whose name says nothing
+    /// count as 1. Zero or less turns the ceiling off.
+    #[arg(long, env = "MJAI_MAX_NODE_MULTIPLIER", default_value_t = 2.0)]
+    pub max_node_multiplier: f64,
+
     #[arg(long, env = "MJAI_PUBLIC_URL", default_value = "http://localhost:3000")]
     pub public_url: String,
 

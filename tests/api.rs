@@ -58,6 +58,9 @@ fn test_config(data_dir: &std::path::Path, email_api_url: Option<String>) -> Con
         mihomo_controller_url: "http://127.0.0.1:1".into(),
         mihomo_secret: "test-mihomo-secret".into(),
         mihomo_proxy_url: "http://127.0.0.1:7890".into(),
+        // No ceiling in the suite: the fixtures have no multipliers to read and
+        // a filter that never fires is a filter nothing tests.
+        max_node_multiplier: 0.0,
         public_url: "http://localhost:3000".into(),
         admin_email: "admin@example.com".into(),
         admin_password: "test-password-123".into(),

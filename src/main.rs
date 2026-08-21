@@ -125,6 +125,11 @@ async fn main() -> anyhow::Result<()> {
             mihomo.apply_runtime_config().await;
         });
     }
+    // Per-node traffic, which mihomo keeps only per live connection: nothing
+    // reads it back afterwards, so a round missed while the broker is down is a
+    // round of bytes nobody can recover. Started here rather than in `new` so
+    // that a `Catalog`-only test does not grow a background task.
+    tokio::spawn(Arc::clone(&state.mihomo).sample_traffic_forever());
     tokio::spawn(upload_legacy_packs(state.clone()));
     tokio::spawn(backfill::rewrite_record_metadata(state.clone()));
     tokio::spawn(backfill::write_game_scoped_claims(state.clone()));

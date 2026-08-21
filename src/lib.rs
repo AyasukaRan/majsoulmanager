@@ -121,6 +121,7 @@ impl AppState {
             &config.mihomo_controller_url,
             config.mihomo_secret.clone(),
             config.mihomo_proxy_url.clone(),
+            config.max_node_multiplier,
         )?);
         let watch_logs = Arc::new(WatchLogBuffer::default());
         let refetch = Arc::new(refetch::RefetchBroker::default());

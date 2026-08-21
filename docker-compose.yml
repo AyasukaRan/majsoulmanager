@@ -93,6 +93,7 @@ services:
       MJAI_MIHOMO_CONTROLLER_URL: http://mihomo:9090
       MJAI_MIHOMO_SECRET: ${MJAI_MIHOMO_SECRET:-change-mihomo-me}
       MJAI_MIHOMO_PROXY_URL: http://mihomo:7890
+      MJAI_MAX_NODE_MULTIPLIER: ${MJAI_MAX_NODE_MULTIPLIER:-2}
       MAJSOUL_ACCOUNTS: ${MAJSOUL_ACCOUNTS:-}
       # The re-fetch pool's own accounts. Separate from the line above
       # because it holds several and the collector only ever reads one.

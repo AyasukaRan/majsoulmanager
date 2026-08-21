@@ -1,6 +1,7 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -371,6 +372,13 @@ pub struct MihomoOutboundStatus {
 pub struct MihomoNode {
     pub name: String,
     pub node_type: String,
+    /// What a subscription bills for a byte through this node, read out of its
+    /// name. See [`node_multiplier`]. `1.0` when the name says nothing.
+    pub multiplier: f64,
+    /// Bytes carried for this deployment since the process started, both
+    /// directions. Accumulated by the sampler, not reported by mihomo — see
+    /// [`MihomoManager::sample_traffic`] for what that costs in accuracy.
+    pub bytes: u64,
     /// Whether it reached Mahjong Soul on the last check. `None` means it has
     /// not been checked yet, which the pool treats exactly like `false` —
     /// spending an account on an unknown node is the thing this answers.
@@ -399,9 +407,100 @@ pub struct MihomoStatus {
     /// no account names one.
     pub outbounds: Vec<MihomoOutboundStatus>,
     pub proxy_url: String,
+    /// The ceiling `usable_nodes` applies, carried so the console can say why a
+    /// node it can see is not one an account will be given.
+    pub max_multiplier: f64,
     pub nodes: Vec<MihomoNode>,
     pub updated_at: DateTime<Utc>,
     pub error: Option<String>,
+}
+
+/// How often the traffic sampler asks mihomo what its connections have carried.
+///
+/// Ten seconds against sessions that live about seventy: what is lost is
+/// whatever a connection moved between the last sample and the moment it
+/// closed, so the figures read low by up to one interval per closed connection
+/// and never high. That is the right direction for a number an operator uses to
+/// decide whether a subscription's quota will last.
+const TRAFFIC_SAMPLE: Duration = Duration::from_secs(10);
+
+/// The traffic multiplier a subscription writes into a node's name, or `1.0`.
+///
+/// Providers bill transferred bytes times this number and they advertise it in
+/// the only place a Clash client can see it — the name. There is no standard
+/// for it: `x0.8`, `2x`, `×3`, `[1.5x]`, `倍率:5` and `2倍` are all in the wild,
+/// which is why this reads a number next to any of those markers rather than
+/// matching a format.
+///
+/// The largest one found wins. A name like `香港 x2 | 中转 x1` is describing a
+/// path that costs two, and the expensive reading is the safe one for a number
+/// that decides whether an exit is used at all.
+///
+/// Anything outside `0 < m <= 10` is not a multiplier. Real ones run from about
+/// a tenth to five; a bigger number next to an `x` is a word or a port —
+/// `Relay x86` is the case that made this a rule — and reads as par.
+pub fn node_multiplier(name: &str) -> f64 {
+    let chars: Vec<char> = name.chars().collect();
+    // `None` until something is read, rather than starting at par and taking
+    // the larger: a discount node is exactly the case where the two differ, and
+    // `x0.8` has to come back as 0.8 rather than lose to the default.
+    let mut found: Option<f64> = None;
+    for (index, marker) in chars.iter().enumerate() {
+        if !matches!(marker, 'x' | 'X' | '×' | '倍') {
+            continue;
+        }
+        for candidate in [
+            number_after(&chars, index + 1),
+            number_before(&chars, index),
+        ] {
+            if let Some(candidate) = candidate.filter(|value| *value > 0.0 && *value <= 10.0) {
+                found = Some(found.map_or(candidate, |best: f64| best.max(candidate)));
+            }
+        }
+    }
+    found.unwrap_or(1.0)
+}
+
+/// The number immediately after `start`, skipping the punctuation a name may
+/// put between the marker and the figure.
+fn number_after(chars: &[char], start: usize) -> Option<f64> {
+    let mut first = start;
+    // `率` and `数` are skipped for the same reason the punctuation is: the
+    // marker matched is `倍`, and what a name actually writes is 「倍率」 or
+    // 「倍数」 followed by the figure.
+    while chars
+        .get(first)
+        .is_some_and(|c| matches!(c, ' ' | ':' | '：' | '=' | '率' | '数'))
+    {
+        first += 1;
+    }
+    let mut end = first;
+    while chars
+        .get(end)
+        .is_some_and(|c| c.is_ascii_digit() || *c == '.')
+    {
+        end += 1;
+    }
+    chars
+        .get(first..end)?
+        .iter()
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+/// The number immediately before `end`, which is how `2x` and `2倍` are written.
+fn number_before(chars: &[char], end: usize) -> Option<f64> {
+    let mut start = end;
+    while start > 0 && (chars[start - 1].is_ascii_digit() || chars[start - 1] == '.') {
+        start -= 1;
+    }
+    chars
+        .get(start..end)?
+        .iter()
+        .collect::<String>()
+        .parse()
+        .ok()
 }
 
 impl MihomoStatus {
@@ -418,11 +517,19 @@ impl MihomoStatus {
     /// set and a caller that takes the first few takes the fastest few. Callers
     /// that want them spread out shuffle it themselves — registration does,
     /// deliberately, so a batch does not pile onto one address.
+    ///
+    /// Nodes billed above `MJAI_MAX_NODE_MULTIPLIER` are left out. This walk
+    /// moves about 52KiB per game and there are 191 million of them, which is
+    /// nine terabytes of subscription quota at par — a node billed at three
+    /// times spends that quota three times as fast for a game that is worth the
+    /// same either way. Reachability decides whether an exit *can* be used;
+    /// this decides whether it is worth using.
     pub fn usable_nodes(&self) -> Vec<String> {
         let mut usable: Vec<&MihomoNode> = self
             .nodes
             .iter()
             .filter(|node| node.alive.unwrap_or(false))
+            .filter(|node| node.multiplier <= self.max_multiplier)
             .collect();
         usable.sort_by(|left, right| {
             (left.delay_ms.unwrap_or(u64::MAX), &left.name)
@@ -487,7 +594,26 @@ pub struct MihomoManager {
     /// node belongs to matters for naming and for reporting and for nothing
     /// else.
     subscriptions: RwLock<Vec<StoredSubscription>>,
+    /// See [`MihomoStatus::usable_nodes`].
+    max_multiplier: f64,
+    /// Bytes carried per node, and the per-connection water marks that are
+    /// subtracted to get there. See [`MihomoManager::sample_traffic`].
+    traffic: RwLock<Traffic>,
     client: Client,
+}
+
+/// What the traffic sampler carries between rounds.
+///
+/// mihomo reports a running total per *connection*, and connections come and
+/// go — this pool opens about thirteen a second. So a node's figure is built by
+/// differencing each connection against what was already counted for it, and
+/// the water marks of connections that have closed are dropped.
+#[derive(Default)]
+struct Traffic {
+    /// Node name to bytes, both directions, since this process started.
+    total: HashMap<String, u64>,
+    /// Connection id to the running total already added to its node.
+    counted: HashMap<String, u64>,
 }
 
 impl MihomoManager {
@@ -496,6 +622,7 @@ impl MihomoManager {
         controller_url: &str,
         controller_secret: String,
         proxy_url: String,
+        max_multiplier: f64,
     ) -> Result<Self, MihomoError> {
         std::fs::create_dir_all(root.join("providers"))?;
         let subscription_path = root.join("subscription.json");
@@ -531,6 +658,15 @@ impl MihomoManager {
             // account pool at boot, which is what frees them.
             leased: RwLock::new(Vec::new()),
             subscriptions: RwLock::new(subscriptions),
+            // A ceiling of zero or less would leave the pool with no exits at
+            // all, which is not a configuration anybody means: it reads as
+            // "unset" and every node stays eligible.
+            max_multiplier: if max_multiplier > 0.0 {
+                max_multiplier
+            } else {
+                f64::INFINITY
+            },
+            traffic: RwLock::new(Traffic::default()),
             client,
         };
         manager.write_runtime_config()?;
@@ -715,9 +851,75 @@ impl MihomoManager {
             lanes,
             outbounds,
             proxy_url: self.proxy_url.clone(),
+            max_multiplier: self.max_multiplier,
             nodes,
             updated_at: Utc::now(),
             error,
+        }
+    }
+
+    /// Adds what mihomo's live connections have carried since the last round to
+    /// the running total for the node each one goes out through.
+    ///
+    /// mihomo has no per-node counter — it reports a running total per
+    /// connection and forgets a connection when it closes. So this differences
+    /// each one against what was already counted for it, which makes the figure
+    /// exact for a connection that outlives a round and short by its last
+    /// partial round for one that does not. With sessions living about seventy
+    /// seconds against a ten-second sample that is a few percent, always
+    /// downwards, and a quota estimate that reads low is the safe direction.
+    ///
+    /// A connection is attributed to `chains[0]`, which is the node at the far
+    /// end — the group names in front of it are this process's own routing and
+    /// are the same for every exit.
+    async fn sample_traffic(&self) -> Result<(), MihomoError> {
+        let value = self
+            .controller_json(Method::GET, "/connections", None)
+            .await?;
+        let live = value
+            .get("connections")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| MihomoError::Controller("missing connections array".into()))?;
+        let mut traffic = self.traffic.write();
+        let mut open = HashSet::with_capacity(live.len());
+        for connection in live {
+            let Some(id) = connection.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(node) = connection
+                .get("chains")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|chains| chains.first())
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let carried = ["download", "upload"]
+                .into_iter()
+                .filter_map(|field| connection.get(field).and_then(serde_json::Value::as_u64))
+                .sum::<u64>();
+            open.insert(id.to_owned());
+            let counted = traffic.counted.insert(id.to_owned(), carried).unwrap_or(0);
+            // A total that went backwards is an id mihomo reused, not a
+            // negative transfer; count it from zero rather than underflowing.
+            let fresh = carried.saturating_sub(counted);
+            if fresh > 0 {
+                *traffic.total.entry(node.to_owned()).or_default() += fresh;
+            }
+        }
+        traffic.counted.retain(|id, _| open.contains(id));
+        Ok(())
+    }
+
+    /// The sampler. A failed round leaves the totals where they were: a
+    /// controller that cannot be reached has not moved any bytes worth
+    /// counting, and the next round differences against the same water marks.
+    pub async fn sample_traffic_forever(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(TRAFFIC_SAMPLE).await;
+            if let Err(error) = self.sample_traffic().await {
+                tracing::debug!(%error, "读不到 mihomo 的连接列表，这一轮流量不计");
+            }
         }
     }
 
@@ -1141,6 +1343,7 @@ impl MihomoManager {
         );
         let selected = shared;
         let provider_names = self.provider_node_names().await;
+        let carried = self.traffic.read().total.clone();
         let mut nodes = Vec::new();
         for (name, subscription) in provider_names {
             let Some(node) = proxies.get(&name) else {
@@ -1154,6 +1357,8 @@ impl MihomoManager {
                 .and_then(serde_json::Value::as_u64);
             nodes.push(MihomoNode {
                 selected: selected.as_deref() == Some(name.as_str()),
+                multiplier: node_multiplier(&name),
+                bytes: carried.get(&name).copied().unwrap_or(0),
                 name,
                 node_type: node
                     .get("type")
@@ -1482,6 +1687,35 @@ mod tests {
         );
     }
 
+    /// Real node names, from the two subscriptions this deployment runs.
+    ///
+    /// There is no format to conform to — the multiplier is advertised in a
+    /// display name — so what this pins is the shapes actually seen, and that a
+    /// name saying nothing costs par rather than being guessed at.
+    #[test]
+    fn reads_the_billing_multiplier_out_of_a_node_name() {
+        for (name, expected) in [
+            ("[88bdd3] 🇭🇰 香港Y08 | x0.8", 0.8),
+            ("[88bdd3] 🇭🇰 香港Y10 | IEPL", 1.0),
+            ("[95849d] 🇸🇬 AnyTLS.SG 02", 1.0),
+            ("香港 08 电信推荐", 1.0),
+            ("🇯🇵 日本 IEPL 2x", 2.0),
+            ("🇺🇸 美国 [1.5x] 中转", 1.5),
+            ("🇹🇼 台湾 ×3", 3.0),
+            ("🇰🇷 韩国 倍率:5", 5.0),
+            ("🇭🇰 香港 2倍", 2.0),
+            ("🇸🇬 新加坡 x1", 1.0),
+            // The expensive reading of a name that says two things.
+            ("🇭🇰 香港 x2 | 中转 x1", 2.0),
+            // Not multipliers: no exit is billed at 86 times, so an `x`
+            // against a number that big is a word.
+            ("🇺🇸 Relay x86 box", 1.0),
+            ("🇯🇵 Osaka 443", 1.0),
+        ] {
+            assert_eq!(node_multiplier(name), expected, "{name}");
+        }
+    }
+
     fn update(url: &str) -> SubscriptionUpdate {
         SubscriptionUpdate {
             url: url.into(),
@@ -1579,6 +1813,8 @@ mod tests {
     fn only_nodes_that_reached_mahjong_soul_are_worth_an_account() {
         fn node(name: &str, alive: Option<bool>, delay_ms: Option<u64>) -> MihomoNode {
             MihomoNode {
+                multiplier: node_multiplier(name),
+                bytes: 0,
                 name: name.into(),
                 node_type: "Trojan".into(),
                 alive,
@@ -1595,6 +1831,7 @@ mod tests {
             lanes: Vec::new(),
             outbounds: Vec::new(),
             proxy_url: "http://mihomo:7890".into(),
+            max_multiplier: 2.0,
             nodes: vec![
                 node("slow", Some(true), Some(900)),
                 node("dead", Some(false), Some(10)),
@@ -1603,11 +1840,20 @@ mod tests {
                 // Alive but never timed: behind the ones with a number, not
                 // ahead of them, because unknown is not fast.
                 node("untimed", Some(true), None),
+                // Alive, quick, and three times the price of every byte it
+                // carries. Reachability is not the only question.
+                node("premium x3", Some(true), Some(30)),
+                // At the ceiling rather than past it, so the rule is "above",
+                // not "at or above".
+                node("premium 2x", Some(true), Some(40)),
             ],
             updated_at: Utc::now(),
             error: None,
         };
-        assert_eq!(status.usable_nodes(), ["quick", "slow", "untimed"]);
+        assert_eq!(
+            status.usable_nodes(),
+            ["premium 2x", "quick", "slow", "untimed"]
+        );
     }
 }
 
@@ -1642,6 +1888,7 @@ mod lane_tests {
             "http://127.0.0.1:9090",
             "secret".into(),
             "http://mihomo:7890".into(),
+            f64::INFINITY,
         )
         .expect("a manager with two subscriptions");
         let config = std::fs::read_to_string(root.join("config.yaml")).expect("a written config");
@@ -1731,6 +1978,7 @@ mod lane_tests {
             "http://127.0.0.1:9090",
             "secret".into(),
             "http://mihomo:7890".into(),
+            f64::INFINITY,
         )
         .expect("a manager with no subscription");
         let config = std::fs::read_to_string(root.join("config.yaml")).expect("a written config");
@@ -1818,6 +2066,7 @@ mod lane_tests {
             "http://127.0.0.1:9090",
             "secret".into(),
             "http://mihomo:7890".into(),
+            f64::INFINITY,
         )
         .expect("a manager");
 
@@ -1911,6 +2160,7 @@ mod lane_tests {
             "http://127.0.0.1:9090",
             "secret".into(),
             "http://mihomo:7890".into(),
+            f64::INFINITY,
         )
         .expect("a manager");
 
