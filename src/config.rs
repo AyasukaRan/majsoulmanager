@@ -165,11 +165,28 @@ pub struct Config {
     #[arg(long, env = "MJAI_KAFKA_TOPIC", default_value = "mjai.records.raw")]
     pub kafka_topic: String,
 
-    /// One partition, because a single broker pinned to one core gains nothing
-    /// from more. The pack worker is written per-partition so raising this
-    /// works, but the ceiling is that nothing yet rebalances partitions across
-    /// processes: a second consumer would need its own assignment.
-    #[arg(long, env = "MJAI_KAFKA_PARTITIONS", default_value_t = 1)]
+    /// One pack worker per partition, and the pack worker is the pipeline's
+    /// narrowest point — so this is how wide the pipeline is.
+    ///
+    /// It was one, on the reasoning that "a single broker pinned to one core
+    /// gains nothing from more". True of the broker and beside the point: what
+    /// a partition buys is not broker parallelism but a second consumer. Each
+    /// record costs its worker a gunzip, two mjai parses, a full replay for the
+    /// player statistics, a sha256 and two zstd frames — measured at 3.4 ms,
+    /// all of it on one thread, and while that thread is sealing a 256MB pack it
+    /// is not consuming at all.
+    ///
+    /// What one partition did on the live deployment: 290 records a second with
+    /// 56 cores idle, the topic pinned at the `MJAI_KAFKA_MAX_LAG` gate, and 400
+    /// logged-in accounts sleeping in it. Adding accounts moved nothing, because
+    /// the accounts were never the limit.
+    ///
+    /// Eight, which is eight cores at full tilt and leaves the rest for the
+    /// conversions. Raising it on a deployment that already has a topic is two
+    /// steps, because rskafka cannot widen one: `rpk topic add-partitions` on
+    /// the broker, then restart. `Kafka::connect` reads the live count and says
+    /// so when the two disagree.
+    #[arg(long, env = "MJAI_KAFKA_PARTITIONS", default_value_t = 8)]
     pub kafka_partitions: i32,
 
     /// The durable replacement for the old in-memory pending-row cap. Ingest is
