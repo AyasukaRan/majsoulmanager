@@ -29,24 +29,50 @@ permissions:
 # outside that path is a process mistake this workflow would only notice after
 # it had already started building.
 jobs:
-  images:
-    name: Publish images
+  # What changed since the last tag, which decides whether each image is built
+  # or simply retagged.
+  #
+  # Both images were built, in one job, one after the other, on every tag —
+  # eight minutes, whatever the release contained. Two of the last three
+  # releases changed only docker-compose.yml, the Makefile and a `.env`
+  # example, none of which is inside either image: sixteen minutes of a build
+  # runner to publish four images identical to the four before them.
+  plan:
+    name: Decide what to build
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      packages: write
+    timeout-minutes: 5
+    outputs:
+      api_tags: ${{ steps.plan.outputs.api_tags }}
+      web_tags: ${{ steps.plan.outputs.web_tags }}
+      api_build: ${{ steps.plan.outputs.api_build }}
+      web_build: ${{ steps.plan.outputs.web_build }}
+      api_from: ${{ steps.plan.outputs.api_from }}
+      web_from: ${{ steps.plan.outputs.web_from }}
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
 
     steps:
+      # Whole history and every tag: the comparison below is against the
+      # previous release, which a shallow clone cannot see.
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
-      - name: Resolve image tags
-        id: images
+      # Only to ask whether the previous release's images are really in the
+      # registry. Nothing is pushed from this job.
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image tags and what changed
+        id: plan
         shell: bash
         run: |
+          set -euo pipefail
           owner="${GITHUB_REPOSITORY_OWNER,,}"
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             names="${GITHUB_REF_NAME#v}"
@@ -60,18 +86,110 @@ jobs:
           else
             names="dev"
           fi
-          api=""
-          web=""
-          for name in ${names}; do
-            api+="ghcr.io/${owner}/majsoulmanager-api:${name},"
-            web+="ghcr.io/${owner}/majsoulmanager-web:${name},"
-            if [[ -n "${DOCKERHUB_USERNAME}" ]]; then
-              api+="docker.io/${DOCKERHUB_USERNAME}/majsoulmanager-api:${name},"
-              web+="docker.io/${DOCKERHUB_USERNAME}/majsoulmanager-web:${name},"
+          for component in api web; do
+            tags=""
+            for name in ${names}; do
+              tags+="ghcr.io/${owner}/majsoulmanager-${component}:${name},"
+              if [[ -n "${DOCKERHUB_USERNAME}" ]]; then
+                tags+="docker.io/${DOCKERHUB_USERNAME}/majsoulmanager-${component}:${name},"
+              fi
+            done
+            echo "${component}_tags=${tags%,}" >> "${GITHUB_OUTPUT}"
+          done
+
+          # The previous release, and what a release since it has touched. On a
+          # ref that is not a tag there is nothing to compare against, so both
+          # images are built — that is the `dev` path, which is asking for a
+          # build by definition.
+          previous=""
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            previous="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+          fi
+          api_build=true
+          web_build=true
+          if [[ -n "${previous}" ]]; then
+            api_build=false
+            web_build=false
+            # What each image is actually built from. The API's context is the
+            # repository with `.dockerignore` taking out `web`, `*.md` and the
+            # build directories, so its inputs are exactly the five paths its
+            # Dockerfile copies — not docker-compose.yml, not the Makefile, not
+            # tests/, none of which ever reaches the image. The web image's
+            # context is ./web, so everything under it counts and nothing above
+            # it does.
+            while read -r path; do
+              [[ -n "${path}" ]] || continue
+              case "${path}" in
+                web/*) web_build=true ;;
+                Dockerfile|Cargo.toml|Cargo.lock|src/*|migrations/*|modules/*) api_build=true ;;
+                # How the images are built is an input to both of them.
+                .github/workflows/release.yml) api_build=true; web_build=true ;;
+              esac
+            done < <(git diff --name-only "${previous}" "${GITHUB_REF_NAME}")
+          fi
+
+          # A retag can only copy a manifest that exists. The previous release
+          # may predate this workflow, or may have failed half way through, and
+          # a missing source would publish a version tag pointing at nothing —
+          # so the fallback is to build it, which is always correct and only
+          # slower.
+          for component in api web; do
+            build_var="${component}_build"
+            [[ "${!build_var}" == "false" ]] || continue
+            from="ghcr.io/${owner}/majsoulmanager-${component}:${previous#v}"
+            if docker buildx imagetools inspect "${from}" >/dev/null 2>&1; then
+              echo "${component}_from=${from}" >> "${GITHUB_OUTPUT}"
+            else
+              echo "::notice::${from} 不在仓库里，改成重新构建 ${component}"
+              printf -v "${build_var}" '%s' true
             fi
           done
-          echo "api=${api%,}" >> "${GITHUB_OUTPUT}"
-          echo "web=${web%,}" >> "${GITHUB_OUTPUT}"
+          echo "api_build=${api_build}" >> "${GITHUB_OUTPUT}"
+          echo "web_build=${web_build}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "### ${GITHUB_REF_NAME}"
+            echo ""
+            echo "上一个版本：\`${previous:-（没有）}\`"
+            echo ""
+            echo "| 镜像 | 这次 |"
+            echo "| --- | --- |"
+            echo "| api | $([[ "${api_build}" == true ]] && echo 构建 || echo "沿用 ${previous}") |"
+            echo "| web | $([[ "${web_build}" == true ]] && echo 构建 || echo "沿用 ${previous}") |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  # One job per image rather than one job for both, so the two run at once
+  # instead of the web image waiting out the Rust build it has nothing to do
+  # with.
+  publish:
+    name: Publish ${{ matrix.component }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      # A failure in one image must not cancel the other: half a release is
+      # easier to finish than half a release that was also cancelled.
+      fail-fast: false
+      matrix:
+        include:
+          - component: api
+            context: .
+            file: ./Dockerfile
+          - component: web
+            context: ./web
+            file: ./web/Dockerfile
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      TAGS: ${{ needs.plan.outputs[format('{0}_tags', matrix.component)] }}
+      BUILD: ${{ needs.plan.outputs[format('{0}_build', matrix.component)] }}
+      FROM_IMAGE: ${{ needs.plan.outputs[format('{0}_from', matrix.component)] }}
+
+    steps:
+      - name: Check out repository
+        if: ${{ env.BUILD == 'true' }}
+        uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -90,22 +208,28 @@ jobs:
           username: ${{ env.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and publish API image
+      - name: Build and publish
+        if: ${{ env.BUILD == 'true' }}
         uses: docker/build-push-action@v6
         with:
-          context: .
-          file: ./Dockerfile
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
           push: true
-          tags: ${{ steps.images.outputs.api }}
-          cache-from: type=gha,scope=api
-          cache-to: type=gha,mode=max,scope=api
+          tags: ${{ env.TAGS }}
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
 
-      - name: Build and publish web image
-        uses: docker/build-push-action@v6
-        with:
-          context: ./web
-          file: ./web/Dockerfile
-          push: true
-          tags: ${{ steps.images.outputs.web }}
-          cache-from: type=gha,scope=web
-          cache-to: type=gha,mode=max,scope=web
+      # Nothing this image is built from changed, so the previous release's
+      # manifest is this one's. `imagetools create` copies the manifest under
+      # new names without pulling or pushing a layer, which is the difference
+      # between twenty seconds and eight minutes — and it publishes every tag,
+      # so a deployment pinning MJAI_IMAGE_TAG to this version still finds it.
+      - name: Retag the previous release
+        if: ${{ env.BUILD != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          targets=()
+          for tag in ${TAGS//,/ }; do targets+=(-t "${tag}"); done
+          docker buildx imagetools create "${targets[@]}" "${FROM_IMAGE}"
+          echo "${FROM_IMAGE} → ${TAGS}" >> "${GITHUB_STEP_SUMMARY}"
