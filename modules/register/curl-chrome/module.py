@@ -499,6 +499,36 @@ async def fetch_code(session, credential: str, p: dict, since_ts: float,
 
 
 # ============================ Cloud Mail (自建邮箱) ============================
+async def _mail_request(send, proxy: str | None):
+    """邮箱走本机出口, 代理只是后备。
+
+    邮箱本来跟着账号的出口走, 理由写的是"一个账号的邮箱和它的注册请求来自同一个 IP,
+    比分两路更像真人"。这条理由是错的: 邮箱服务器是我们自己的, 雀魂看不见我们从哪
+    取的信 —— 它只看得到注册流量。剩下的全是坏处。注册借的是按雀魂延迟挑出来的出口,
+    而那些出口里有连不上邮箱的:
+
+        dial MAJSOUL-OUT-26 --> mail.chatgpt.org.uk:443
+          error: cloudouthk-b1.ultra2max.com:1123 connect error: context deadline exceeded
+
+    表现是一整批注册在"正在开邮箱"这一步成片失败, 报 SSL_connect connection closed
+    abruptly。同一台机器直连是 200 / 0.45 秒, 走共享出站是 1.8 秒。
+
+    代理留作后备而不是删掉: 另一句理由"容器不一定能直连外网"在这台机器上不成立,
+    但换个部署可能成立, 而那时候的表现会是每一次注册都在同一步失败。只有传输层失败
+    才重试 —— 业务失败 (令牌不对、地址不存在) 换个出口是同样的答案, 值不上多打一次。
+    """
+    try:
+        return await send(None)
+    except Exception as direct:
+        if not proxy:
+            raise
+        try:
+            return await send(proxy)
+        except Exception:
+            # 直连的那个错才是要看的: 后备失败几乎总是"两条路都不通"。
+            raise direct
+
+
 async def _cloud_mail_call(session, cfg: dict, path: str, body: dict | None,
                            proxy: str | None):
     """打一次 Cloud Mail 的接口, 返回 data。body 为 None 时发 GET。
@@ -511,14 +541,20 @@ async def _cloud_mail_call(session, cfg: dict, path: str, body: dict | None,
     # 裸令牌, 不是 Bearer: worker 拿这个头的值直接和 KV 里存的比对。
     headers = {"Authorization": (cfg.get("token") or "").strip()}
     if body is None:
-        r = await session.get(base + path, headers=headers, **_no_proxy({"proxy": proxy}))
+        async def send(via):
+            return await session.get(base + path, headers=headers,
+                                     **_no_proxy({"proxy": via}))
     else:
-        r = await session.post(
-            base + path,
-            data=json.dumps(body, separators=(",", ":")),
-            headers={**headers, "Content-Type": "application/json"},
-            **_no_proxy({"proxy": proxy}),
-        )
+        payload = json.dumps(body, separators=(",", ":"))
+
+        async def send(via):
+            return await session.post(
+                base + path,
+                data=payload,
+                headers={**headers, "Content-Type": "application/json"},
+                **_no_proxy({"proxy": via}),
+            )
+    r = await _mail_request(send, proxy)
     try:
         j = json.loads(r.text)
     except Exception:
@@ -661,12 +697,15 @@ async def _temp_mail_get(session, cfg: dict, path: str, params: dict | None,
     key = (cfg.get("api_key") or "").strip()
     if not key:
         raise RuntimeError("临时邮箱的 api_key 是空的")
-    r = await session.get(
-        base + path,
-        params=params or None,
-        headers={"X-API-Key": key, "Accept": "application/json"},
-        **_no_proxy({"proxy": proxy}),
-    )
+    async def send(via):
+        return await session.get(
+            base + path,
+            params=params or None,
+            headers={"X-API-Key": key, "Accept": "application/json"},
+            **_no_proxy({"proxy": via}),
+        )
+
+    r = await _mail_request(send, proxy)
     try:
         j = json.loads(r.text)
     except Exception:
@@ -913,8 +952,7 @@ async def open_mailbox(session, params: dict, p: dict, proxy: str | None,
     而"都跑一遍"是没人想要的那个解释。"""
     cloud = params.get("cloud_mail") or None
     if cloud:
-        # 邮箱也走这个号的出口: 一个账号的邮箱和它的注册请求来自同一个 IP, 比分两路
-        # 更像真人 —— 而且容器不一定能直连外网。
+        # 出口是后备而不是主路, 见 `_mail_request`。
         address = await cloud_mail_open(session, cloud, proxy)
         return address, lambda since: fetch_code_cloud_mail(
             session, cloud, address, since, tries, interval, proxy)
