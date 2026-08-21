@@ -28,9 +28,9 @@ use uuid::Uuid;
 /// The suite talks to the real PostgreSQL, ClickHouse, Redpanda and RustFS;
 /// there is no in-memory mode left to fall back to, and skipping when they are
 /// absent would leave the SQL, the produce path and the pack upload untested.
-/// `docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
-/// postgres clickhouse redpanda rustfs create-bucket` provides them locally, CI
-/// starts the same four.
+/// `make test-infra` provides them locally and CI runs that same target — not
+/// `docker compose up` by hand, which would start the broker at the size the
+/// deployment runs it: four cores and eight gigabytes, taken up front.
 fn test_config(data_dir: &std::path::Path, email_api_url: Option<String>) -> Config {
     Config {
         listen: "127.0.0.1:0".into(),

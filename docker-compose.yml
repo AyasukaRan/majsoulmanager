@@ -255,9 +255,31 @@ services:
     command:
       - redpanda
       - start
+      # Kept: the API runs beside the broker on the same box. Without it Seastar
+      # pins a thread per shard and spins it at 100%, which would take four cores
+      # away from the conversions to poll an idle socket.
       - --overprovisioned
-      - --smp=1
-      - --memory=1G
+      # Redpanda gives a partition to a shard, and a shard is a core. One core is
+      # the quickstart's number and it was this deployment's for a year — with a
+      # single partition, which made it the right one.
+      #
+      # It is headroom rather than a fix, and worth saying so: the broker was
+      # measured at 2.5% of one core while the pipeline ran at 290 records a
+      # second, so even eight times that is a fifth of a core. What changed is
+      # that there are now eight partitions and eight pack workers reading them,
+      # and putting all eight on one shard makes the broker the one part of this
+      # that cannot be widened without a restart.
+      #
+      # Raising the count is the safe direction: Redpanda rebalances partitions
+      # onto the new shards at start-up. Lowering it again is the one to read the
+      # release notes for.
+      - --smp=${MJAI_REDPANDA_CORES:-4}
+      # Two gigabytes a core, which is Redpanda's own figure. Most of it is the
+      # batch cache, and this workload is the case it exists for: the pack
+      # workers fetch from a few thousand offsets behind the writer, so a cache
+      # that holds the backlog — 25,000 records at the ingest gate, about 375MB —
+      # serves every one of those reads without touching the disk.
+      - --memory=${MJAI_REDPANDA_MEMORY:-8G}
       - --reserve-memory=0M
       - --node-id=0
       - --kafka-addr=internal://0.0.0.0:29092,external://0.0.0.0:9092
