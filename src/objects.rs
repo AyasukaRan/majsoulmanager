@@ -19,6 +19,27 @@ const EMPTY_PAYLOAD_SHA256: &str =
 /// asking for more only costs a longer canonical query string.
 const LIST_PAGE_SIZE: &str = "1000";
 
+/// How many pack uploads may be in the object store at once.
+///
+/// One, because the volume behind RustFS is a 7200rpm disk: fast in one stream
+/// — 240MB/s sequential, measured — and useless in eight. Eight pack workers
+/// each PUT a 256MB object when they seal, and with all eight interleaved the
+/// disk sat at 43ms per write and RustFS answered
+/// `500 InternalError: timeout` on twelve uploads in fifteen minutes.
+///
+/// What each of those cost was not the upload. A failed seal discards the pack
+/// and rewinds to the committed offset, so every timeout threw away 17,600
+/// records and replayed them from the topic — which is more load, which is more
+/// timeouts. The backlog stood at 203,844 records with ClickHouse taking none
+/// of them.
+///
+/// Serialised, every upload is its own sequential stream and the margin is not
+/// close: the pipeline produces about 17MB/s of packed bytes against a disk
+/// that takes 240MB/s one stream at a time, so waiting here is never what
+/// limits ingest. Reads are deliberately not behind this — a `/raw` range GET
+/// must not queue behind a 256MB upload.
+const CONCURRENT_UPLOADS: usize = 1;
+
 /// Minimal S3 client covering exactly the five operations the pack pipeline
 /// needs. An AWS SDK would drag in a tree the size of the rest of this binary
 /// to sign four request shapes, and `reqwest`, `hmac`, `sha2` and `hex` are all
@@ -30,6 +51,8 @@ const LIST_PAGE_SIZE: &str = "1000";
 pub struct Objects {
     http: reqwest::Client,
     uploads: reqwest::Client,
+    /// See [`CONCURRENT_UPLOADS`].
+    uploading: tokio::sync::Semaphore,
     endpoint: String,
     /// The `Host` header `reqwest` will derive from the endpoint, port included
     /// when it is not the scheme default. It has to be signed byte-identically
@@ -94,6 +117,7 @@ impl Objects {
                 .connect_timeout(Duration::from_secs(3))
                 .timeout(Duration::from_secs(600))
                 .build()?,
+            uploading: tokio::sync::Semaphore::new(CONCURRENT_UPLOADS),
             endpoint,
             host,
             bucket: bucket.to_owned(),
@@ -108,6 +132,15 @@ impl Objects {
     /// corrupted in flight instead of storing it; one SHA-256 pass over 256MB
     /// is a fraction of the transfer it protects.
     pub async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), ObjectError> {
+        // Held for the hash as well as the transfer. Hashing 256MB is a
+        // fraction of the upload it protects, and keeping it inside the permit
+        // means the disk sees one writer arrive as the previous one leaves
+        // rather than eight arriving together after eight parallel hashes.
+        let _upload = self
+            .uploading
+            .acquire()
+            .await
+            .expect("the upload semaphore is never closed");
         let payload_hash = hex::encode(Sha256::digest(&bytes));
         let response = self
             .signed(
