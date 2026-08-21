@@ -18,7 +18,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { selectClass } from "@/lib/utils";
+import { cn, formatBytes, selectClass } from "@/lib/utils";
 import type { RunAction } from "@/components/watch/busy-action";
 
 const LANE_LABELS: Record<MihomoLane, string> = {
@@ -319,6 +319,77 @@ export function WatchProxyCard({
             ))}
           </div>
         ) : null}
+
+        {/* Traffic, because this walk is not a small consumer: 191 million
+            games at 52KiB is nine terabytes at par, and a subscription bills
+            that times the multiplier written into the node's own name. Sorted
+            by what each node has actually spent, which is the order the quota
+            runs out in. */}
+        {(proxy?.nodes ?? []).length === 0 ? null : (
+          <details className="rounded-lg border bg-muted/25 px-3 py-2">
+            <summary className="cursor-pointer text-xs text-muted-foreground">
+              {"节点流量与倍率 —— 合计 "}
+              <span className="font-mono">
+                {formatBytes(
+                  (proxy?.nodes ?? []).reduce((sum, node) => sum + node.bytes, 0),
+                )}
+              </span>
+              {"，按倍率折算 "}
+              <span className="font-mono">
+                {formatBytes(
+                  (proxy?.nodes ?? []).reduce(
+                    (sum, node) => sum + node.bytes * node.multiplier,
+                    0,
+                  ),
+                )}
+              </span>
+              {`；倍率高于 ${proxy?.max_multiplier ?? 2} 的不分配账号`}
+            </summary>
+            <div className="mt-2 max-h-72 space-y-1 overflow-y-auto text-xs">
+              {[...(proxy?.nodes ?? [])]
+                .sort((left, right) => right.bytes - left.bytes)
+                .map((node) => {
+                  const skipped = node.multiplier > (proxy?.max_multiplier ?? 2);
+                  return (
+                    <div
+                      key={node.name}
+                      className="flex items-baseline justify-between gap-3 border-b pb-1 last:border-0"
+                    >
+                      <span
+                        className={cn(
+                          "min-w-0 truncate",
+                          skipped && "text-muted-foreground line-through",
+                        )}
+                        title={skipped ? "倍率过高，不给它分配账号" : undefined}
+                      >
+                        {node.name}
+                      </span>
+                      <span className="shrink-0 font-mono tabular-nums text-muted-foreground">
+                        {node.multiplier !== 1 ? (
+                          <span
+                            className={cn(
+                              "mr-2",
+                              node.multiplier > 1
+                                ? "text-amber-600 dark:text-amber-400"
+                                : "text-emerald-600 dark:text-emerald-400",
+                            )}
+                          >
+                            ×{node.multiplier}
+                          </span>
+                        ) : null}
+                        <span className="font-semibold text-foreground">
+                          {formatBytes(node.bytes)}
+                        </span>
+                        {node.multiplier !== 1
+                          ? ` → ${formatBytes(node.bytes * node.multiplier)}`
+                          : ""}
+                      </span>
+                    </div>
+                  );
+                })}
+            </div>
+          </details>
+        )}
 
         <div className="flex flex-wrap gap-2">
           <Button

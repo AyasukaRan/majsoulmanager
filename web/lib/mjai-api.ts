@@ -557,6 +557,14 @@ export type MihomoNode = {
   selected: boolean;
   /** Which subscription it came from, by that subscription's id. */
   subscription: string;
+  /**
+   * What the subscription bills for a byte through this node, read out of its
+   * name (`x0.8`, `2x`, `倍率:3`). 1 when the name says nothing. Nodes above
+   * `max_multiplier` are never given an account.
+   */
+  multiplier: number;
+  /** Bytes carried since the API started, both directions. */
+  bytes: number;
 };
 
 /**
@@ -586,6 +594,12 @@ export type MihomoStatus = {
   /** One per node an account was bound to; empty when none is. */
   outbounds: MihomoOutboundStatus[];
   proxy_url: string;
+  /**
+   * The billing multiplier above which a node is never given an account, however
+   * fast it is. 191 million games at 52KiB is nine terabytes of quota at par,
+   * and a node billed at three times spends it three times over.
+   */
+  max_multiplier: number;
   nodes: MihomoNode[];
   updated_at: string;
   error: string | null;
