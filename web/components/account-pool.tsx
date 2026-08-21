@@ -44,6 +44,22 @@ const PURPOSES: Array<{ value: StoredAccount["purpose"]; label: string }> = [
 const FOLLOW = "__follow__";
 
 /**
+ * How many rows are on screen at once.
+ *
+ * Every row is four inputs and two `<select>`s, so a pool of a thousand is six
+ * thousand form controls in one document — the page takes seconds to appear and
+ * every keystroke in every box re-renders all of them. Fifty is enough to scan
+ * and cheap to type in.
+ *
+ * Only the rendering is paged. The document is loaded, edited and saved whole:
+ * the PUT carries a revision and replaces the entire pool, so there is no such
+ * thing as saving one page of it. That is also why 全选 stays what it says —
+ * it ticks the whole pool, not this page, because the batch edits behind it are
+ * exactly what a pool this size needs and page-at-a-time is twenty rounds of it.
+ */
+const PAGE_SIZE = 50;
+
+/**
  * How each verdict reads, and how loudly.
  *
  * Only 已封禁 is destructive, and only it is red. A refusal is amber because it
@@ -132,6 +148,13 @@ export function AccountPoolCard() {
    * Adding and importing only append, so what is ticked stays ticked.
    */
   const [selected, setSelected] = useState<ReadonlySet<number>>(new Set());
+  /**
+   * Which slice of the list is on screen. Clamped where it is read rather than
+   * corrected here: a delete can drop the page count under it, and a state that
+   * fixes itself on render cannot leave the table blank the way a missed
+   * `useEffect` can.
+   */
+  const [page, setPage] = useState(0);
   /**
    * The nodes mihomo knows about, for the 出站 column to offer.
    *
@@ -254,6 +277,25 @@ export function AccountPoolCard() {
   }
 
   const accounts = document_.accounts;
+  const pages = Math.max(1, Math.ceil(accounts.length / PAGE_SIZE));
+  const current = Math.min(page, pages - 1);
+  const start = current * PAGE_SIZE;
+  /**
+   * The rows on screen, each carrying its position in the whole pool.
+   *
+   * Carried rather than recomputed per callback because `selected`, `edit` and
+   * `removeAt` all address a row by that position — hand any of them the
+   * per-page index and page 2 edits page 1's rows.
+   */
+  const visible = accounts
+    .slice(start, start + PAGE_SIZE)
+    .map((account, offset) => ({ account, index: start + offset }));
+  /**
+   * Where a row that was just added went. Both 加一个 and the importer append,
+   * so it is always the last page — and landing anywhere else looks exactly
+   * like the button having done nothing.
+   */
+  const showLast = (total: number) => setPage(Math.ceil(total / PAGE_SIZE) - 1);
   const edit = (index: number, patch: Partial<StoredAccount>) =>
     setDocument({
       ...document_,
@@ -297,6 +339,9 @@ export function AccountPoolCard() {
         accounts.map((account) => account.username),
       );
       if (added.length > 0) {
+        // Where they landed, so 「已加进列表」 is followed by the rows rather
+        // than by whichever page was open when the file was picked.
+        showLast(accounts.length + added.length);
         // Appended to whatever is on screen when the file finishes reading, not
         // to the snapshot this handler started with: a row deleted or a note
         // typed while the file was being read would otherwise come back.
@@ -413,7 +458,7 @@ export function AccountPoolCard() {
                     )
                   }
                 />
-                全选
+                全选{pages > 1 ? `（全部 ${accounts.length} 个，不只这一页）` : ""}
               </label>
               {selected.size > 0 ? (
                 <>
@@ -486,7 +531,7 @@ export function AccountPoolCard() {
                 </span>
               )}
             </div>
-            {accounts.map((account, index) => (
+            {visible.map(({ account, index }) => (
               <div
                 key={index}
                 className="grid gap-2 rounded-lg border bg-muted/25 p-3 md:grid-cols-[auto_1.3fr_1fr_130px_150px_1fr_auto] md:items-center"
@@ -587,6 +632,44 @@ export function AccountPoolCard() {
                 </div>
               </div>
             ))}
+            {pages > 1 ? (
+              <div className="flex flex-wrap items-center justify-center gap-2 pt-1 text-xs text-muted-foreground">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={current === 0}
+                  onClick={() => setPage(current - 1)}
+                >
+                  上一页
+                </Button>
+                <span className="font-mono tabular-nums">
+                  {start + 1}–{start + visible.length} / {accounts.length}
+                </span>
+                <span>第</span>
+                <Input
+                  type="number"
+                  min={1}
+                  max={pages}
+                  aria-label="跳到第几页"
+                  className="h-8 w-16 px-2 text-center"
+                  value={current + 1}
+                  onChange={(event) =>
+                    setPage(
+                      Math.min(pages, Math.max(1, Number(event.target.value) || 1)) - 1,
+                    )
+                  }
+                />
+                <span className="font-mono tabular-nums">/ {pages} 页</span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={current >= pages - 1}
+                  onClick={() => setPage(current + 1)}
+                >
+                  下一页
+                </Button>
+              </div>
+            ) : null}
           </div>
         )}
 
@@ -604,7 +687,8 @@ export function AccountPoolCard() {
         <div className="flex flex-wrap items-center gap-2">
           <Button
             variant="outline"
-            onClick={() =>
+            onClick={() => {
+              showLast(accounts.length + 1);
               setDocument({
                 ...document_,
                 accounts: [
@@ -621,8 +705,8 @@ export function AccountPoolCard() {
                     banned_at: null,
                   },
                 ],
-              })
-            }
+              });
+            }}
           >
             <Plus className="size-4" />
             加一个
