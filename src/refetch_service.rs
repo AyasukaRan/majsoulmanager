@@ -80,25 +80,45 @@ const PROGRESS_EVERY: u64 = 500;
 /// the pacing alone allows 180.
 const MIN_IN_FLIGHT: usize = 1_000;
 
+/// How many records a session may have spoken for at once.
+///
+/// One is what the walk started with and what [`MIN_IN_FLIGHT`] quietly went
+/// back to: a floor of a thousand is four requests each for two hundred and
+/// fifty sessions and barely one each for a thousand, so a pool that grew past
+/// the floor was back where it began without anything changing.
+///
+/// What that costs is not average throughput — a saturated session is saturated
+/// either way — it is every wobble. With 922 sessions against a floor of 1,000
+/// the entire system holds 78 queued requests: one session reconnecting, one
+/// page read, one slow fetch, and there is nothing behind them for the others to
+/// pick up. Measured on that deployment, `waiting` swung between 0 and its
+/// ceiling continuously and the rate with it, 348 a second against bursts of
+/// 1,348. Four deep is enough that a session always finds its next request
+/// already waiting, and the ceiling below still decides when pacing is slow.
+const QUEUE_PER_SESSION: usize = 4;
+
 /// How many records a walk keeps in the air.
 ///
-/// [`MIN_IN_FLIGHT`] is one floor and the session count is the other — a pool
-/// with more accounts than that should be using them. The ceiling is the one
-/// thing the old "exactly one per session" rule was right about: a request sits
-/// in the broker's queue until a session claims it, and one that waits longer
-/// than [`CLAIM_TIMEOUT`] comes back as nobody having served it, which for the
-/// 牌谱屋 walk ends the pass.
+/// [`QUEUE_PER_SESSION`] sets the depth and [`MIN_IN_FLIGHT`] is the floor under
+/// a small pool. The ceiling is the one thing the old "exactly one per session"
+/// rule was right about: a request sits in the broker's queue until a session
+/// claims it, and one that waits longer than [`CLAIM_TIMEOUT`] comes back as
+/// nobody having served it, which for the 牌谱屋 walk ends the pass.
 ///
 /// Queue wait is `(in_flight - sessions) × delay / sessions`, so this is that
-/// inverted at a third of the timeout. At the default 1.5 s pacing with a couple
-/// of hundred accounts it does not bind until five figures; at the maximum
-/// minute-long pacing it is what keeps a deep queue from timing out on a pool
-/// that is merely slow rather than broken.
+/// inverted at a third of the timeout: at the maximum minute-long pacing the
+/// ceiling cuts the depth to two, and a queue that deep drains in a minute
+/// however slow the pool is. At the default 1.5 s pacing it does not bind at
+/// all, and at no pacing — which is what the sweep runs — the depth is
+/// [`QUEUE_PER_SESSION`] outright.
 fn in_flight_for(workers: usize, request_delay_ms: u64) -> usize {
     let workers = workers.max(1);
     let patience = CLAIM_TIMEOUT.as_millis() as u64 / 3;
     let ceiling = workers.saturating_mul(1 + (patience / request_delay_ms.max(1)) as usize);
-    workers.max(MIN_IN_FLIGHT).min(ceiling)
+    workers
+        .saturating_mul(QUEUE_PER_SESSION)
+        .max(MIN_IN_FLIGHT)
+        .min(ceiling)
 }
 
 /// How long a worker waits before logging in again after a session ended.
@@ -3120,11 +3140,15 @@ mod tests {
 
         // The deployment this was measured on: 278 sessions, default pacing.
         // One per session is what pinned it at 33 records a second with every
-        // session idle, so the floor has to bite here.
-        assert_eq!(in_flight_for(278, default), MIN_IN_FLIGHT);
-        // More accounts than the floor use them.
-        assert_eq!(in_flight_for(4_000, default), 4_000);
-        // And a pool of one still gets a queue, just not a thousand deep.
+        // session idle.
+        assert_eq!(in_flight_for(278, default), 278 * QUEUE_PER_SESSION);
+        // The floor only decides for a pool too small to reach it.
+        assert_eq!(in_flight_for(100, default), MIN_IN_FLIGHT);
+        // And a thousand sessions get four thousand, not the floor — which is
+        // the whole point: a pool that grows past MIN_IN_FLIGHT was otherwise
+        // back to one request each, with 78 queue slots for 922 servers.
+        assert_eq!(in_flight_for(964, default), 964 * QUEUE_PER_SESSION);
+        // A pool of one still gets a queue, just not a thousand deep.
         assert!((1..MIN_IN_FLIGHT).contains(&in_flight_for(1, default)));
 
         // The slow end, which is what the ceiling is for: at a minute between
