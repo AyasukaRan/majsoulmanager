@@ -181,7 +181,7 @@ const BALANCE_BAND: f64 = 0.25;
 /// What one exit did for the pool over a balancing round.
 #[derive(Clone, Copy, Default, Debug, serde::Serialize)]
 pub struct NodeTally {
-    /// Records this node's accounts brought back.
+    /// Records this node's sessions brought back.
     pub fetched: u64,
     /// Requests that came back an error — a refusal, a dropped session, a
     /// handshake that never completed. Reported but not weighed: a node whose
@@ -189,6 +189,23 @@ pub struct NodeTally {
     /// failure twice would take accounts off a node that is merely being
     /// offered games Mahjong Soul no longer serves.
     pub failed: u64,
+    /// How long those requests took in total, from the request going out to the
+    /// answer coming back. Divided by `fetched + failed` it is the one number
+    /// that says whether an exit is slow or Mahjong Soul is: a pool where every
+    /// exit reads the same is a pool whose exits are not the problem.
+    pub nanos: u64,
+    /// Sessions logged in through this exit right now.
+    ///
+    /// The balancer's denominator, and it has to be this rather than the count
+    /// of accounts bound to the node. A session resolves its exit when it logs
+    /// in and keeps it until it ends, so for a minute or so after a move the
+    /// records still arrive at the *old* node while the pool document already
+    /// says the account belongs to the new one. Numerator from the sessions,
+    /// denominator from the document, and a node that has just been drained
+    /// reads as the most productive exit in the pool — which is exactly what it
+    /// did: `荷兰`, one account by the document, 949 records by the tally, and a
+    /// promotion it had not earned.
+    pub sessions: usize,
 }
 
 /// Which accounts should change exit, given what each exit just produced.
@@ -233,8 +250,13 @@ fn rebalance(
     let mut ranked: Vec<(&str, usize, f64)> = holders
         .iter()
         .map(|(node, held)| {
-            let fetched = tally.get(*node).map_or(0, |tally| tally.fetched) as f64;
-            (*node, held.len(), fetched / held.len() as f64)
+            let counted = tally.get(*node).copied().unwrap_or_default();
+            // Per *logged-in session*, not per bound account. The two differ for
+            // about a minute after every move — see `NodeTally::sessions` — and
+            // dividing one population's records by the other's size is what made
+            // a drained exit look like the best one in the pool.
+            let live = counted.sessions.max(1) as f64;
+            (*node, held.len(), counted.fetched as f64 / live)
         })
         .collect();
     ranked.sort_by(|left, right| right.2.total_cmp(&left.2).then(left.0.cmp(right.0)));
@@ -630,10 +652,19 @@ pub struct RefetchRuntimeStatus {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RefetchNodeStatus {
     pub node: String,
-    /// Accounts bound to it right now.
+    /// Accounts bound to it right now, from the pool document.
     pub accounts: usize,
+    /// Sessions actually logged in through it, which is what the counters below
+    /// were produced by. Below `accounts` for a minute after a move, and the
+    /// reason the two are reported apart rather than as one number.
+    pub sessions: usize,
     pub fetched: u64,
     pub failed: u64,
+    /// Average round trip for one `fetchGameRecord` through this exit, in
+    /// milliseconds. The one number that separates "this exit is slow" from
+    /// "Mahjong Soul is slow": if every exit reads the same, the exits are not
+    /// what is holding the pool back.
+    pub took_ms: u64,
 }
 
 impl Default for RefetchRuntimeStatus {
@@ -789,11 +820,14 @@ impl RefetchSupervisor {
             .into_iter()
             .map(|(node, accounts)| {
                 let counted = tally.get(&node).copied().unwrap_or_default();
+                let answered = counted.fetched + counted.failed;
                 RefetchNodeStatus {
                     node,
                     accounts,
+                    sessions: counted.sessions,
                     fetched: counted.fetched,
                     failed: counted.failed,
+                    took_ms: counted.nanos / answered.max(1) / 1_000_000,
                 }
             })
             .collect();
@@ -1216,7 +1250,18 @@ impl RefetchSupervisor {
             if self.generation.load(Ordering::SeqCst) != generation {
                 return;
             }
-            let tally = std::mem::take(&mut *self.node_tally.write());
+            // Counters reset, live session gauge kept: the gauge is what is
+            // logged in right now, not something accumulated over a round.
+            let tally = {
+                let mut live = self.node_tally.write();
+                let round = live.clone();
+                for entry in live.values_mut() {
+                    entry.fetched = 0;
+                    entry.failed = 0;
+                    entry.nanos = 0;
+                }
+                round
+            };
             let bindings = self.dependencies.accounts.refetch_bindings();
             let nodes = tally.len().max(1);
             // Four times an even share, floored so that a pool smaller than its
@@ -1245,17 +1290,32 @@ impl RefetchSupervisor {
         }
     }
 
-    /// Counts one request against the exit that carried it.
-    fn record_node(&self, node: Option<&str>, fetched: bool) {
+    /// Counts one request, and how long it took, against the exit that carried
+    /// it.
+    fn record_node(&self, node: Option<&str>, fetched: bool, took: Duration) {
         let Some(node) = node else {
             return;
         };
         let mut tally = self.node_tally.write();
         let entry = tally.entry(node.to_owned()).or_default();
+        entry.nanos = entry.nanos.saturating_add(took.as_nanos() as u64);
         match fetched {
             true => entry.fetched += 1,
             false => entry.failed += 1,
         }
+    }
+
+    /// A session arriving at an exit, or leaving it. The balancer's denominator.
+    fn node_session(&self, node: Option<&str>, arriving: bool) {
+        let Some(node) = node else {
+            return;
+        };
+        let mut tally = self.node_tally.write();
+        let entry = tally.entry(node.to_owned()).or_default();
+        entry.sessions = match arriving {
+            true => entry.sessions.saturating_add(1),
+            false => entry.sessions.saturating_sub(1),
+        };
     }
 
     /// One session, for as long as this generation lasts: log in, answer
@@ -1355,6 +1415,7 @@ impl RefetchSupervisor {
                         .accounts
                         .record_login(&username, AccountState::Ok, "");
                     self.sessions.fetch_add(1, Ordering::Relaxed);
+                    self.node_session(node.as_deref(), true);
                     let outcome = self
                         .serve(
                             &config,
@@ -1365,6 +1426,7 @@ impl RefetchSupervisor {
                             node.as_deref(),
                         )
                         .await;
+                    self.node_session(node.as_deref(), false);
                     self.sessions.fetch_sub(1, Ordering::Relaxed);
                     transport.close().await;
                     if let Err(error) = outcome {
@@ -1478,7 +1540,7 @@ impl RefetchSupervisor {
             let sent = tokio::time::Instant::now();
             let fetched =
                 fetch_game_record(transport, pb_worker, request.uuid(), client_version).await;
-            self.record_node(node, fetched.is_ok());
+            self.record_node(node, fetched.is_ok(), sent.elapsed());
             match fetched {
                 Ok(raw) => request.answer(Ok(raw)),
                 Err(error) => {
@@ -3485,15 +3547,28 @@ mod tests {
         out
     }
 
-    fn tally(counts: &[(&str, u64)]) -> HashMap<String, NodeTally> {
+    /// The counters a round produced, against the sessions that produced them.
+    ///
+    /// `sessions` is taken from the same spread the bindings were built from,
+    /// which is the settled case: every bound account is logged in through the
+    /// node it is bound to. The case where they differ is a move that has not
+    /// been picked up yet, and `a_drained_exit_does_not_look_like_the_best_one`
+    /// is the one that builds it by hand.
+    fn tally(counts: &[(&str, u64)], spread: &[(&str, usize)]) -> HashMap<String, NodeTally> {
         counts
             .iter()
             .map(|(node, fetched)| {
+                let sessions = spread
+                    .iter()
+                    .find(|(name, _)| name == node)
+                    .map_or(0, |(_, held)| *held);
                 (
                     (*node).to_owned(),
                     NodeTally {
                         fetched: *fetched,
                         failed: 0,
+                        nanos: 0,
+                        sessions,
                     },
                 )
             })
@@ -3516,8 +3591,12 @@ mod tests {
     fn accounts_move_toward_the_exits_that_use_them() {
         // Two hundred accounts, evenly spread, and one exit doing four times
         // what the others manage per account.
-        let mut spread = bindings(&[("fast", 50), ("ok", 50), ("slow", 50), ("dead", 50)]);
-        let counts = tally(&[("fast", 4_000), ("ok", 1_000), ("slow", 1_000), ("dead", 0)]);
+        let even = [("fast", 50), ("ok", 50), ("slow", 50), ("dead", 50)];
+        let mut spread = bindings(&even);
+        let counts = tally(
+            &[("fast", 4_000), ("ok", 1_000), ("slow", 1_000), ("dead", 0)],
+            &even,
+        );
         let moves = rebalance(&spread, &counts, 200);
         assert!(
             !moves.is_empty(),
@@ -3556,19 +3635,22 @@ mod tests {
         // A node at the floor is not drained further: it would stop being
         // measured, and losing the last account changes the node set, which is
         // a mihomo reload and a pool-wide disconnect.
-        let spread = bindings(&[("fast", 40), ("dead", 1)]);
-        let counts = tally(&[("fast", 4_000), ("dead", 0)]);
+        let floor = [("fast", 40), ("dead", 1)];
+        let spread = bindings(&floor);
+        let counts = tally(&[("fast", 4_000), ("dead", 0)], &floor);
         assert!(rebalance(&spread, &counts, 200).is_empty());
 
         // And the cap holds even when the fast exit is the only sensible
         // destination — it is a ban limit, not a throughput one.
-        let spread = bindings(&[("fast", 20), ("slow", 60)]);
-        let counts = tally(&[("fast", 4_000), ("slow", 60)]);
+        let capped = [("fast", 20), ("slow", 60)];
+        let spread = bindings(&capped);
+        let counts = tally(&[("fast", 4_000), ("slow", 60)], &capped);
         let moves = rebalance(&spread, &counts, 22);
         assert_eq!(moves.len(), 2, "only two seats left under the cap");
 
         // Nothing to compare against is nothing to decide.
-        assert!(rebalance(&bindings(&[("only", 30)]), &tally(&[("only", 9)]), 40).is_empty());
+        let alone = [("only", 30)];
+        assert!(rebalance(&bindings(&alone), &tally(&[("only", 9)], &alone), 40).is_empty());
     }
 
     /// A per-account rate is a mean, and a mean carries no sample size.
@@ -3581,14 +3663,54 @@ mod tests {
     #[test]
     fn a_lucky_single_account_does_not_win_the_pool() {
         // `lucky` sits at the floor with a rate no seven-account node can match.
-        let spread = bindings(&[("lucky", 1), ("good", 60), ("ok", 60), ("dead", 60)]);
-        let counts = tally(&[("lucky", 200), ("good", 4_920), ("ok", 4_280), ("dead", 0)]);
+        let uneven = [("lucky", 1), ("good", 60), ("ok", 60), ("dead", 60)];
+        let spread = bindings(&uneven);
+        let counts = tally(
+            &[("lucky", 200), ("good", 4_920), ("ok", 4_280), ("dead", 0)],
+            &uneven,
+        );
         let moves = rebalance(&spread, &counts, 28);
         // Nine were free to move and the cap was twenty-eight away. It gets one:
         // what it already holds, which is what re-measures it with twice the
         // sample rather than betting a twentieth of the pool on one account.
         assert_eq!(moves.len(), 1, "{moves:?}");
         assert_eq!(moves[0].1, "lucky");
+    }
+
+    /// A move takes a minute to land, and until it does the records still
+    /// arrive at the exit the account was taken off.
+    ///
+    /// A session resolves its exit when it logs in and keeps it until it ends,
+    /// so right after a round the pool document and the sessions disagree.
+    /// Dividing the records one population brought back by the other one's size
+    /// is what made `荷兰` — one account by the document, seven sessions still
+    /// running, 949 records — read as three times the best exit in the pool and
+    /// earn a promotion it had not earned. Twice.
+    #[test]
+    fn a_drained_exit_does_not_look_like_the_best_one() {
+        // `drained` was emptied to the floor last round; its seven sessions are
+        // still up and still fetching at the same rate as everybody else.
+        let spread = bindings(&[("drained", 1), ("busy", 60), ("other", 60)]);
+        let mut counts = tally(
+            &[("busy", 4_800), ("other", 4_800)],
+            &[("busy", 60), ("other", 60)],
+        );
+        counts.insert(
+            "drained".to_owned(),
+            NodeTally {
+                fetched: 560,
+                failed: 0,
+                nanos: 0,
+                // What the document says is one. What produced those records is
+                // seven, and 560 over seven is exactly what the other exits do.
+                sessions: 7,
+            },
+        );
+        let moves = rebalance(&spread, &counts, 60);
+        assert!(
+            moves.iter().all(|(_, node)| node != "drained"),
+            "an exit that is merely ordinary must not be promoted: {moves:?}"
+        );
     }
 
     /// Where it ends up, which is the whole point: run the loop until it stops
@@ -3616,6 +3738,10 @@ mod tests {
                     NodeTally {
                         fetched: fetched as u64,
                         failed: 0,
+                        nanos: 0,
+                        // Settled: everything bound to the node is logged in
+                        // through it.
+                        sessions: held,
                     },
                 );
             }
