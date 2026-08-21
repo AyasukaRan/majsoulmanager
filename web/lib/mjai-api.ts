@@ -412,6 +412,24 @@ export type RefetchStatus = {
   qps: number;
   /** Most recent rejections, newest first. Bounded display buffer. */
   failures: RefetchFailure[];
+  /** Per-exit production since the last balancing round, busiest first. */
+  nodes: RefetchNodeStatus[];
+};
+
+/**
+ * One exit's share of the pool.
+ *
+ * The pool moves accounts off the exits producing least per account and onto
+ * the ones producing most, every five minutes, and this is what it decides on.
+ * A settled pool reads as similar `fetched` against dissimilar `accounts` —
+ * that is the shape of "every exit is being used for what it is worth", not a
+ * mistake.
+ */
+export type RefetchNodeStatus = {
+  node: string;
+  accounts: number;
+  fetched: number;
+  failed: number;
 };
 
 /**

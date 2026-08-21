@@ -541,6 +541,52 @@ impl AccountPool {
             .filter(|node| !node.is_empty())
     }
 
+    /// Which node each enabled re-fetch account is bound to, for the balancer to
+    /// count from. Accounts on the shared lane are left out: they name no node,
+    /// and nothing here can attribute what they fetched.
+    pub fn refetch_bindings(&self) -> Vec<(String, String)> {
+        self.document
+            .read()
+            .accounts
+            .iter()
+            .filter(|account| account.enabled && account.purpose == AccountPurpose::Refetch)
+            .filter_map(|account| {
+                let node = account.node.trim();
+                (!node.is_empty()).then(|| (account.username.clone(), node.to_owned()))
+            })
+            .collect()
+    }
+
+    /// Re-points named accounts at other nodes, in one write.
+    ///
+    /// Only the binding moves. Nothing else about the account is touched and no
+    /// node is created or removed here — a move to a node no listener exists for
+    /// would put that session on the shared lane, so the caller is required to
+    /// pick from nodes that are already bound. See the balancer, which is the
+    /// only caller and holds every node at one account or more for exactly that
+    /// reason.
+    pub fn rebind_nodes(&self, moves: &[(String, String)]) -> Result<usize, WatchServiceError> {
+        if moves.is_empty() {
+            return Ok(0);
+        }
+        let mut document = self.document.read().clone();
+        let mut moved = 0usize;
+        for (username, node) in moves {
+            if let Some(account) = document.accounts.iter_mut().find(|account| {
+                account.username.eq_ignore_ascii_case(username)
+                    && account.purpose == AccountPurpose::Refetch
+            }) && account.node != *node
+            {
+                account.node = node.clone();
+                moved += 1;
+            }
+        }
+        // Through `update` like every other write: it validates, bumps the
+        // revision and keeps the passwords the console never saw.
+        self.update(document)?;
+        Ok(moved)
+    }
+
     /// Every distinct node the enabled re-fetch accounts name, in a stable
     /// order. What mihomo has to grow an outbound for.
     ///
